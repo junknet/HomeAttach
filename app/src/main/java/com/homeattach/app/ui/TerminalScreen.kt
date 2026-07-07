@@ -165,6 +165,10 @@ fun TerminalScreen(
     var terminalSize by remember(sessionName, connectAttempt) { mutableStateOf<RemoteTerminalSize?>(null) }
     var hasDrawnFirstFrame by remember(sessionName, connectAttempt) { mutableStateOf(false) }
 
+    // Live IME composing text (voice dictation stream). A pty can't express rewrites, so the
+    // preedit renders locally in an overlay strip; only the finalized text goes down the wire.
+    var imePreedit by remember { mutableStateOf("") }
+
     val remoteTerminalSession = remember(sessionName, connectAttempt) {
         RemoteTerminalSession(
             onInput = { bytes -> connectionReference.get()?.send(bytes) },
@@ -487,9 +491,17 @@ fun TerminalScreen(
             override fun readFnKey(): Boolean = false
             override fun onCodePoint(codePoint: Int, ctrlDown: Boolean, session: TerminalSession?): Boolean = false
             override fun onEmulatorSet() {}
-            override fun logError(tag: String?, message: String?) {}
-            override fun logWarn(tag: String?, message: String?) {}
-            override fun logInfo(tag: String?, message: String?) {}
+            // Debug builds surface the engine's IME traffic (commitText/composing calls) in
+            // logcat — the only way to see what a voice keyboard actually sends. Release: silent.
+            override fun logError(tag: String?, message: String?) {
+                if (com.homeattach.app.BuildConfig.DEBUG) android.util.Log.e(tag ?: "TerminalView", message ?: "")
+            }
+            override fun logWarn(tag: String?, message: String?) {
+                if (com.homeattach.app.BuildConfig.DEBUG) android.util.Log.w(tag ?: "TerminalView", message ?: "")
+            }
+            override fun logInfo(tag: String?, message: String?) {
+                if (com.homeattach.app.BuildConfig.DEBUG) android.util.Log.i(tag ?: "TerminalView", message ?: "")
+            }
             override fun logDebug(tag: String?, message: String?) {}
             override fun logVerbose(tag: String?, message: String?) {}
             override fun logStackTraceWithMessage(tag: String?, message: String?, e: Exception?) {}
@@ -584,6 +596,8 @@ fun TerminalScreen(
                                 factory = { ctx ->
                                     TerminalView(ctx, null).also { view ->
                                         view.setTerminalViewClient(terminalViewClient)
+                                        view.setIsTerminalViewKeyLoggingEnabled(com.homeattach.app.BuildConfig.DEBUG)
+                                        view.setImePreeditListener { preedit -> imePreedit = preedit }
                                         view.attachSession(remoteTerminalSession.session)
                                         // Termux setTextSize is pixels; set before first layout so
                                         // font metrics are non-zero and cols/rows compute correctly.
@@ -628,6 +642,22 @@ fun TerminalScreen(
                                         }
                                     },
                             )
+                            // Voice dictation preview: the composing text streams here live
+                            // (revisions included); the terminal gets one clean write on finalize.
+                            if (imePreedit.isNotEmpty()) {
+                                Text(
+                                    text = imePreedit.takeLast(120),
+                                    color = Color(0xFFE8F0FE),
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    maxLines = 3,
+                                    overflow = TextOverflow.Ellipsis,
+                                    modifier = Modifier
+                                        .align(Alignment.BottomStart)
+                                        .fillMaxWidth()
+                                        .background(Color(0xE61A2233))
+                                        .padding(horizontal = 12.dp, vertical = 8.dp),
+                                )
+                            }
                         }
                         Column(
                             modifier = Modifier

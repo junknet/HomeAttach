@@ -308,17 +308,28 @@ public final class TerminalView extends View {
         // Ensure that inputType is only set if TerminalView is selected view with the keyboard and
         // an alternate view is not selected, like an EditText. This is necessary if an activity is
         // initially started with the alternate view or if activity is returned to from another app
+    /** HomeAttach: observer for the IME composing (preedit) text. Streaming IMEs — voice
+     *  dictation above all — revise this text live before committing; the screen renders it
+     *  locally (a pty cannot express rewrites). Called on the UI thread with the current
+     *  preedit, and with "" when the region commits or finishes. */
+    java.util.function.Consumer<String> mImePreeditListener;
+
+    public void setImePreeditListener(java.util.function.Consumer<String> listener) {
+        mImePreeditListener = listener;
+    }
+
         // and the alternate view was the one selected the last time.
         if (mClient.isTerminalViewSelected()) {
             if (mClient.shouldEnforceCharBasedInput()) {
                 // Some keyboards seems do not reset the internal state on TYPE_NULL.
                 // Affects mostly Samsung stock keyboards.
                 // https://github.com/termux/termux-app/issues/686
-                // However, this is not a valid value as per AOSP since `InputType.TYPE_CLASS_*` is
-                // not set and it logs a warning:
-                // W/InputAttributes: Unexpected input class: inputType=0x00080090 imeOptions=0x02000000
-                // https://cs.android.com/android/platform/superproject/+/android-11.0.0_r40:packages/inputmethods/LatinIME/java/src/com/android/inputmethod/latin/InputAttributes.java;l=79
-                outAttrs.inputType = InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS;
+                // HomeAttach: upstream used TYPE_TEXT_VARIATION_VISIBLE_PASSWORD here, but
+                // keyboards treat password fields as dictation-forbidden: Samsung voice typing
+                // hangs at "converting" and never commits. A plain text class keeps the Samsung
+                // state machine happy AND lets voice input commit through the InputConnection;
+                // NO_SUGGESTIONS still suppresses autocorrect mangling of terminal input.
+                outAttrs.inputType = InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS;
             } else {
                 // Using InputType.NULL is the most correct input type and avoids issues with other hacks.
                 //
@@ -369,6 +380,61 @@ public final class TerminalView extends View {
             public boolean deleteSurroundingText(int leftLength, int rightLength) {
                 if (TERMINAL_VIEW_KEY_LOGGING_ENABLED) {
                     mClient.logInfo(LOG_TAG, "IME: deleteSurroundingText(" + leftLength + ", " + rightLength + ")");
+            // HomeAttach: voice engines (Samsung voice typing in particular) probe the editor
+            // before inserting anything; a null ExtractedText reads as "broken editor" and the
+            // engine silently drops the recognized text. Answer the probes from the (transient)
+            // editable so dictation commits like any other IME text.
+            @Override
+            public android.view.inputmethod.ExtractedText getExtractedText(
+                    android.view.inputmethod.ExtractedTextRequest request, int flags) {
+                if (TERMINAL_VIEW_KEY_LOGGING_ENABLED) mClient.logInfo(LOG_TAG, "IME: getExtractedText(flags=" + flags + ")");
+                Editable content = getEditable();
+                android.view.inputmethod.ExtractedText extracted = new android.view.inputmethod.ExtractedText();
+                extracted.text = content == null ? "" : content.toString();
+                extracted.startOffset = 0;
+                extracted.selectionStart = extracted.text.length();
+                extracted.selectionEnd = extracted.text.length();
+                return extracted;
+            }
+
+            // HomeAttach: the pty is an append-only byte pipe with no "rewrite" primitive, so
+            // a streaming IME's composing region (voice dictation revising text as it goes)
+            // CANNOT be mirrored remotely — emulating revisions with backspaces desyncs on
+            // any remote line editor. Desktop terminals solve this by drawing the preedit
+            // locally and committing only final text; we do the same: surface the composing
+            // text to the screen via onImePreeditChanged, send bytes only on commit/finish.
+            @Override
+            public boolean setComposingText(CharSequence text, int newCursorPosition) {
+                if (TERMINAL_VIEW_KEY_LOGGING_ENABLED) mClient.logInfo(LOG_TAG, "IME: setComposingText(\"" + text + "\", " + newCursorPosition + ")");
+                boolean result = super.setComposingText(text, newCursorPosition);
+                if (mImePreeditListener != null) mImePreeditListener.accept(text.toString());
+                return result;
+            }
+
+            @Override
+            public CharSequence getTextBeforeCursor(int length, int flags) {
+                if (TERMINAL_VIEW_KEY_LOGGING_ENABLED) mClient.logInfo(LOG_TAG, "IME: getTextBeforeCursor(" + length + ")");
+                return super.getTextBeforeCursor(length, flags);
+            }
+
+            @Override
+            public CharSequence getTextAfterCursor(int length, int flags) {
+                if (TERMINAL_VIEW_KEY_LOGGING_ENABLED) mClient.logInfo(LOG_TAG, "IME: getTextAfterCursor(" + length + ")");
+                return super.getTextAfterCursor(length, flags);
+            }
+
+            @Override
+            public boolean performPrivateCommand(String action, android.os.Bundle data) {
+                if (TERMINAL_VIEW_KEY_LOGGING_ENABLED) mClient.logInfo(LOG_TAG, "IME: performPrivateCommand(" + action + ")");
+                return super.performPrivateCommand(action, data);
+            }
+
+            @Override
+            public boolean requestCursorUpdates(int cursorUpdateMode) {
+                if (TERMINAL_VIEW_KEY_LOGGING_ENABLED) mClient.logInfo(LOG_TAG, "IME: requestCursorUpdates(" + cursorUpdateMode + ")");
+                return super.requestCursorUpdates(cursorUpdateMode);
+            }
+
                 }
                 // The stock Samsung keyboard with 'Auto check spelling' enabled sends leftLength > 1.
                 KeyEvent deleteKey = new KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_DEL);
@@ -376,6 +442,7 @@ public final class TerminalView extends View {
                 return super.deleteSurroundingText(leftLength, rightLength);
             }
 
+                if (mImePreeditListener != null) mImePreeditListener.accept("");
             void sendTextToTerminal(CharSequence text) {
                 stopTextSelectionMode();
                 final int textLengthInChars = text.length();
@@ -391,6 +458,7 @@ public final class TerminalView extends View {
                         }
                     } else {
                         codePoint = firstChar;
+                if (mImePreeditListener != null) mImePreeditListener.accept("");
                     }
 
                     // Check onKeyDown() for details.
