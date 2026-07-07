@@ -28,20 +28,32 @@ touch "$AUTHORIZED"
 chmod 600 "$AUTHORIZED"
 
 revoke_homeattach_keys() {
-    # Drop every line whose comment marks it as a HomeAttach app key.
-    if grep -q " $KEY_COMMENT\$" "$AUTHORIZED" 2>/dev/null; then
-        local tmp
-        tmp=$(mktemp)
-        grep -v " $KEY_COMMENT\$" "$AUTHORIZED" > "$tmp" || true
-        cat "$tmp" > "$AUTHORIZED"
-        rm -f "$tmp"
-        echo "Revoked previously authorized HomeAttach key(s)."
+    # Revoke by BOTH the comment tag and the exact key material of the current
+    # key file, so a prior key is removed even if its comment was rewritten.
+    local old_field="${1:-}"
+    local before after tmp
+    before=$(wc -l < "$AUTHORIZED" 2>/dev/null || echo 0)
+    tmp=$(mktemp)
+    awk -v c=" $KEY_COMMENT\$" -v f="$old_field" '
+        $0 ~ c { next }
+        f != "" && index($0, f) { next }
+        { print }
+    ' "$AUTHORIZED" > "$tmp" || true
+    cat "$tmp" > "$AUTHORIZED"
+    rm -f "$tmp"
+    after=$(wc -l < "$AUTHORIZED" 2>/dev/null || echo 0)
+    if [ "$before" -ne "$after" ]; then
+        echo "Revoked $((before - after)) previously authorized HomeAttach key(s)."
+    else
+        echo "No prior HomeAttach key was authorized (nothing to revoke)."
     fi
 }
 
 if [ "$ROTATE" -eq 1 ]; then
     echo "Rotating HomeAttach SSH key..."
-    revoke_homeattach_keys
+    OLD_FIELD=""
+    [ -f "${KEY_PATH}.pub" ] && OLD_FIELD=$(awk '{print $2}' "${KEY_PATH}.pub")
+    revoke_homeattach_keys "$OLD_FIELD"
     rm -f "$KEY_PATH" "${KEY_PATH}.pub"
     ssh-keygen -t ed25519 -f "$KEY_PATH" -N "" -C "$KEY_COMMENT"
     cat "${KEY_PATH}.pub" >> "$AUTHORIZED"
