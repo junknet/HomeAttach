@@ -35,12 +35,27 @@ class SettingsStore(context: Context) {
         )
     }
 
-    fun load(): HostConfig = HostConfig(
-        host = prefs.getString(KEY_HOST, "") ?: "",
-        port = prefs.getInt(KEY_PORT, 22),
-        username = prefs.getString(KEY_USERNAME, "") ?: "",
-        privateKeyPem = prefs.getString(KEY_KEY_PEM, "") ?: "",
-    )
+    fun load(): HostConfig {
+        val config = HostConfig(
+            host = prefs.getString(KEY_HOST, "") ?: "",
+            port = prefs.getInt(KEY_PORT, 22),
+            username = prefs.getString(KEY_USERNAME, "") ?: "",
+            privateKeyPem = prefs.getString(KEY_KEY_PEM, "") ?: "",
+        )
+        if (com.homeattach.app.BuildConfig.DEBUG && !config.isValid) {
+            val debugConfig = HostConfig(
+                host = com.homeattach.app.BuildConfig.HOMEATTACH_DEBUG_HOST,
+                port = com.homeattach.app.BuildConfig.HOMEATTACH_DEBUG_PORT,
+                username = com.homeattach.app.BuildConfig.HOMEATTACH_DEBUG_USERNAME,
+                privateKeyPem = com.homeattach.app.BuildConfig.HOMEATTACH_DEBUG_PRIVATE_KEY,
+            )
+            if (debugConfig.isValid) {
+                save(debugConfig)
+                return debugConfig
+            }
+        }
+        return config
+    }
 
     fun save(config: HostConfig) {
         prefs.edit()

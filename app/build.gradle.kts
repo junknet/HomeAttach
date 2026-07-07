@@ -41,7 +41,9 @@ fun localPropertyOrEnv(name: String, defaultValue: String = ""): String {
 fun buildConfigString(value: String): String {
     return "\"" + value
         .replace("\\", "\\\\")
-        .replace("\"", "\\\"") + "\""
+        .replace("\"", "\\\"")
+        .replace("\n", "\\n")
+        .replace("\r", "\\r") + "\""
 }
 
 val githubRepository = providers.environmentVariable("GITHUB_REPOSITORY").orNull.orEmpty()
@@ -76,6 +78,22 @@ android {
             "UPDATE_MANIFEST_URL",
             buildConfigString(localPropertyOrEnv("HOMEATTACH_UPDATE_MANIFEST_URL", manifestDefault)),
         )
+
+        val debugHost = localPropertyOrEnv("HOMEATTACH_HOME_HOST", "")
+        val debugPort = localPropertyOrEnv("HOMEATTACH_HOME_PORT", "22").toIntOrNull() ?: 22
+        val debugUsername = localPropertyOrEnv("HOMEATTACH_HOME_USERNAME", "")
+        val debugKeyPath = localPropertyOrEnv("HOMEATTACH_HOME_PRIVATE_KEY_FILE", "")
+        val debugKeyContent = if (debugKeyPath.isNotBlank()) {
+            val f = file(debugKeyPath)
+            if (f.exists()) f.readText() else ""
+        } else {
+            ""
+        }
+
+        buildConfigField("String", "HOMEATTACH_DEBUG_HOST", buildConfigString(debugHost))
+        buildConfigField("int", "HOMEATTACH_DEBUG_PORT", debugPort.toString())
+        buildConfigField("String", "HOMEATTACH_DEBUG_USERNAME", buildConfigString(debugUsername))
+        buildConfigField("String", "HOMEATTACH_DEBUG_PRIVATE_KEY", buildConfigString(debugKeyContent))
     }
 
     signingConfigs {
