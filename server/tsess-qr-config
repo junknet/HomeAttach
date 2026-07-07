@@ -79,9 +79,13 @@ if [ -z "$IP" ]; then
     exit 1
 fi
 
-# Encode the private key with literal \n so it fits one JSON string.
-PEM_CONTENT=$(awk '{printf "%s\\n", $0}' "$KEY_PATH")
-JSON_CONFIG="{\"host\":\"$IP\",\"port\":22,\"username\":\"$USER_NAME\",\"privateKey\":\"$PEM_CONTENT\"}"
+# Full config as YAML; the private key rides in a block scalar, so the PEM
+# survives byte-for-byte with no escaping games.
+YAML_CONFIG="host: $IP
+port: 22
+username: $USER_NAME
+private_key: |
+$(sed 's/^/  /' "$KEY_PATH")"
 
 echo "=========================================================="
 echo " HomeAttach Configurator"
@@ -94,10 +98,10 @@ echo ""
 if command -v qrencode >/dev/null 2>&1; then
     echo "Scan this in the app: Settings -> Scan QR Code"
     echo ""
-    printf '%s' "$JSON_CONFIG" | qrencode -t utf8
+    printf '%s' "$YAML_CONFIG" | qrencode -t utf8
 else
     echo "'qrencode' not installed (sudo apt install qrencode) to render a QR."
-    echo "Raw config JSON (paste into the app if needed):"
+    echo "Raw config YAML (paste into the app if needed):"
     echo ""
-    echo "$JSON_CONFIG"
+    echo "$YAML_CONFIG"
 fi

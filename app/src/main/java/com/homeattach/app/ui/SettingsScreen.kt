@@ -65,7 +65,7 @@ import kotlinx.coroutines.withContext
 import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanOptions
 import androidx.activity.compose.rememberLauncherForActivityResult
-import org.json.JSONObject
+import org.yaml.snakeyaml.Yaml
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.foundation.clickable
 import androidx.compose.material.icons.filled.QrCodeScanner
@@ -197,16 +197,8 @@ fun SettingsScreen(
                     scanErrorText = null
                     onFieldEdited()
                 } else {
-                    if (rawValue.contains("BEGIN ") && rawValue.contains(" PRIVATE KEY")) {
-                        keyPem = runCatching { normalizePrivateKeyPem(rawValue) }.getOrElse { _ -> rawValue }
-                        keyVisible = false
-                        scanSuccessText = context.getString(R.string.settings_scan_success)
-                        scanErrorText = null
-                        onFieldEdited()
-                    } else {
-                        scanErrorText = context.getString(R.string.settings_scan_error)
-                        scanSuccessText = null
-                    }
+                    scanErrorText = context.getString(R.string.settings_scan_error)
+                    scanSuccessText = null
                 }
             }
         }
@@ -788,42 +780,33 @@ private fun detectPrivateKeyType(pem: String): String? {
     }
 }
 
-private data class ScannedConfig(
+internal data class ScannedConfig(
     val host: String?,
     val port: Int?,
     val username: String?,
     val privateKey: String?
 )
 
-private fun parseScannedConfig(text: String): ScannedConfig? {
-    val trimmed = text.trim()
-    if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
-        return try {
-            val json = JSONObject(trimmed)
-            val host = json.optString("host", "").ifBlank { json.optString("Host", "") }.takeIf { it.isNotEmpty() }
-            val port = if (json.has("port")) json.getInt("port") else if (json.has("Port")) json.getInt("Port") else null
-            val username = json.optString("username", "").ifBlank { json.optString("Username", "") }.ifBlank { json.optString("user", "") }.takeIf { it.isNotEmpty() }
-            val privateKey = json.optString("privateKey", "")
-                .ifBlank { json.optString("private_key", "") }
-                .ifBlank { json.optString("key", "") }
-                .ifBlank { json.optString("PrivateKey", "") }
-                .takeIf { it.isNotEmpty() }
-            ScannedConfig(host, port, username, privateKey)
-        } catch (e: Exception) {
-            null
+/**
+ * Parses the full-config QR payload emitted by `tsess-qr-config`: a YAML document with
+ * `host` / `port` / `username` and the PEM riding in a `private_key` block scalar.
+ * Old JSON payloads parse through the same call — JSON is a YAML subset.
+ */
+internal fun parseScannedConfig(text: String): ScannedConfig? {
+    return try {
+        val root = Yaml().load<Any?>(text.trim()) as? Map<*, *> ?: return null
+        val host = (root["host"] as? String)?.trim()?.takeIf { it.isNotEmpty() }
+        val port = when (val raw = root["port"]) {
+            is Int -> raw
+            is String -> raw.toIntOrNull()
+            else -> null
         }
+        val username = (root["username"] as? String)?.trim()?.takeIf { it.isNotEmpty() }
+        val privateKey = ((root["private_key"] ?: root["privateKey"]) as? String)
+            ?.takeIf { it.isNotBlank() }
+        if (host == null && username == null && privateKey == null) null
+        else ScannedConfig(host, port, username, privateKey)
+    } catch (e: Exception) {
+        null
     }
-    if (trimmed.startsWith("homeattach://")) {
-        return try {
-            val uri = android.net.Uri.parse(trimmed)
-            val host = uri.getQueryParameter("host")
-            val port = uri.getQueryParameter("port")?.toIntOrNull()
-            val username = uri.getQueryParameter("username")
-            val privateKey = uri.getQueryParameter("key") ?: uri.getQueryParameter("privateKey")
-            ScannedConfig(host, port, username, privateKey)
-        } catch (e: Exception) {
-            null
-        }
-    }
-    return null
 }

@@ -156,6 +156,8 @@ dependencies {
     implementation(libs.androidx.security.crypto)
     implementation("com.journeyapps:zxing-android-embedded:4.3.0")
     implementation("androidx.compose.material:material-icons-extended")
+    // Full-config QR payloads (tsess-qr-config) are YAML; JSON payloads parse as its subset.
+    implementation("org.yaml:snakeyaml:2.2")
 
     testImplementation(libs.junit)
     // Android's bundled org.json is a stub on the JVM unit-test classpath; the real impl lets
