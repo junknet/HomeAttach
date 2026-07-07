@@ -3,12 +3,10 @@ package com.homeattach.app.ui
 import android.app.Activity
 import android.content.Context
 import android.content.ContextWrapper
-import android.graphics.Rect
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.view.View
-import android.view.WindowManager
 import android.view.inputmethod.InputMethodManager
 import android.widget.Toast
 import androidx.core.view.WindowCompat
@@ -208,19 +206,6 @@ fun TerminalScreen(
         onDispose { rootView.keepScreenOn = false }
     }
 
-    val hostActivity = remember(context) { context.findHostActivity() }
-    DisposableEffect(hostActivity) {
-        if (hostActivity == null) {
-            onDispose {}
-        } else {
-            val previousSoftInputMode = hostActivity.window.attributes.softInputMode
-            hostActivity.window.setSoftInputMode(buildSoftInputModeWithAdjustNothing(previousSoftInputMode))
-            onDispose {
-                hostActivity.window.setSoftInputMode(previousSoftInputMode)
-            }
-        }
-    }
-
     DisposableEffect(sessionName, ownerIdentifier, connectAttempt) {
         val disposed = AtomicBoolean(false)
         val appContext = context.applicationContext
@@ -355,10 +340,16 @@ fun TerminalScreen(
         }
     }
 
-    val keyboardBottomInsetPx = rememberKeyboardOverlayBottomInsetPx()
-    val imeVisible = WindowInsets.isImeVisible || keyboardBottomInsetPx > 0
+    val imeVisible = WindowInsets.isImeVisible
     val drawerState = rememberDrawerState(initialValue = DrawerValue.Closed)
     val scope = rememberCoroutineScope()
+
+    LaunchedEffect(imeVisible, terminalView) {
+        terminalView?.let { view ->
+            view.requestLayout()
+            view.updateSize(true)
+        }
+    }
 
     LaunchedEffect(drawerState.currentValue, drawerState.targetValue, terminalView) {
         if (drawerState.currentValue != DrawerValue.Closed ||
@@ -637,12 +628,6 @@ private tailrec fun Context.findHostActivity(): Activity? = when (this) {
     else -> null
 }
 
-private fun buildSoftInputModeWithAdjustNothing(previousSoftInputMode: Int): Int {
-    val modeWithoutAdjust =
-        previousSoftInputMode and WindowManager.LayoutParams.SOFT_INPUT_MASK_ADJUST.inv()
-    return modeWithoutAdjust or WindowManager.LayoutParams.SOFT_INPUT_ADJUST_NOTHING
-}
-
 private fun View.showSoftKeyboard() {
     val inputMethodManager = context.getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager
     inputMethodManager?.showSoftInput(this, InputMethodManager.SHOW_IMPLICIT)
@@ -771,39 +756,6 @@ private fun ConnectionProblem(
             }
         }
     }
-}
-
-@Composable
-private fun rememberKeyboardOverlayBottomInsetPx(): Int {
-    val view = LocalView.current
-    var bottomInsetPx by remember(view) { mutableIntStateOf(0) }
-
-    DisposableEffect(view) {
-        val visibleFrame = Rect()
-        val listener = android.view.ViewTreeObserver.OnGlobalLayoutListener {
-            val rootView = view.rootView
-            rootView.getWindowVisibleDisplayFrame(visibleFrame)
-            val obscuredBottom = (rootView.height - visibleFrame.bottom).coerceAtLeast(0)
-            val nextBottomInsetPx = if (obscuredBottom > rootView.height / 5) {
-                obscuredBottom
-            } else {
-                0
-            }
-            if (nextBottomInsetPx != bottomInsetPx) {
-                bottomInsetPx = nextBottomInsetPx
-            }
-        }
-        view.viewTreeObserver.addOnGlobalLayoutListener(listener)
-        listener.onGlobalLayout()
-        onDispose {
-            val observer = view.viewTreeObserver
-            if (observer.isAlive) {
-                observer.removeOnGlobalLayoutListener(listener)
-            }
-        }
-    }
-
-    return bottomInsetPx
 }
 
 @Composable
