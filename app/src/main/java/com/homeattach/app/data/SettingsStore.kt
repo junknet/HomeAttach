@@ -68,11 +68,16 @@ class SettingsStore(context: Context) {
 
     fun isConfigured(): Boolean = load().isValid
 
-    /** Terminal font size in pixels, persisted across sessions (set by pinch-zoom). */
     fun loadTerminalFontPx(default: Int): Int = prefs.getInt(KEY_FONT_PX, default)
 
     fun saveTerminalFontPx(px: Int) {
         prefs.edit().putInt(KEY_FONT_PX, px).apply()
+    }
+
+    fun loadMaxImeHeight(default: Int): Int = prefs.getInt(KEY_MAX_IME_HEIGHT, default)
+
+    fun saveMaxImeHeight(height: Int) {
+        prefs.edit().putInt(KEY_MAX_IME_HEIGHT, height).apply()
     }
 
     companion object {
@@ -81,5 +86,6 @@ class SettingsStore(context: Context) {
         private const val KEY_USERNAME = "username"
         private const val KEY_KEY_PEM = "key_pem"
         private const val KEY_FONT_PX = "terminal_font_px"
+        private const val KEY_MAX_IME_HEIGHT = "max_ime_height"
     }
 }

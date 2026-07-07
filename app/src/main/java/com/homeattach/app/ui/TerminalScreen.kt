@@ -77,6 +77,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.platform.LocalDensity
 import androidx.activity.compose.BackHandler
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.contentDescription
@@ -86,7 +87,7 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.repeatOnLifecycle
-import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import com.homeattach.app.R
 import com.homeattach.app.data.SettingsStore
 import com.homeattach.app.ssh.RemoteTerminalSize
@@ -108,7 +109,6 @@ import com.termux.view.TerminalViewClient
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.concurrent.thread
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.withContext
@@ -127,9 +127,6 @@ private sealed interface ConnStatus {
     /** The SSH transport dropped mid-session; the remote session may still be alive. */
     data class ConnectionLost(val message: String) : ConnStatus
 }
-
-private const val INITIAL_ANDROID_TERMINAL_COLUMNS = 80
-private const val INITIAL_ANDROID_TERMINAL_ROWS = 24
 
 private const val KEY_REPEAT_INITIAL_DELAY_MS = 400L
 private const val KEY_REPEAT_INTERVAL_MS = 60L
@@ -163,18 +160,32 @@ fun TerminalScreen(
     val ownerIdentifier = remember { buildAndroidFocusOwnerIdentifier() }
     val backNavigationRequested = remember(sessionName) { AtomicBoolean(false) }
     val context = LocalContext.current
+    val measuredSizeRef = remember(sessionName, connectAttempt) { AtomicReference<RemoteTerminalSize?>(null) }
+    val lastSentSize = remember(sessionName, connectAttempt) { AtomicReference<RemoteTerminalSize?>(null) }
+    var terminalSize by remember(sessionName, connectAttempt) { mutableStateOf<RemoteTerminalSize?>(null) }
+    var hasDrawnFirstFrame by remember(sessionName, connectAttempt) { mutableStateOf(false) }
+
     val remoteTerminalSession = remember(sessionName, connectAttempt) {
-        var resizeJob: Job? = null
         RemoteTerminalSession(
             onInput = { bytes -> connectionReference.get()?.send(bytes) },
             onResize = { columns, rows ->
-                resizeJob?.cancel()
-                resizeJob = scope.launch {
-                    delay(300L)
-                    connectionReference.get()?.resizePty(columns, rows)
+                val size = RemoteTerminalSize(columns, rows)
+                measuredSizeRef.set(size)
+                terminalSize = size
+
+                // Before attach the measured size rides in the attach request itself; after
+                // attach every real grid change (only the IME, in immersive mode) is a WINCH.
+                val conn = connectionReference.get()
+                if (conn != null && lastSentSize.get() != size) {
+                    lastSentSize.set(size)
+                    conn.resizePty(columns, rows)
                 }
             },
-        )
+        ).apply {
+            onFirstOutput = {
+                mainHandler.post { hasDrawnFirstFrame = true }
+            }
+        }
     }
 
     DisposableEffect(remoteTerminalSession) {
@@ -183,10 +194,16 @@ fun TerminalScreen(
         }
     }
 
-    DisposableEffect(status) {
-        val activity = context.findHostActivity()
-        val window = activity?.window
-        if (window != null && status is ConnStatus.Connected) {
+    // Immersive fullscreen for the entire life of this screen, entered BEFORE the first layout.
+    // Hiding on entry (instead of on Connected) means the first measured grid is already the
+    // final one, so nothing resizes when the connection lands seconds later. The layout below
+    // must never consume system-bar insets: the bars transiently overlay the terminal (IME or
+    // swipe can bring them back for a few seconds), and consuming their inset would resize the
+    // grid on every show/hide flap — each flap costs a local reflow plus a remote SIGWINCH
+    // full repaint.
+    DisposableEffect(Unit) {
+        val window = context.findHostActivity()?.window
+        if (window != null) {
             val controller = WindowCompat.getInsetsController(window, window.decorView)
             controller.hide(WindowInsetsCompat.Type.systemBars())
             controller.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
@@ -225,15 +242,24 @@ fun TerminalScreen(
         val disposed = AtomicBoolean(false)
         val appContext = context.applicationContext
         val config = settingsStore.load()
-        val attachRequest = TerminalAttachRequest(
-            sessionName = sessionName,
-            ownerIdentifier = ownerIdentifier,
-            terminalSize = RemoteTerminalSize(
-                columns = INITIAL_ANDROID_TERMINAL_COLUMNS,
-                rows = INITIAL_ANDROID_TERMINAL_ROWS,
-            ),
-        )
         val reader = thread(name = "ssh-terminal-reader", isDaemon = true) {
+            // Wait until the terminal size has been measured by the UI layout.
+            var size = measuredSizeRef.get()
+            while (size == null) {
+                if (disposed.get()) return@thread
+                try {
+                    Thread.sleep(16)
+                } catch (e: InterruptedException) {
+                    return@thread
+                }
+                size = measuredSizeRef.get()
+            }
+
+            val attachRequest = TerminalAttachRequest(
+                sessionName = sessionName,
+                ownerIdentifier = ownerIdentifier,
+                terminalSize = size,
+            )
             val conn = try {
                 TerminalConnection.attach(config, attachRequest)
             } catch (e: Exception) {
@@ -247,6 +273,14 @@ fun TerminalScreen(
                 return@thread
             }
             connectionReference.set(conn)
+            lastSentSize.set(size)
+            // Insets were still animating when the first measurement happened: reconcile once
+            // so the remote pty matches the grid the user actually sees.
+            val settledSize = measuredSizeRef.get()
+            if (settledSize != null && settledSize != size) {
+                lastSentSize.set(settledSize)
+                conn.resizePty(settledSize.columns, settledSize.rows)
+            }
             mainHandler.post {
                 status = ConnStatus.Connected
             }
@@ -355,7 +389,27 @@ fun TerminalScreen(
         }
     }
 
+    val composeDensity = LocalDensity.current
     val imeVisible = WindowInsets.isImeVisible
+    val imeHeight = WindowInsets.ime.getBottom(composeDensity)
+    var maxImeHeight by remember { mutableIntStateOf(settingsStore.loadMaxImeHeight(0)) }
+
+    LaunchedEffect(imeHeight, imeVisible) {
+        if (imeVisible && imeHeight > 0) {
+            if (imeHeight > maxImeHeight) {
+                maxImeHeight = imeHeight
+                settingsStore.saveMaxImeHeight(imeHeight)
+            } else if (imeHeight < maxImeHeight) {
+                delay(150L)
+                maxImeHeight = imeHeight
+                settingsStore.saveMaxImeHeight(imeHeight)
+            }
+        }
+    }
+
+    val bottomPaddingPx = if (imeVisible) maxImeHeight else 0
+    val bottomPaddingDp = with(composeDensity) { bottomPaddingPx.toDp() }
+
     val drawerState = rememberDrawerState(initialValue = DrawerValue.Closed)
 
     BackHandler(enabled = (status is ConnStatus.Connected) || drawerState.isOpen) {
@@ -376,9 +430,9 @@ fun TerminalScreen(
         }
     }
 
-    // IME show/hide changes the imePadding Column height → TerminalView.onSizeChanged →
-    // session.updateSize handles the reflow. No manual resize needed (the old double-resize here
-    // caused the first-frame flicker).
+    // IME show/hide is expressed as a discrete bottom padding jump (stored keyboard height,
+    // flipped by imeVisible) instead of the animated imePadding() modifier: the terminal
+    // resizes exactly once per keyboard toggle, not on every animation frame.
 
     LaunchedEffect(drawerState.currentValue, drawerState.targetValue, terminalView) {
         if (drawerState.currentValue != DrawerValue.Closed ||
@@ -499,16 +553,100 @@ fun TerminalScreen(
         }
     ) {
         Scaffold(
-            containerColor = Color(0xFF0A0B10)
+            containerColor = Color(0xFF0A0B10),
+            // Zero insets: transient system bars overlay the terminal instead of resizing it.
+            contentWindowInsets = WindowInsets(0, 0, 0, 0),
         ) { padding ->
             Box(
                 modifier = Modifier
                     .fillMaxSize()
-                    .padding(top = padding.calculateTopPadding())
+                    .padding(padding)
                     .background(Color(0xFF0A0B10)),
             ) {
-                when (val s = status) {
-                    is ConnStatus.Connecting -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                // 1. Layered Terminal Area: Render when connecting or connected
+                if (status is ConnStatus.Connecting || status is ConnStatus.Connected) {
+                    Column(
+                        modifier = Modifier.fillMaxSize(),
+                    ) {
+                        // The terminal simply fills whatever the Column leaves it: full height
+                        // normally, full minus the keys row's discrete IME padding when the
+                        // keyboard is up. One layout pass per IME toggle — no per-frame
+                        // animation resize, no manual height math to double-count.
+                        Box(
+                            modifier = Modifier
+                                .weight(1f)
+                                .fillMaxWidth(),
+                        ) {
+                            AndroidView(
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .background(Color(0xFF0A0B10)),
+                                factory = { ctx ->
+                                    TerminalView(ctx, null).also { view ->
+                                        view.setTerminalViewClient(terminalViewClient)
+                                        view.attachSession(remoteTerminalSession.session)
+                                        // Termux setTextSize is pixels; set before first layout so
+                                        // font metrics are non-zero and cols/rows compute correctly.
+                                        view.setTextSize(terminalFontPx)
+                                        view.setTypeface(terminalTypeface)
+                                        view.setBackgroundColor(0xFF0A0B10.toInt())
+                                        // Termux's TerminalView (unlike jackpal) does not make
+                                        // itself focusable; without this, requestFocus() is a
+                                        // no-op, the IME never binds to it, and input is lost.
+                                        view.isFocusable = true
+                                        view.isFocusableInTouchMode = true
+                                        view.setOnFocusChangeListener { _, hasFocus ->
+                                            if (hasFocus &&
+                                                remoteTerminalSession.currentColumns > 0 &&
+                                                remoteTerminalSession.currentRows > 0
+                                            ) {
+                                                connectionReference.get()?.focusPty(
+                                                    remoteTerminalSession.currentColumns,
+                                                    remoteTerminalSession.currentRows,
+                                                )
+                                            }
+                                        }
+                                        remoteTerminalSession.onScreenUpdated = { view.onScreenUpdated() }
+                                        terminalView = view
+                                    }
+                                },
+                                update = { view ->
+                                    view.attachSession(remoteTerminalSession.session)
+                                    remoteTerminalSession.onScreenUpdated = { view.onScreenUpdated() }
+                                },
+                            )
+                            // Left-edge swipe zone: only this thin strip opens the drawer, so the
+                            // terminal body keeps all its horizontal touches (selection, scroll).
+                            Box(
+                                modifier = Modifier
+                                    .align(Alignment.CenterStart)
+                                    .fillMaxHeight()
+                                    .width(20.dp)
+                                    .pointerInput(Unit) {
+                                        detectHorizontalDragGestures { _, dragAmount ->
+                                            if (dragAmount > 8f) scope.launch { drawerState.open() }
+                                        }
+                                    },
+                            )
+                        }
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(bottom = bottomPaddingDp)
+                        ) {
+                            ExtraKeysRow(remoteTerminalSession = remoteTerminalSession)
+                        }
+                    }
+                }
+
+                // 2. Loading overlay: show when connecting, when terminal size hasn't been measured, or before first output
+                if (status is ConnStatus.Connecting || terminalSize == null || !hasDrawnFirstFrame) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .background(Color(0xFF0A0B10)),
+                        contentAlignment = Alignment.Center
+                    ) {
                         Column(horizontalAlignment = Alignment.CenterHorizontally) {
                             CircularProgressIndicator(color = Color(0xFF00E676))
                             Text(
@@ -519,7 +657,12 @@ fun TerminalScreen(
                             )
                         }
                     }
-                    is ConnStatus.ConnectFailed -> ConnectionProblem(
+                }
+
+                // 3. Connection problem overlays
+                if (status is ConnStatus.ConnectFailed) {
+                    val s = status as ConnStatus.ConnectFailed
+                    ConnectionProblem(
                         title = stringResource(R.string.terminal_connection_failed_title),
                         message = s.message,
                         hint = null,
@@ -527,7 +670,9 @@ fun TerminalScreen(
                         onRetry = { reconnect() },
                         onBack = { closeConnectionAndNavigateBackOnce() },
                     )
-                    is ConnStatus.ConnectionLost -> ConnectionProblem(
+                } else if (status is ConnStatus.ConnectionLost) {
+                    val s = status as ConnStatus.ConnectionLost
+                    ConnectionProblem(
                         title = stringResource(R.string.terminal_connection_lost_title),
                         message = s.message,
                         hint = stringResource(R.string.terminal_connection_lost_hint),
@@ -535,69 +680,6 @@ fun TerminalScreen(
                         onRetry = { reconnect() },
                         onBack = { closeConnectionAndNavigateBackOnce() },
                     )
-                    is ConnStatus.Connected -> {
-                        Column(
-                            modifier = Modifier
-                                .fillMaxSize()
-                                .imePadding(),
-                        ) {
-                            Box(
-                                modifier = Modifier
-                                    .weight(1f)
-                                    .fillMaxWidth(),
-                            ) {
-                                AndroidView(
-                                    modifier = Modifier
-                                        .fillMaxSize()
-                                        .background(Color(0xFF0A0B10)),
-                                    factory = { ctx ->
-                                        TerminalView(ctx, null).also { view ->
-                                            view.setTerminalViewClient(terminalViewClient)
-                                            view.attachSession(remoteTerminalSession.session)
-                                            // Termux setTextSize is pixels; set before first layout so
-                                            // font metrics are non-zero and cols/rows compute correctly.
-                                            view.setTextSize(terminalFontPx)
-                                            view.setTypeface(terminalTypeface)
-                                            view.setBackgroundColor(0xFF0A0B10.toInt())
-                                            // Termux's TerminalView (unlike jackpal) does not make
-                                            // itself focusable; without this, requestFocus() is a
-                                            // no-op, the IME never binds to it, and input is lost.
-                                            view.isFocusable = true
-                                            view.isFocusableInTouchMode = true
-                                            view.setOnFocusChangeListener { _, hasFocus ->
-                                                if (hasFocus &&
-                                                    remoteTerminalSession.currentColumns > 0 &&
-                                                    remoteTerminalSession.currentRows > 0
-                                                ) {
-                                                    connectionReference.get()?.focusPty(
-                                                        remoteTerminalSession.currentColumns,
-                                                        remoteTerminalSession.currentRows,
-                                                    )
-                                                }
-                                            }
-                                            remoteTerminalSession.onScreenUpdated = { view.onScreenUpdated() }
-                                            terminalView = view
-                                        }
-                                    },
-                                    update = {},
-                                )
-                                // Left-edge swipe zone: only this thin strip opens the drawer, so the
-                                // terminal body keeps all its horizontal touches (selection, scroll).
-                                Box(
-                                    modifier = Modifier
-                                        .align(Alignment.CenterStart)
-                                        .fillMaxHeight()
-                                        .width(20.dp)
-                                        .pointerInput(Unit) {
-                                            detectHorizontalDragGestures { _, dragAmount ->
-                                                if (dragAmount > 8f) scope.launch { drawerState.open() }
-                                            }
-                                        },
-                                )
-                            }
-                            ExtraKeysRow(remoteTerminalSession = remoteTerminalSession)
-                        }
-                    }
                 }
             }
         }

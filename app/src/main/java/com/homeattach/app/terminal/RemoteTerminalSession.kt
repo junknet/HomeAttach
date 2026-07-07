@@ -20,6 +20,9 @@ class RemoteTerminalSession(
     /** Set by the screen to repaint the TerminalView when new output lands. */
     var onScreenUpdated: () -> Unit = {}
 
+    /** Fired when the emulator receives and processes the first chunk of remote data. */
+    var onFirstOutput: () -> Unit = {}
+
     var currentColumns = 0
         private set
     var currentRows = 0
@@ -73,6 +76,8 @@ class RemoteTerminalSession(
     // Keeps re-posting until the view has laid out and the emulator exists, then drains all pending
     // output in one pass. TerminalEmulator is not thread-safe, so this runs only on the main thread.
     private val drainRunnable = object : Runnable {
+        private var firstOutputFired = false
+
         override fun run() {
             val emulator = session.emulator
             if (emulator == null) {
@@ -86,7 +91,13 @@ class RemoteTerminalSession(
                 emulator.append(chunk, chunk.size)
                 appended = true
             }
-            if (appended) onScreenUpdated()
+            if (appended) {
+                onScreenUpdated()
+                if (!firstOutputFired) {
+                    firstOutputFired = true
+                    onFirstOutput()
+                }
+            }
         }
     }
 
