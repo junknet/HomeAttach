@@ -62,6 +62,21 @@ import java.util.Locale
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import com.journeyapps.barcodescanner.ScanContract
+import com.journeyapps.barcodescanner.ScanOptions
+import androidx.activity.compose.rememberLauncherForActivityResult
+import org.json.JSONObject
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.foundation.clickable
+import androidx.compose.material.icons.filled.QrCodeScanner
+import androidx.compose.material3.TopAppBarDefaults
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Box
+import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.draw.drawBehind
 
 /**
  * First-run / settings screen: host, port, username and the SSH private key PEM. Everything is
@@ -161,39 +176,210 @@ fun SettingsScreen(
         testState = TestConnectionState.Idle
     }
 
-    Scaffold(
-        topBar = {
-            TopAppBar(
-                title = { Text(stringResource(R.string.settings_title)) },
-                navigationIcon = {
-                    // First run has nowhere to go back to; the screen is then the app's root.
-                    if (onBack != null) {
-                        IconButton(onClick = onBack) {
+    var scanErrorText by remember { mutableStateOf<String?>(null) }
+    var scanSuccessText by remember { mutableStateOf<String?>(null) }
+
+    val scanLauncher = rememberLauncherForActivityResult(
+        contract = ScanContract(),
+        onResult = { result ->
+            val rawValue = result.contents
+            if (rawValue != null) {
+                val parsed = parseScannedConfig(rawValue)
+                if (parsed != null) {
+                    parsed.host?.let { host = it }
+                    parsed.port?.let { port = it.toString() }
+                    parsed.username?.let { username = it }
+                    parsed.privateKey?.let {
+                        keyPem = runCatching { normalizePrivateKeyPem(it) }.getOrElse { _ -> it }
+                        keyVisible = false
+                    }
+                    scanSuccessText = context.getString(R.string.settings_scan_success)
+                    scanErrorText = null
+                    onFieldEdited()
+                } else {
+                    if (rawValue.contains("BEGIN ") && rawValue.contains(" PRIVATE KEY")) {
+                        keyPem = runCatching { normalizePrivateKeyPem(rawValue) }.getOrElse { _ -> rawValue }
+                        keyVisible = false
+                        scanSuccessText = context.getString(R.string.settings_scan_success)
+                        scanErrorText = null
+                        onFieldEdited()
+                    } else {
+                        scanErrorText = context.getString(R.string.settings_scan_error)
+                        scanSuccessText = null
+                    }
+                }
+            }
+        }
+    )
+
+    val triggerScan = {
+        scanErrorText = null
+        scanSuccessText = null
+        val options = ScanOptions().apply {
+            setDesiredBarcodeFormats(ScanOptions.QR_CODE)
+            setPrompt(context.getString(R.string.settings_scan_qr))
+            setCameraId(0)
+            setBeepEnabled(false)
+            setBarcodeImageEnabled(false)
+        }
+        scanLauncher.launch(options)
+        Unit
+    }
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(MaterialTheme.colorScheme.background)
+            .drawBehind {
+                drawCircle(
+                    brush = Brush.radialGradient(
+                        colors = listOf(
+                            Color(0xFF006B5B).copy(alpha = 0.15f),
+                            Color.Transparent
+                        ),
+                        center = androidx.compose.ui.geometry.Offset(0f, 0f),
+                        radius = size.width * 0.9f
+                    )
+                )
+                drawCircle(
+                    brush = Brush.radialGradient(
+                        colors = listOf(
+                            Color(0xFF56DBBC).copy(alpha = 0.1f),
+                            Color.Transparent
+                        ),
+                        center = androidx.compose.ui.geometry.Offset(size.width, size.height * 0.6f),
+                        radius = size.width * 0.7f
+                    )
+                )
+            }
+    ) {
+        Scaffold(
+            containerColor = Color.Transparent,
+            topBar = {
+                TopAppBar(
+                    title = { Text(stringResource(R.string.settings_title)) },
+                    navigationIcon = {
+                        // First run has nowhere to go back to; the screen is then the app's root.
+                        if (onBack != null) {
+                            IconButton(onClick = onBack) {
+                                Icon(
+                                    Icons.AutoMirrored.Filled.ArrowBack,
+                                    contentDescription = stringResource(R.string.settings_back),
+                                )
+                            }
+                        }
+                    },
+                    actions = {
+                        IconButton(onClick = triggerScan) {
                             Icon(
-                                Icons.AutoMirrored.Filled.ArrowBack,
-                                contentDescription = stringResource(R.string.settings_back),
+                                imageVector = Icons.Filled.QrCodeScanner,
+                                contentDescription = stringResource(R.string.settings_scan_qr),
+                                tint = MaterialTheme.colorScheme.primary
+                            )
+                        }
+                    },
+                    colors = TopAppBarDefaults.topAppBarColors(
+                        containerColor = Color.Transparent
+                    )
+                )
+            },
+        ) { padding ->
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(padding)
+                    .padding(horizontal = 16.dp, vertical = 12.dp)
+                    .verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                Text(
+                    stringResource(R.string.settings_intro),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+
+                if (scanSuccessText != null) {
+                    Text(
+                        text = scanSuccessText!!,
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.padding(vertical = 4.dp)
+                    )
+                }
+                if (scanErrorText != null) {
+                    Text(
+                        text = scanErrorText!!,
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.error,
+                        modifier = Modifier.padding(vertical = 4.dp)
+                    )
+                }
+
+                // QR Code Scan Hero Card
+                Card(
+                    onClick = triggerScan,
+                    shape = RoundedCornerShape(20.dp),
+                    border = BorderStroke(
+                        1.dp,
+                        Brush.linearGradient(
+                            colors = listOf(
+                                MaterialTheme.colorScheme.primary.copy(alpha = 0.5f),
+                                MaterialTheme.colorScheme.tertiary.copy(alpha = 0.15f)
+                            )
+                        )
+                    ),
+                    colors = CardDefaults.cardColors(
+                        containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.15f)
+                    ),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 6.dp)
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(16.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .size(48.dp)
+                                .background(
+                                    brush = Brush.linearGradient(
+                                        colors = listOf(
+                                            MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.7f),
+                                            MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.7f)
+                                        )
+                                    ),
+                                    shape = RoundedCornerShape(12.dp)
+                                ),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Icon(
+                                imageVector = Icons.Filled.QrCodeScanner,
+                                contentDescription = null,
+                                tint = MaterialTheme.colorScheme.primary,
+                                modifier = Modifier.size(24.dp)
+                            )
+                        }
+                        Spacer(modifier = Modifier.width(16.dp))
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = stringResource(R.string.settings_scan_qr),
+                                style = MaterialTheme.typography.titleMedium,
+                                color = MaterialTheme.colorScheme.onSurface
+                            )
+                            Spacer(modifier = Modifier.height(2.dp))
+                            Text(
+                                text = "Scan a config QR code (JSON or PEM) to auto-fill.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
                         }
                     }
-                },
-            )
-        },
-    ) { padding ->
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(padding)
-                .padding(horizontal = 16.dp, vertical = 12.dp)
-                .verticalScroll(rememberScrollState()),
-            verticalArrangement = Arrangement.spacedBy(10.dp),
-        ) {
-            Text(
-                stringResource(R.string.settings_intro),
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
+                }
 
-            SectionHeader(stringResource(R.string.settings_section_server))
+                SectionHeader(stringResource(R.string.settings_section_server))
 
             OutlinedTextField(
                 value = host,
@@ -210,7 +396,7 @@ fun SettingsScreen(
                     else -> null
                 },
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Ascii),
-                shape = RoundedCornerShape(12.dp),
+                shape = RoundedCornerShape(16.dp),
                 modifier = Modifier.fillMaxWidth(),
             )
 
@@ -225,7 +411,7 @@ fun SettingsScreen(
                 isError = portError != null,
                 supportingText = portError?.let { { Text(it) } },
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                shape = RoundedCornerShape(12.dp),
+                shape = RoundedCornerShape(16.dp),
                 modifier = Modifier.fillMaxWidth(),
             )
 
@@ -240,7 +426,7 @@ fun SettingsScreen(
                 isError = usernameError != null,
                 supportingText = usernameError?.let { { Text(it) } },
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Ascii),
-                shape = RoundedCornerShape(12.dp),
+                shape = RoundedCornerShape(16.dp),
                 modifier = Modifier.fillMaxWidth(),
             )
 
@@ -269,7 +455,7 @@ fun SettingsScreen(
                     PasswordVisualTransformation()
                 },
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Ascii),
-                shape = RoundedCornerShape(12.dp),
+                shape = RoundedCornerShape(16.dp),
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(200.dp),
@@ -334,6 +520,7 @@ fun SettingsScreen(
                         }
                     },
                     enabled = testState != TestConnectionState.Running,
+                    shape = RoundedCornerShape(16.dp),
                     modifier = Modifier.weight(1f),
                 ) {
                     Text(stringResource(R.string.settings_test_connection))
@@ -347,6 +534,7 @@ fun SettingsScreen(
                             showEmptyErrors = true
                         }
                     },
+                    shape = RoundedCornerShape(16.dp),
                     modifier = Modifier.weight(1f),
                 ) {
                     Text(stringResource(R.string.settings_save))
@@ -416,6 +604,7 @@ fun SettingsScreen(
                     },
                     enabled = updateState !is UpdateUiState.Checking &&
                         updateState !is UpdateUiState.Downloading,
+                    shape = RoundedCornerShape(16.dp),
                     modifier = Modifier.weight(1f),
                 ) {
                     Text(stringResource(R.string.settings_update_check))
@@ -444,6 +633,7 @@ fun SettingsScreen(
                         }
                     },
                     enabled = updateState is UpdateUiState.Available,
+                    shape = RoundedCornerShape(16.dp),
                     modifier = Modifier.weight(1f),
                 ) {
                     Text(stringResource(R.string.settings_update_install))
@@ -452,6 +642,7 @@ fun SettingsScreen(
 
             UpdateStatusText(updateState)
         }
+    }
     }
 }
 
@@ -595,4 +786,44 @@ private fun detectPrivateKeyType(pem: String): String? {
         "BEGIN PRIVATE KEY" in text -> "PKCS#8"
         else -> null
     }
+}
+
+private data class ScannedConfig(
+    val host: String?,
+    val port: Int?,
+    val username: String?,
+    val privateKey: String?
+)
+
+private fun parseScannedConfig(text: String): ScannedConfig? {
+    val trimmed = text.trim()
+    if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
+        return try {
+            val json = JSONObject(trimmed)
+            val host = json.optString("host", "").ifBlank { json.optString("Host", "") }.takeIf { it.isNotEmpty() }
+            val port = if (json.has("port")) json.getInt("port") else if (json.has("Port")) json.getInt("Port") else null
+            val username = json.optString("username", "").ifBlank { json.optString("Username", "") }.ifBlank { json.optString("user", "") }.takeIf { it.isNotEmpty() }
+            val privateKey = json.optString("privateKey", "")
+                .ifBlank { json.optString("private_key", "") }
+                .ifBlank { json.optString("key", "") }
+                .ifBlank { json.optString("PrivateKey", "") }
+                .takeIf { it.isNotEmpty() }
+            ScannedConfig(host, port, username, privateKey)
+        } catch (e: Exception) {
+            null
+        }
+    }
+    if (trimmed.startsWith("homeattach://")) {
+        return try {
+            val uri = android.net.Uri.parse(trimmed)
+            val host = uri.getQueryParameter("host")
+            val port = uri.getQueryParameter("port")?.toIntOrNull()
+            val username = uri.getQueryParameter("username")
+            val privateKey = uri.getQueryParameter("key") ?: uri.getQueryParameter("privateKey")
+            ScannedConfig(host, port, username, privateKey)
+        } catch (e: Exception) {
+            null
+        }
+    }
+    return null
 }

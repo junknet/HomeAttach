@@ -1,0 +1,91 @@
+#!/usr/bin/env bash
+
+# SSH configuration + QR-code generator for HomeAttach.
+#
+# Default : ensure a dedicated HomeAttach keypair exists and is authorized,
+#           then print the connection config as a terminal QR code.
+# --rotate: revoke every previously authorized HomeAttach key, generate a
+#           fresh keypair, authorize it, and print the new QR. The old private
+#           key stops working the moment it leaves authorized_keys, so rescan
+#           the new code in the app afterwards.
+#
+# Keys are tagged with the comment "homeattach-android-app"; revocation matches
+# on that tag, so it cleans up prior keys even if the key file was replaced.
+
+set -euo pipefail
+
+KEY_PATH="$HOME/.ssh/id_ed25519_homeattach"
+KEY_COMMENT="homeattach-android-app"
+AUTHORIZED="$HOME/.ssh/authorized_keys"
+USER_NAME=$(whoami)
+
+ROTATE=0
+[ "${1:-}" = "--rotate" ] && ROTATE=1
+
+mkdir -p "$HOME/.ssh"
+chmod 700 "$HOME/.ssh"
+touch "$AUTHORIZED"
+chmod 600 "$AUTHORIZED"
+
+revoke_homeattach_keys() {
+    # Drop every line whose comment marks it as a HomeAttach app key.
+    if grep -q " $KEY_COMMENT\$" "$AUTHORIZED" 2>/dev/null; then
+        local tmp
+        tmp=$(mktemp)
+        grep -v " $KEY_COMMENT\$" "$AUTHORIZED" > "$tmp" || true
+        cat "$tmp" > "$AUTHORIZED"
+        rm -f "$tmp"
+        echo "Revoked previously authorized HomeAttach key(s)."
+    fi
+}
+
+if [ "$ROTATE" -eq 1 ]; then
+    echo "Rotating HomeAttach SSH key..."
+    revoke_homeattach_keys
+    rm -f "$KEY_PATH" "${KEY_PATH}.pub"
+    ssh-keygen -t ed25519 -f "$KEY_PATH" -N "" -C "$KEY_COMMENT"
+    cat "${KEY_PATH}.pub" >> "$AUTHORIZED"
+    echo "New key generated and authorized."
+elif [ ! -f "$KEY_PATH" ]; then
+    echo "Generating new dedicated SSH keypair for HomeAttach..."
+    ssh-keygen -t ed25519 -f "$KEY_PATH" -N "" -C "$KEY_COMMENT"
+    cat "${KEY_PATH}.pub" >> "$AUTHORIZED"
+    echo "Key created and added to authorized_keys."
+else
+    # Key exists but may have been de-authorized; make sure it is present.
+    if ! grep -qF "$(cut -d' ' -f2 "${KEY_PATH}.pub")" "$AUTHORIZED" 2>/dev/null; then
+        cat "${KEY_PATH}.pub" >> "$AUTHORIZED"
+        echo "Re-authorized existing HomeAttach key."
+    fi
+fi
+
+# Detect a stable global address: prefer non-temporary IPv6, fall back to IPv4.
+IP=$(ip -6 addr show scope global 2>/dev/null | grep -v temporary | awk '/inet6/{print $2}' | cut -d/ -f1 | head -n1)
+[ -n "$IP" ] || IP=$(ip -4 addr show scope global 2>/dev/null | awk '/inet /{print $2}' | cut -d/ -f1 | head -n1)
+if [ -z "$IP" ]; then
+    echo "Error: could not detect a global-scope network address." >&2
+    exit 1
+fi
+
+# Encode the private key with literal \n so it fits one JSON string.
+PEM_CONTENT=$(awk '{printf "%s\\n", $0}' "$KEY_PATH")
+JSON_CONFIG="{\"host\":\"$IP\",\"port\":22,\"username\":\"$USER_NAME\",\"privateKey\":\"$PEM_CONTENT\"}"
+
+echo "=========================================================="
+echo " HomeAttach Configurator"
+echo "   username   : $USER_NAME"
+echo "   address    : $IP"
+echo "   key        : $KEY_PATH"
+echo "=========================================================="
+echo ""
+
+if command -v qrencode >/dev/null 2>&1; then
+    echo "Scan this in the app: Settings -> Scan QR Code"
+    echo ""
+    printf '%s' "$JSON_CONFIG" | qrencode -t utf8
+else
+    echo "'qrencode' not installed (sudo apt install qrencode) to render a QR."
+    echo "Raw config JSON (paste into the app if needed):"
+    echo ""
+    echo "$JSON_CONFIG"
+fi

@@ -49,4 +49,10 @@
     <string name="settings_update_installer_opened">System installer opened</string>
     <string name="settings_update_permission_opened">Enable install permission, then tap Install update again</string>
     <string name="settings_update_failure">Update failed: %1$s</string>
+
+    <!-- QR Scanner strings -->
+    <string name="settings_scan_qr">Scan QR Code</string>
+    <string name="settings_scan_success">Configuration imported successfully</string>
+    <string name="settings_scan_error">Failed to parse QR code content</string>
+    <string name="settings_scan_failed">QR code scanning failed: %1$s</string>
 </resources>

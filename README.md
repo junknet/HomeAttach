@@ -63,15 +63,20 @@ exits (or is killed), the socket and the ring buffer disappear with it.
    Run `s codex`-style workflows by picking/typing a name, then start your
    TUI inside. Everything else on the PC stays a completely bare shell.
 
-4. **SSH access for the app**: generate a dedicated keypair (don't reuse
-   your personal one — keeps it independently revocable) and authorize it:
+4. **Quick SSH Setup (QR Code Scan)**:
+   We provide a helper script to automatically configure SSH keys and display a configuration QR code. Simply run:
+   ```sh
+   ./server/tsess-qr-config
+   ```
+   This script generates a dedicated keypair, authorizes it, and prints a QR code in your terminal containing the full connection payload. On your phone, open the app's Settings, tap **Scan QR Code**, and scan the terminal screen. The host, port, username, and private key will auto-fill instantly!
+
+   *(Alternative manual setup)*:
+   If you prefer configuring manually, generate a keypair:
    ```sh
    ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519_homeattach -N "" -C "homeattach-android-app"
    cat ~/.ssh/id_ed25519_homeattach.pub >> ~/.ssh/authorized_keys
    ```
-   Paste the private key's contents into the app's Settings screen (stored
-   there in `EncryptedSharedPreferences`, Keystore-backed — never hardcode
-   it into source).
+   Then paste the private key's contents into the app's Settings screen (stored in `EncryptedSharedPreferences`).
 
 5. sshd needs to be reachable from wherever the phone actually is. On the
    phone, set the app's host to the PC's real external address, IPv4 or

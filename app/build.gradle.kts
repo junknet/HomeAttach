@@ -56,8 +56,8 @@ android {
         applicationId = "com.homeattach.app"
         minSdk = 26
         targetSdk = 36
-        versionCode = 4
-        versionName = "1.0.2"
+        versionCode = 5
+        versionName = "1.0.3"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         buildConfigField(
@@ -126,6 +126,8 @@ dependencies {
     // on the Android runtime) or BouncyCastle's implementation - see SshClient.ensureEd25519Support().
     implementation(libs.bouncycastle)
     implementation(libs.androidx.security.crypto)
+    implementation("com.journeyapps:zxing-android-embedded:4.3.0")
+    implementation("androidx.compose.material:material-icons-extended")
 
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.junit)
