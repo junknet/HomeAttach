@@ -119,8 +119,11 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
 Key libraries: `com.github.mwiede:jsch` (SSH; note the BouncyCastle
 dependency it needs for ed25519 keys on Android — see the comment in
-`SshClient.kt`) plus the vendored Apache-2.0 Jackpal `emulatorview` terminal
-component under `app/src/main/java/jackpal/androidterm/emulatorview/`.
+`SshClient.kt`) plus the vendored Termux terminal engine (`terminal-emulator` +
+`terminal-view`) under `app/src/main/java/com/termux/{terminal,view}/`, adapted
+with a remote-stream mode so it renders 24-bit truecolor and modern TUIs over
+SSH. Because that engine is GPLv3, **the app as a whole is distributed under the
+GPLv3** (see `LICENSE`); each vendored file keeps its original Termux header.
 
 ## Public release updates
 

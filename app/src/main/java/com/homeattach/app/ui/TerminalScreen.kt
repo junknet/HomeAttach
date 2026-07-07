@@ -97,7 +97,13 @@ import com.homeattach.app.ssh.watchRemoteSessions
 import com.homeattach.app.ssh.fetchRemoteSessions
 import com.homeattach.app.ssh.openSshSession
 import com.homeattach.app.terminal.RemoteTerminalSession
-import jackpal.androidterm.emulatorview.EmulatorView
+import android.view.KeyEvent
+import android.view.MotionEvent
+import androidx.compose.foundation.gestures.detectHorizontalDragGestures
+import androidx.compose.foundation.layout.width
+import com.termux.terminal.TerminalSession
+import com.termux.view.TerminalView
+import com.termux.view.TerminalViewClient
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.concurrent.thread
@@ -150,7 +156,7 @@ fun TerminalScreen(
     var status by remember { mutableStateOf<ConnStatus>(ConnStatus.Connecting) }
     var sessions by remember { mutableStateOf<List<RemoteSession>>(emptyList()) }
     var connectAttempt by remember(sessionName) { mutableIntStateOf(0) }
-    var terminalView by remember { mutableStateOf<EmulatorView?>(null) }
+    var terminalView by remember { mutableStateOf<TerminalView?>(null) }
     val connectionReference = remember { AtomicReference<TerminalConnection?>(null) }
     val mainHandler = remember { Handler(Looper.getMainLooper()) }
     val ownerIdentifier = remember { buildAndroidFocusOwnerIdentifier() }
@@ -362,18 +368,16 @@ fun TerminalScreen(
     LaunchedEffect(lifecycleOwner, status, terminalView) {
         lifecycleOwner.lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED) {
             if (status is ConnStatus.Connected && terminalView != null) {
+                delay(150L) // 避开 AndroidView 首帧 measure 和 layout 的竞态冲突
                 terminalView?.requestFocus()
                 terminalView?.showSoftKeyboard()
             }
         }
     }
 
-    LaunchedEffect(imeVisible, terminalView) {
-        terminalView?.let { view ->
-            view.requestLayout()
-            view.updateSize(true)
-        }
-    }
+    // IME show/hide changes the imePadding Column height → TerminalView.onSizeChanged →
+    // session.updateSize handles the reflow. No manual resize needed (the old double-resize here
+    // caused the first-frame flicker).
 
     LaunchedEffect(drawerState.currentValue, drawerState.targetValue, terminalView) {
         if (drawerState.currentValue != DrawerValue.Closed ||
@@ -383,9 +387,47 @@ fun TerminalScreen(
         }
     }
 
+    // Termux setTextSize is in pixels; scale the dp constant once and reuse for the view + pinch lock.
+    val terminalTextSizePx = (TERMINAL_TEXT_SIZE_DP * context.resources.displayMetrics.density).toInt()
+    val terminalViewClient = remember(terminalTextSizePx) {
+        object : TerminalViewClient {
+            override fun onScale(scale: Float): Float = terminalTextSizePx.toFloat() // pinch-zoom locked
+            override fun onSingleTapUp(e: MotionEvent?) {
+                // The load-bearing fix: a tap on the terminal raises the soft keyboard.
+                terminalView?.requestFocus()
+                terminalView?.showSoftKeyboard()
+            }
+            override fun shouldBackButtonBeMappedToEscape(): Boolean = false // Compose BackHandler owns back
+            override fun shouldEnforceCharBasedInput(): Boolean = true
+            override fun shouldUseCtrlSpaceWorkaround(): Boolean = false
+            override fun isTerminalViewSelected(): Boolean = true
+            override fun copyModeChanged(copyMode: Boolean) {}
+            // Return false so the view's default path writes input to the session → SSH.
+            override fun onKeyDown(keyCode: Int, e: KeyEvent?, session: TerminalSession?): Boolean = false
+            override fun onKeyUp(keyCode: Int, e: KeyEvent?): Boolean = false
+            override fun onLongPress(event: MotionEvent?): Boolean = false
+            override fun readControlKey(): Boolean = false
+            override fun readAltKey(): Boolean = false
+            override fun readShiftKey(): Boolean = false
+            override fun readFnKey(): Boolean = false
+            override fun onCodePoint(codePoint: Int, ctrlDown: Boolean, session: TerminalSession?): Boolean = false
+            override fun onEmulatorSet() {}
+            override fun logError(tag: String?, message: String?) {}
+            override fun logWarn(tag: String?, message: String?) {}
+            override fun logInfo(tag: String?, message: String?) {}
+            override fun logDebug(tag: String?, message: String?) {}
+            override fun logVerbose(tag: String?, message: String?) {}
+            override fun logStackTraceWithMessage(tag: String?, message: String?, e: Exception?) {}
+            override fun logStackTrace(tag: String?, e: Exception?) {}
+        }
+    }
+
     ModalNavigationDrawer(
         drawerState = drawerState,
-        gesturesEnabled = false,
+        // Closed: gestures off so the terminal keeps its horizontal swipes (the left-edge zone below
+        // opens the drawer). Open: gestures on so a scrim tap or drag closes it — the terminal is
+        // behind the scrim and gets no touches anyway.
+        gesturesEnabled = drawerState.isOpen,
         drawerContent = {
             ModalDrawerSheet(
                 modifier = Modifier
@@ -436,48 +478,6 @@ fun TerminalScreen(
         }
     ) {
         Scaffold(
-            topBar = {
-                if (status !is ConnStatus.Connected) {
-                    TopAppBar(
-                        title = { Text(sessionLabel) },
-                        navigationIcon = {
-                            IconButton(
-                                onClick = {
-                                    closeConnectionAndNavigateBackOnce()
-                                },
-                            ) {
-                                Icon(
-                                    Icons.AutoMirrored.Filled.ArrowBack,
-                                    contentDescription = stringResource(R.string.terminal_back),
-                                )
-                            }
-                        },
-                        actions = {
-                            ConnectionStateIndicator(status = status, reconnecting = connectAttempt > 0)
-                            val toggleKeyboardLabel = stringResource(R.string.terminal_toggle_keyboard)
-                            IconButton(
-                                onClick = {
-                                    terminalView?.let { view ->
-                                        if (imeVisible) {
-                                            view.hideSoftKeyboard()
-                                        } else {
-                                            view.requestFocus()
-                                            view.showSoftKeyboard()
-                                        }
-                                    }
-                                },
-                                enabled = status is ConnStatus.Connected,
-                            ) {
-                                Text(
-                                    text = "⌨",
-                                    style = MaterialTheme.typography.titleLarge,
-                                    modifier = Modifier.semantics { contentDescription = toggleKeyboardLabel },
-                                )
-                            }
-                        },
-                    )
-                }
-            },
             containerColor = Color(0xFF0A0B10)
         ) { padding ->
             Box(
@@ -528,14 +528,21 @@ fun TerminalScreen(
                                 AndroidView(
                                     modifier = Modifier
                                         .fillMaxSize()
-                                        .background(Color.Black),
+                                        .background(Color(0xFF0A0B10)),
                                     factory = { ctx ->
-                                        EmulatorView(ctx, null).also { view ->
-                                            view.setDensity(ctx.resources.displayMetrics)
-                                            view.setUseCookedIME(false)
-                                            view.attachSession(remoteTerminalSession)
-                                            view.setTermType("xterm-256color")
-                                            view.setTextSize(TERMINAL_TEXT_SIZE_DP)
+                                        TerminalView(ctx, null).also { view ->
+                                            view.setTerminalViewClient(terminalViewClient)
+                                            view.attachSession(remoteTerminalSession.session)
+                                            // Termux setTextSize is pixels; set before first layout so
+                                            // font metrics are non-zero and cols/rows compute correctly.
+                                            view.setTextSize(terminalTextSizePx)
+                                            view.setTypeface(android.graphics.Typeface.MONOSPACE)
+                                            view.setBackgroundColor(0xFF0A0B10.toInt())
+                                            // Termux's TerminalView (unlike jackpal) does not make
+                                            // itself focusable; without this, requestFocus() is a
+                                            // no-op, the IME never binds to it, and input is lost.
+                                            view.isFocusable = true
+                                            view.isFocusableInTouchMode = true
                                             view.setOnFocusChangeListener { _, hasFocus ->
                                                 if (hasFocus &&
                                                     remoteTerminalSession.currentColumns > 0 &&
@@ -547,16 +554,27 @@ fun TerminalScreen(
                                                     )
                                                 }
                                             }
+                                            remoteTerminalSession.onScreenUpdated = { view.onScreenUpdated() }
                                             terminalView = view
                                         }
                                     },
                                     update = {},
                                 )
+                                // Left-edge swipe zone: only this thin strip opens the drawer, so the
+                                // terminal body keeps all its horizontal touches (selection, scroll).
+                                Box(
+                                    modifier = Modifier
+                                        .align(Alignment.CenterStart)
+                                        .fillMaxHeight()
+                                        .width(20.dp)
+                                        .pointerInput(Unit) {
+                                            detectHorizontalDragGestures { _, dragAmount ->
+                                                if (dragAmount > 8f) scope.launch { drawerState.open() }
+                                            }
+                                        },
+                                )
                             }
-                            ExtraKeysRow(
-                                remoteTerminalSession = remoteTerminalSession,
-                                onMenuClick = { scope.launch { drawerState.open() } }
-                            )
+                            ExtraKeysRow(remoteTerminalSession = remoteTerminalSession)
                         }
                     }
                 }
@@ -770,7 +788,6 @@ private fun ConnectionProblem(
 @Composable
 private fun ExtraKeysRow(
     remoteTerminalSession: RemoteTerminalSession,
-    onMenuClick: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     Row(
@@ -782,12 +799,6 @@ private fun ExtraKeysRow(
         horizontalArrangement = Arrangement.spacedBy(5.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        KeyCap(
-            label = "☰",
-            modifier = Modifier.weight(0.72f),
-        ) {
-            onMenuClick()
-        }
         KeyCap(
             label = stringResource(R.string.terminal_key_esc),
             modifier = Modifier.weight(0.9f),
