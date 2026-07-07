@@ -51,6 +51,7 @@ import com.homeattach.app.R
 import com.homeattach.app.data.HostConfig
 import com.homeattach.app.data.SettingsStore
 import com.homeattach.app.ssh.fetchRemoteSessions
+import com.homeattach.app.ssh.normalizePrivateKeyPem
 import com.homeattach.app.update.AppUpdateCheckResult
 import com.homeattach.app.update.AvailableAppUpdate
 import com.homeattach.app.update.GithubReleaseUpdater
@@ -130,21 +131,29 @@ fun SettingsScreen(
         null
     }
 
-    val keyError = if (keyPem.isBlank() && showEmptyErrors) {
-        stringResource(R.string.settings_key_error_required)
-    } else {
-        null
+    val normalizedPrivateKeyPem = remember(keyPem) {
+        runCatching { normalizePrivateKeyPem(keyPem) }
     }
-    val keyTypeLabel = remember(keyPem) { detectPrivateKeyType(keyPem) }
+    val keyError = when {
+        keyPem.isBlank() && showEmptyErrors -> stringResource(R.string.settings_key_error_required)
+        keyPem.isNotBlank() && normalizedPrivateKeyPem.isFailure -> {
+            normalizedPrivateKeyPem.exceptionOrNull()?.message
+                ?: stringResource(R.string.settings_key_error_invalid)
+        }
+        else -> null
+    }
+    val keyTypeLabel = remember(keyPem, normalizedPrivateKeyPem) {
+        normalizedPrivateKeyPem.getOrNull()?.let(::detectPrivateKeyType)
+    }
 
     val formValid = trimmedHost.isNotEmpty() && !hostHasBrackets && portValid &&
-        username.isNotBlank() && keyPem.isNotBlank()
+        username.isNotBlank() && keyPem.isNotBlank() && normalizedPrivateKeyPem.isSuccess
 
     fun currentConfig() = HostConfig(
         host = trimmedHost,
         port = portValue ?: 22,
         username = username.trim(),
-        privateKeyPem = keyPem,
+        privateKeyPem = normalizedPrivateKeyPem.getOrThrow(),
     )
 
     // Any edit invalidates a previous test verdict.
@@ -272,7 +281,7 @@ fun SettingsScreen(
             ) {
                 TextButton(onClick = {
                     clipboard.getText()?.text?.let {
-                        keyPem = it
+                        keyPem = runCatching { normalizePrivateKeyPem(it) }.getOrElse { _ -> it }
                         keyVisible = true
                         onFieldEdited()
                     }

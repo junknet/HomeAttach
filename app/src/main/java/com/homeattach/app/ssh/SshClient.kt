@@ -83,10 +83,11 @@ private object SshClient
 fun openSshSession(config: HostConfig): Session {
     ensureEd25519Support()
     try {
+        val normalizedPrivateKeyPem = normalizePrivateKeyPem(config.privateKeyPem)
         val jsch = JSch()
         jsch.addIdentity(
             "homeattach-key",
-            config.privateKeyPem.toByteArray(StandardCharsets.UTF_8),
+            normalizedPrivateKeyPem.toByteArray(StandardCharsets.UTF_8),
             null,
             null,
         )
@@ -106,6 +107,8 @@ fun openSshSession(config: HostConfig): Session {
             throw SshAuthException("Authentication failed: $msg", e)
         }
         throw SshConnectException("Could not connect to ${config.host}:${config.port}: $msg", e)
+    } catch (e: PrivateKeyFormatException) {
+        throw SshAuthException("Invalid private key format: ${e.message}", e)
     }
 }
 

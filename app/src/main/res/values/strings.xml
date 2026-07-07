@@ -22,6 +22,7 @@
 
     <string name="settings_key_label">Private key</string>
     <string name="settings_key_error_required">Paste a private key to continue</string>
+    <string name="settings_key_error_invalid">Invalid private key format</string>
     <string name="settings_key_hint_format">Accepts OpenSSH ed25519/RSA or PEM private keys</string>
     <string name="settings_key_detected">%1$s private key detected</string>
     <string name="settings_key_show">Show</string>
