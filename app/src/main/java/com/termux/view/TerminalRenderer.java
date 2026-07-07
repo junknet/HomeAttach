@@ -53,11 +53,18 @@ public final class TerminalRenderer {
         }
     }
 
-    /** Render the terminal to a canvas with at a specified row scroll, and an optional rectangular selection. */
-    public final void render(TerminalEmulator mEmulator, Canvas canvas, int topRow,
+    /**
+     * Render the terminal to a canvas with at a specified row scroll, and an optional rectangular
+     * selection.
+     *
+     * HomeAttach: [topRowOffsetPx] is the sub-row scroll offset for pixel-smooth scrolling — the
+     * canvas shifts up by that amount and one extra row is drawn to fill the bottom gap. The
+     * caller guarantees a non-zero offset only while topRow < 0, keeping the extra row in range.
+     */
+    public final void render(TerminalEmulator mEmulator, Canvas canvas, int topRow, float topRowOffsetPx,
                              int selectionY1, int selectionY2, int selectionX1, int selectionX2) {
         final boolean reverseVideo = mEmulator.isReverseVideo();
-        final int endRow = topRow + mEmulator.mRows;
+        final int endRow = topRow + mEmulator.mRows + (topRowOffsetPx > 0f ? 1 : 0);
         final int columns = mEmulator.mColumns;
         final int cursorCol = mEmulator.getCursorCol();
         final int cursorRow = mEmulator.getCursorRow();
@@ -68,6 +75,9 @@ public final class TerminalRenderer {
 
         if (reverseVideo)
             canvas.drawColor(palette[TextStyle.COLOR_INDEX_FOREGROUND], PorterDuff.Mode.SRC);
+
+        canvas.save();
+        canvas.translate(0f, -topRowOffsetPx);
 
         float heightOffset = mFontLineSpacingAndAscent;
         for (int row = topRow; row < endRow; row++) {
@@ -154,6 +164,8 @@ public final class TerminalRenderer {
             drawTextRun(canvas, line, palette, heightOffset, lastRunStartColumn, columnWidthSinceLastRun, lastRunStartIndex, charsSinceLastRun,
                 measuredWidthForRun, cursorColor, cursorShape, lastRunStyle, reverseVideo || invertCursorTextColor || lastRunInsideSelection);
         }
+
+        canvas.restore();
     }
 
     private void drawTextRun(Canvas canvas, char[] text, int[] palette, float y, int startColumn, int runWidthColumns,

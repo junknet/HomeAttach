@@ -32,7 +32,7 @@ import android.view.autofill.AutofillValue;
 import android.view.inputmethod.BaseInputConnection;
 import android.view.inputmethod.EditorInfo;
 import android.view.inputmethod.InputConnection;
-import android.widget.Scroller;
+import android.widget.OverScroller;
 
 import androidx.annotation.Nullable;
 import androidx.annotation.RequiresApi;
@@ -68,6 +68,13 @@ public final class TerminalView extends View {
 
     /** The top row of text to display. Ranges from -activeTranscriptRows to 0. */
     int mTopRow;
+    /**
+     * HomeAttach: sub-row scroll offset in pixels, in [0, fontLineSpacing). The viewport top sits
+     * this many pixels below the top of [mTopRow], giving pixel-smooth finger tracking and fling
+     * instead of whole-row jumps. Rendering translates the canvas up by this amount and draws one
+     * extra bottom row; non-zero only while mTopRow < 0, so the extra row is always in range.
+     */
+    float mTopRowOffsetPx;
     int[] mDefaultSelectors = new int[]{-1,-1,-1,-1};
 
     float mScaleFactor = 1.f;
@@ -78,10 +85,13 @@ public final class TerminalView extends View {
     /** Keep track of the time when a touch event leading to sending mouse scroll events started. */
     private long mMouseStartDownTime = -1;
 
-    final Scroller mScroller;
+    final OverScroller mScroller;
 
     /** What was left in from scrolling movement. */
     float mScrollRemainder;
+
+    /** Guards against double-posting the vsync scroll animation runnable. */
+    private boolean mScrollAnimationPosted;
 
     /** If non-zero, this is the last unicode code point received if that was a combining character. */
     int mCombiningAccent;
@@ -149,6 +159,13 @@ public final class TerminalView extends View {
                     sendMouseEventCode(event, TerminalEmulator.MOUSE_LEFT_BUTTON, false);
                     return true;
                 }
+                // A slow drag released between rows settles onto the row grid (a following
+                // fling replaces this animation via its own forceFinished + fling).
+                if (scrolledWithFinger && mEmulator != null && mScroller.isFinished()
+                        && !mEmulator.isMouseTrackingActive() && !mEmulator.isAlternateBufferActive()
+                        && mTopRowOffsetPx != 0f) {
+                    startSnapToRowGrid();
+                }
                 scrolledWithFinger = false;
                 return false;
             }
@@ -175,12 +192,17 @@ public final class TerminalView extends View {
                     // since we cannot just start sending these events without a starting press event,
                     // which we do not do for touch input, only mouse in onTouchEvent().
                     sendMouseEventCode(e, TerminalEmulator.MOUSE_LEFT_BUTTON_MOVED, true);
-                } else {
+                } else if (mEmulator.isMouseTrackingActive() || mEmulator.isAlternateBufferActive()) {
+                    // Apps consuming scroll as wheel/arrow events want whole-row deltas.
                     scrolledWithFinger = true;
                     distanceY += mScrollRemainder;
                     int deltaRows = (int) (distanceY / mRenderer.mFontLineSpacing);
                     mScrollRemainder = distanceY - deltaRows * mRenderer.mFontLineSpacing;
                     doScroll(e, deltaRows);
+                } else {
+                    // Normal buffer: pixel-true finger tracking.
+                    scrolledWithFinger = true;
+                    scrollByPixels(distanceY);
                 }
                 return true;
             }
@@ -196,41 +218,47 @@ public final class TerminalView extends View {
             @Override
             public boolean onFling(final MotionEvent e2, float velocityX, float velocityY) {
                 if (mEmulator == null) return true;
-                // Do not start scrolling until last fling has been taken care of:
-                if (!mScroller.isFinished()) return true;
 
-                final boolean mouseTrackingAtStartOfFling = mEmulator.isMouseTrackingActive();
-                float SCALE = 0.25f;
-                if (mouseTrackingAtStartOfFling) {
+                if (mEmulator.isMouseTrackingActive() || mEmulator.isAlternateBufferActive()) {
+                    // Row-emulated fling for apps consuming scroll as wheel/arrow events.
+                    if (!mScroller.isFinished()) return true;
+                    float SCALE = 0.25f;
                     mScroller.fling(0, 0, 0, -(int) (velocityY * SCALE), 0, 0, -mEmulator.mRows / 2, mEmulator.mRows / 2);
-                } else {
-                    mScroller.fling(0, mTopRow, 0, -(int) (velocityY * SCALE), 0, 0, -mEmulator.getScreen().getActiveTranscriptRows(), 0);
+                    post(new Runnable() {
+                        private int mLastY = 0;
+
+                        @Override
+                        public void run() {
+                            if (!mEmulator.isMouseTrackingActive() && !mEmulator.isAlternateBufferActive()) {
+                                mScroller.abortAnimation();
+                                return;
+                            }
+                            if (mScroller.isFinished()) return;
+                            boolean more = mScroller.computeScrollOffset();
+                            int newY = mScroller.getCurrY();
+                            doScroll(e2, newY - mLastY);
+                            mLastY = newY;
+                            if (more) post(this);
+                        }
+                    });
+                    return true;
                 }
 
-                post(new Runnable() {
-                    private int mLastY = 0;
-
-                    @Override
-                    public void run() {
-                        if (mouseTrackingAtStartOfFling != mEmulator.isMouseTrackingActive()) {
-                            mScroller.abortAnimation();
-                            return;
-                        }
-                        if (mScroller.isFinished()) return;
-                        boolean more = mScroller.computeScrollOffset();
-                        int newY = mScroller.getCurrY();
-                        int diff = mouseTrackingAtStartOfFling ? (newY - mLastY) : (newY - mTopRow);
-                        doScroll(e2, diff);
-                        mLastY = newY;
-                        if (more) post(this);
-                    }
-                });
-
+                // Normal buffer: native-feel pixel fling — full gesture velocity, frames driven
+                // on vsync (postOnAnimation → panel refresh rate), row-grid snap on settle.
+                mScroller.forceFinished(true);
+                int ls = mRenderer.mFontLineSpacing;
+                int minPx = -mEmulator.getScreen().getActiveTranscriptRows() * ls;
+                int startPx = Math.round(mTopRow * ls + mTopRowOffsetPx);
+                mScroller.fling(0, startPx, 0, Math.round(-velocityY), 0, 0, minPx, 0);
+                postScrollAnimation();
                 return true;
             }
 
             @Override
             public boolean onDown(float x, float y) {
+                // Touching the screen catches an in-flight fling, like every native scroller.
+                if (!mScroller.isFinished()) mScroller.forceFinished(true);
                 // Why is true not returned here?
                 // https://developer.android.com/training/gestures/detector.html#detect-a-subset-of-supported-gestures
                 // Although setting this to true still does not solve the following errors when long pressing in terminal view text area
@@ -256,7 +284,7 @@ public final class TerminalView extends View {
                 }
             }
         });
-        mScroller = new Scroller(context);
+        mScroller = new OverScroller(context);
         AccessibilityManager am = (AccessibilityManager) context.getSystemService(Context.ACCESSIBILITY_SERVICE);
         mAccessibilityEnabled = am.isEnabled();
     }
@@ -280,6 +308,16 @@ public final class TerminalView extends View {
         TERMINAL_VIEW_KEY_LOGGING_ENABLED = value;
     }
 
+    /** HomeAttach: observer for the IME composing (preedit) text. Streaming IMEs — voice
+     *  dictation above all — revise this text live before committing; the screen renders it
+     *  locally (a pty cannot express rewrites). Called on the UI thread with the current
+     *  preedit, and with "" when the region commits or finishes. */
+    java.util.function.Consumer<String> mImePreeditListener;
+
+    public void setImePreeditListener(java.util.function.Consumer<String> listener) {
+        mImePreeditListener = listener;
+    }
+
 
 
     /**
@@ -290,6 +328,7 @@ public final class TerminalView extends View {
     public boolean attachSession(TerminalSession session) {
         if (session == mTermSession) return false;
         mTopRow = 0;
+        mTopRowOffsetPx = 0f;
 
         mTermSession = session;
         mEmulator = null;
@@ -308,16 +347,6 @@ public final class TerminalView extends View {
         // Ensure that inputType is only set if TerminalView is selected view with the keyboard and
         // an alternate view is not selected, like an EditText. This is necessary if an activity is
         // initially started with the alternate view or if activity is returned to from another app
-    /** HomeAttach: observer for the IME composing (preedit) text. Streaming IMEs — voice
-     *  dictation above all — revise this text live before committing; the screen renders it
-     *  locally (a pty cannot express rewrites). Called on the UI thread with the current
-     *  preedit, and with "" when the region commits or finishes. */
-    java.util.function.Consumer<String> mImePreeditListener;
-
-    public void setImePreeditListener(java.util.function.Consumer<String> listener) {
-        mImePreeditListener = listener;
-    }
-
         // and the alternate view was the one selected the last time.
         if (mClient.isTerminalViewSelected()) {
             if (mClient.shouldEnforceCharBasedInput()) {
@@ -351,35 +380,6 @@ public final class TerminalView extends View {
 
         return new BaseInputConnection(this, true) {
 
-            @Override
-            public boolean finishComposingText() {
-                if (TERMINAL_VIEW_KEY_LOGGING_ENABLED) mClient.logInfo(LOG_TAG, "IME: finishComposingText()");
-                super.finishComposingText();
-
-                sendTextToTerminal(getEditable());
-                getEditable().clear();
-                return true;
-            }
-
-            @Override
-            public boolean commitText(CharSequence text, int newCursorPosition) {
-                if (TERMINAL_VIEW_KEY_LOGGING_ENABLED) {
-                    mClient.logInfo(LOG_TAG, "IME: commitText(\"" + text + "\", " + newCursorPosition + ")");
-                }
-                super.commitText(text, newCursorPosition);
-
-                if (mEmulator == null) return true;
-
-                Editable content = getEditable();
-                sendTextToTerminal(content);
-                content.clear();
-                return true;
-            }
-
-            @Override
-            public boolean deleteSurroundingText(int leftLength, int rightLength) {
-                if (TERMINAL_VIEW_KEY_LOGGING_ENABLED) {
-                    mClient.logInfo(LOG_TAG, "IME: deleteSurroundingText(" + leftLength + ", " + rightLength + ")");
             // HomeAttach: voice engines (Samsung voice typing in particular) probe the editor
             // before inserting anything; a null ExtractedText reads as "broken editor" and the
             // engine silently drops the recognized text. Answer the probes from the (transient)
@@ -435,6 +435,37 @@ public final class TerminalView extends View {
                 return super.requestCursorUpdates(cursorUpdateMode);
             }
 
+            @Override
+            public boolean finishComposingText() {
+                if (TERMINAL_VIEW_KEY_LOGGING_ENABLED) mClient.logInfo(LOG_TAG, "IME: finishComposingText()");
+                super.finishComposingText();
+
+                sendTextToTerminal(getEditable());
+                getEditable().clear();
+                if (mImePreeditListener != null) mImePreeditListener.accept("");
+                return true;
+            }
+
+            @Override
+            public boolean commitText(CharSequence text, int newCursorPosition) {
+                if (TERMINAL_VIEW_KEY_LOGGING_ENABLED) {
+                    mClient.logInfo(LOG_TAG, "IME: commitText(\"" + text + "\", " + newCursorPosition + ")");
+                }
+                super.commitText(text, newCursorPosition);
+
+                if (mEmulator == null) return true;
+
+                Editable content = getEditable();
+                sendTextToTerminal(content);
+                content.clear();
+                if (mImePreeditListener != null) mImePreeditListener.accept("");
+                return true;
+            }
+
+            @Override
+            public boolean deleteSurroundingText(int leftLength, int rightLength) {
+                if (TERMINAL_VIEW_KEY_LOGGING_ENABLED) {
+                    mClient.logInfo(LOG_TAG, "IME: deleteSurroundingText(" + leftLength + ", " + rightLength + ")");
                 }
                 // The stock Samsung keyboard with 'Auto check spelling' enabled sends leftLength > 1.
                 KeyEvent deleteKey = new KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_DEL);
@@ -442,7 +473,6 @@ public final class TerminalView extends View {
                 return super.deleteSurroundingText(leftLength, rightLength);
             }
 
-                if (mImePreeditListener != null) mImePreeditListener.accept("");
             void sendTextToTerminal(CharSequence text) {
                 stopTextSelectionMode();
                 final int textLengthInChars = text.length();
@@ -458,7 +488,6 @@ public final class TerminalView extends View {
                         }
                     } else {
                         codePoint = firstChar;
-                if (mImePreeditListener != null) mImePreeditListener.accept("");
                     }
 
                     // Check onKeyDown() for details.
@@ -549,7 +578,7 @@ public final class TerminalView extends View {
             }
         }
 
-        if (!skipScrolling && mTopRow != 0) {
+        if (!skipScrolling && (mTopRow != 0 || mTopRowOffsetPx != 0f)) {
             // Scroll down if not already there.
             if (mTopRow < -3) {
                 // Awaken scroll bars only if scrolling a noticeable amount
@@ -558,6 +587,8 @@ public final class TerminalView extends View {
                 awakenScrollBars();
             }
             mTopRow = 0;
+            mTopRowOffsetPx = 0f;
+            mScroller.forceFinished(true);
         }
 
         mEmulator.clearScrollCounter();
@@ -613,7 +644,10 @@ public final class TerminalView extends View {
      */
     public int[] getColumnAndRow(MotionEvent event, boolean relativeToScroll) {
         int column = (int) (event.getX() / mRenderer.mFontWidth);
-        int row = (int) ((event.getY() - mRenderer.mFontLineSpacingAndAscent) / mRenderer.mFontLineSpacing);
+        // Content is drawn shifted up by the sub-row scroll offset; compensate when mapping
+        // into transcript rows (screen-relative rows keep raw view coordinates).
+        float y = event.getY() + (relativeToScroll ? mTopRowOffsetPx : 0f);
+        int row = (int) ((y - mRenderer.mFontLineSpacingAndAscent) / mRenderer.mFontLineSpacing);
         if (relativeToScroll) {
             row += mTopRow;
         }
@@ -637,6 +671,73 @@ public final class TerminalView extends View {
         }
         mEmulator.sendMouseEvent(button, x, y, pressed);
     }
+
+    /** Move the normal-buffer viewport by [dy] pixels (positive = toward the bottom). */
+    void scrollByPixels(float dy) {
+        setScrollPixelPosition(mTopRow * (float) mRenderer.mFontLineSpacing + mTopRowOffsetPx + dy);
+    }
+
+    /**
+     * Set the viewport top in content pixels (0 = bottom of transcript, negative = into
+     * history), splitting it into the whole-row [mTopRow] and the sub-row [mTopRowOffsetPx].
+     */
+    void setScrollPixelPosition(float positionPx) {
+        int ls = mRenderer.mFontLineSpacing;
+        float min = -mEmulator.getScreen().getActiveTranscriptRows() * (float) ls;
+        float p = Math.max(min, Math.min(0f, positionPx));
+        int newTopRow = (int) Math.floor(p / ls);
+        float offset = p - newTopRow * (float) ls;
+        if (offset >= ls) { // float edge: exactly one row
+            newTopRow++;
+            offset -= ls;
+        }
+        if (newTopRow >= 0) { // only reachable at p == 0; keeps the extra render row in range
+            newTopRow = 0;
+            offset = 0f;
+        }
+        mTopRow = newTopRow;
+        mTopRowOffsetPx = offset;
+        if (!awakenScrollBars()) invalidate();
+    }
+
+    /** Animate the viewport from a between-rows position onto the row grid. */
+    void startSnapToRowGrid() {
+        int ls = mRenderer.mFontLineSpacing;
+        int current = Math.round(mTopRow * ls + mTopRowOffsetPx);
+        int target = Math.round(current / (float) ls) * ls;
+        if (target == current) return;
+        mScroller.startScroll(0, current, 0, target - current, 120);
+        postScrollAnimation();
+    }
+
+    private void postScrollAnimation() {
+        if (mScrollAnimationPosted) return;
+        mScrollAnimationPosted = true;
+        postOnAnimation(mScrollAnimationRunnable);
+    }
+
+    /**
+     * Drives pixel-space fling and snap frames on vsync, so animation runs at the panel's
+     * native refresh rate. When a fling ends between rows, chains the row-grid snap.
+     */
+    private final Runnable mScrollAnimationRunnable = new Runnable() {
+        @Override
+        public void run() {
+            mScrollAnimationPosted = false;
+            if (mEmulator == null) return;
+            if (mEmulator.isMouseTrackingActive() || mEmulator.isAlternateBufferActive()) {
+                mScroller.forceFinished(true);
+                return;
+            }
+            boolean more = mScroller.computeScrollOffset();
+            setScrollPixelPosition(mScroller.getCurrY());
+            if (more) {
+                postScrollAnimation();
+            } else if (mTopRowOffsetPx != 0f) {
+                startSnapToRowGrid();
+            }
+        }
+    };
 
     /** Perform a scroll, either from dragging the screen or by scrolling a mouse wheel. */
     void doScroll(MotionEvent event, int rowsDown) {
@@ -1068,6 +1169,7 @@ public final class TerminalView extends View {
                 mTerminalCursorBlinkerRunnable.setEmulator(mEmulator);
 
             mTopRow = 0;
+            mTopRowOffsetPx = 0f;
             scrollTo(0, 0);
             invalidate();
         }
@@ -1084,7 +1186,7 @@ public final class TerminalView extends View {
                 mTextSelectionCursorController.getSelectors(sel);
             }
 
-            mRenderer.render(mEmulator, canvas, mTopRow, sel[0], sel[1], sel[2], sel[3]);
+            mRenderer.render(mEmulator, canvas, mTopRow, mTopRowOffsetPx, sel[0], sel[1], sel[2], sel[3]);
 
             // render the text selection handles
             renderTextSelection();
@@ -1104,7 +1206,7 @@ public final class TerminalView extends View {
     }
 
     public int getCursorY(float y) {
-        return (int) (((y - 40) / mRenderer.mFontLineSpacing) + mTopRow);
+        return (int) (((y - 40 + mTopRowOffsetPx) / mRenderer.mFontLineSpacing) + mTopRow);
     }
 
     public int getPointX(int cx) {
@@ -1115,7 +1217,7 @@ public final class TerminalView extends View {
     }
 
     public int getPointY(int cy) {
-        return Math.round((cy - mTopRow) * mRenderer.mFontLineSpacing);
+        return Math.round((cy - mTopRow) * mRenderer.mFontLineSpacing - mTopRowOffsetPx);
     }
 
     public int getTopRow() {

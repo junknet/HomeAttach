@@ -126,7 +126,9 @@ class RemoteTerminalSession(
 
     private companion object {
         const val TAG = "RemoteTerminalSession"
-        const val TRANSCRIPT_ROWS = 2000
+        // Deep scrollback: the buffer is a lazily-allocated row-pointer array, so a big cap
+        // costs ~80KB of references up front and real memory only as history fills.
+        const val TRANSCRIPT_ROWS = 10000
         const val FIRST_LAYOUT_RETRY_MS = 16L
     }
 }
