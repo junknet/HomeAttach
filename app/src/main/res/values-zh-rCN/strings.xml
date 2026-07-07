@@ -1,0 +1,52 @@
+<resources>
+    <!-- Brand name stays untranslated. -->
+    <string name="app_name">HomeAttach</string>
+
+    <!-- Settings screen -->
+    <string name="settings_title">HomeAttach 设置</string>
+    <string name="settings_back">返回</string>
+    <string name="settings_intro">连接家中电脑上的 SSH 服务。</string>
+    <string name="settings_section_server">服务器</string>
+    <string name="settings_section_auth">身份认证</string>
+    <string name="settings_section_update">更新</string>
+
+    <string name="settings_host_label">主机</string>
+    <string name="settings_host_error_required">请填写主机地址</string>
+    <string name="settings_host_error_brackets">无需 [ ] 方括号——直接输入 IPv6 地址即可</string>
+    <string name="settings_host_hint_ipv6">检测到 IPv6 地址——无需加方括号</string>
+
+    <string name="settings_port_label">端口</string>
+    <string name="settings_port_error_range">端口必须是 1 到 65535 之间的数字</string>
+
+    <string name="settings_username_label">用户名</string>
+    <string name="settings_username_error_required">请填写用户名</string>
+
+    <string name="settings_key_label">私钥</string>
+    <string name="settings_key_error_required">请先粘贴私钥</string>
+    <string name="settings_key_hint_format">支持 OpenSSH ed25519/RSA 或 PEM 格式私钥</string>
+    <string name="settings_key_detected">检测到 %1$s 私钥</string>
+    <string name="settings_key_show">显示</string>
+    <string name="settings_key_hide">隐藏</string>
+    <string name="settings_key_paste">粘贴</string>
+    <string name="settings_key_clear">清除</string>
+
+    <string name="settings_test_connection">测试连接</string>
+    <string name="settings_testing">正在测试连接…</string>
+    <string name="settings_test_success">连接成功。主机上的会话数:%1$d</string>
+    <string name="settings_test_failure">连接失败:%1$s</string>
+
+    <string name="settings_save">保存并继续</string>
+    <string name="settings_fix_fields">请先修正标红的字段</string>
+
+    <string name="settings_update_check">检查更新</string>
+    <string name="settings_update_install">安装更新</string>
+    <string name="settings_update_current_version">当前版本:%1$s</string>
+    <string name="settings_update_checking">正在检查 GitHub Release…</string>
+    <string name="settings_update_downloading">正在下载 %1$s…</string>
+    <string name="settings_update_not_configured">这个构建没有配置发布仓库</string>
+    <string name="settings_update_latest">已是最新版:%1$s (%2$s)</string>
+    <string name="settings_update_available">发现新版本:%1$s，%2$s</string>
+    <string name="settings_update_installer_opened">已打开系统安装器</string>
+    <string name="settings_update_permission_opened">打开安装权限后，再点一次安装更新</string>
+    <string name="settings_update_failure">更新失败:%1$s</string>
+</resources>

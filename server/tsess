@@ -1,0 +1,73 @@
+#!/bin/bash
+# Ensure a sane PATH: non-interactive SSH exec (e.g. JSch) may hand us a
+# minimal PATH that lacks even coreutils. Absolute-shebang + this keep us safe.
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/bin:/bin${PATH:+:$PATH}"
+# Interactive session picker for the PC: list live zmx sessions, pick a
+# number to attach, or type a new name to create one. Opt-in by design — this
+# is the only way local terminals ever join a shared session.
+set -euo pipefail
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+# shellcheck source=server/tsess-state
+. "$script_dir/tsess-state"
+
+# Direct mode, no picker:
+#   tsess <name>                     attach/create running your login shell
+#   tsess <name> <command> [args..]  attach/create running <command>
+#   tsess <command> -flag...         when <command> exists and the next arg
+#                                    starts with '-', run "<command> -flag..."
+#                                    in a session named after the command
+#                                    (e.g. `s agy --conversation=...`).
+if [ "$#" -ge 1 ]; then
+    if [ "$#" -ge 2 ] && [[ "$2" == -* ]] && command -v "$1" >/dev/null 2>&1; then
+        attach_homeattach_session_as_pc "$1" "$@"
+    else
+        attach_homeattach_session_as_pc "$@"
+    fi
+fi
+
+session_info() {
+    local session_name=$1 child_pid tpgid child_pgid fg_pid cwd cmd
+    child_pid=$(session_query_field "$session_name" pid)
+    [ -z "$child_pid" ] && {
+        printf '?\t?'
+        return
+    }
+    tpgid=$(awk '{print $8}' "/proc/$child_pid/stat" 2>/dev/null)
+    child_pgid=$(ps -o pgid= -p "$child_pid" 2>/dev/null | tr -d ' ')
+    fg_pid=""
+    if [ -n "$tpgid" ] && [ "$tpgid" != "$child_pgid" ]; then
+        fg_pid=$(pgrep -g "$tpgid" 2>/dev/null | head -1)
+    fi
+    [ -z "$fg_pid" ] && fg_pid=$child_pid
+    cwd=$(readlink "/proc/$fg_pid/cwd" 2>/dev/null)
+    cwd=${cwd/#$HOME/\~}
+    cmd=$(ps -o comm= -p "$fg_pid" 2>/dev/null)
+    printf '%s\t%s' "${cmd:-?}" "${cwd:-?}"
+}
+
+mapfile -t names < <(list_session_names)
+
+if [ ${#names[@]} -eq 0 ]; then
+    echo "No active sessions."
+else
+    echo "Active sessions:"
+    for i in "${!names[@]}"; do
+        name=${names[$i]}
+        info=$(session_info "$name")
+        cmd=${info%%$'\t'*}
+        cwd=${info#*$'\t'}
+        printf "  %d) %-14s  %-12s  %s\n" "$((i + 1))" "$name" "$cmd" "$cwd"
+    done
+fi
+
+echo
+read -rp "Number to attach, or new name to create: " choice
+
+if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#names[@]}" ]; then
+    name="${names[$((choice - 1))]}"
+else
+    name="${choice:-main}"
+fi
+
+attach_homeattach_session_as_pc "$name"

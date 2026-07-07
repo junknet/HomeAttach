@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 会话列表页 -->
+    <string name="sessions_title">终端会话</string>
+
+    <!-- 错误状态 -->
+    <string name="sessions_error_title">无法加载会话</string>
+    <string name="sessions_error_auth_fallback">认证失败</string>
+    <string name="sessions_error_connect_fallback">连接失败</string>
+    <string name="sessions_error_unexpected">未知错误:%1$s</string>
+    <string name="sessions_retry">重试</string>
+    <string name="sessions_open_settings">打开设置</string>
+    <string name="sessions_refresh_failed">刷新失败:%1$s</string>
+
+    <!-- 空状态 -->
+    <string name="sessions_empty_title">暂无会话</string>
+    <string name="sessions_empty_body">在电脑上开一个终端标签页,它会自动出现在这里。要创建命名会话,可运行:</string>
+    <string name="sessions_empty_hint">新会话启动的瞬间就会出现在这里。</string>
+
+    <!-- 会话卡片 -->
+    <string name="sessions_status_pc">电脑前台</string>
+    <string name="sessions_status_phone">手机前台</string>
+    <string name="sessions_status_idle">空闲</string>
+    <string name="sessions_attach">连接</string>
+
+    <!-- 结束会话 -->
+    <string name="sessions_kill_action">结束会话</string>
+    <string name="sessions_kill_dialog_title">结束“%1$s”?</string>
+    <string name="sessions_kill_dialog_body">这会结束电脑上的该会话及其中正在运行的程序,并且无法撤销。</string>
+    <string name="sessions_kill_confirm">结束会话</string>
+    <string name="sessions_kill_cancel">取消</string>
+    <string name="sessions_kill_failed">无法结束“%1$s”:%2$s</string>
+
+    <!-- 导航抽屉 -->
+    <string name="sessions_drawer_title">切换会话</string>
+</resources>

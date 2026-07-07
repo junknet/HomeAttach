@@ -1,0 +1,154 @@
+#!/bin/bash
+# Ensure a sane PATH: non-interactive SSH exec (e.g. JSch) may hand us a
+# minimal PATH that lacks even coreutils. Absolute-shebang + this keep us safe.
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/bin:/bin${PATH:+:$PATH}"
+# Shared helpers + focus/release CLI for HomeAttach zmx sessions.
+#
+# A session is one zmx daemon holding a pty, a ghostty-vt state tracker, and
+# a unix socket in the runtime dir. Multiple clients may type into the same
+# pty; size ownership follows zmx leader semantics ("newest typist wins"),
+# constrained by our patches (see server/zmx/PATCHES.md):
+#   - the PC attaches as an owner with --bind: the session lives exactly as
+#     long as its owner views - closing the last PC tab SIGHUPs the child;
+#   - remote clients attach as mirrors (--mirror): they see everything and
+#     may type, but never resize the pty and never answer terminal queries;
+#   - `tsess-state focus` (zmx claim) resizes the pty for the phone; the pty
+#     returns to the PC the moment someone types there, or explicitly via
+#     `tsess-state release` (zmx release).
+#
+# Local PC tabs are NEVER wrapped automatically: sessions exist only when the
+# user opts in by running tsess/tsess-attach.
+
+HOMEATTACH_SESSION_NAME_RE='^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$'
+
+homeattach_fail() {
+    printf '%s: %s\n' "${0##*/}" "$*" >&2
+    return 1
+}
+
+# Mirror of zmx's Cfg.socketDir (src/main.zig): ZMX_DIR beats
+# XDG_RUNTIME_DIR/zmx beats $TMPDIR/zmx-$UID.
+homeattach_runtime_dir() {
+    if [ -n "${ZMX_DIR:-}" ]; then
+        printf '%s' "$ZMX_DIR"
+        return
+    fi
+    if [ -n "${XDG_RUNTIME_DIR:-}" ] && [ -d "$XDG_RUNTIME_DIR" ]; then
+        printf '%s/zmx' "$XDG_RUNTIME_DIR"
+        return
+    fi
+    local tmpdir=${TMPDIR:-/tmp}
+    printf '%s/zmx-%s' "${tmpdir%/}" "$(id -u)"
+}
+
+zmx_bin() {
+    local script_dir
+    if [ -n "${HOMEATTACH_ZMX:-}" ]; then
+        printf '%s' "$HOMEATTACH_ZMX"
+        return
+    fi
+    script_dir=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+    if [ -f "$script_dir/zmx" ] && [ -x "$script_dir/zmx" ]; then
+        printf '%s/zmx' "$script_dir"
+    elif [ -x "$script_dir/zmx/zig-out/bin/zmx" ]; then
+        printf '%s/zmx/zig-out/bin/zmx' "$script_dir"
+    else
+        printf 'zmx'
+    fi
+}
+
+validate_session_name() {
+    local session_name=$1
+    [[ "$session_name" =~ $HOMEATTACH_SESSION_NAME_RE ]] ||
+        homeattach_fail "invalid session name '$session_name'"
+}
+
+session_socket() {
+    printf '%s/%s' "$(homeattach_runtime_dir)" "$1"
+}
+
+has_homeattach_session() {
+    [ -S "$(session_socket "$1")" ]
+}
+
+# One "key=value ..." status line from the daemon:
+# pid= cols= rows= owners= mirrors= bound=
+session_query() {
+    "$(zmx_bin)" stat "$1" 2>/dev/null
+}
+
+session_query_field() {
+    session_query "$1" | tr ' ' '\n' | awk -F= -v k="$2" '$1==k{print $2}'
+}
+
+list_session_names() {
+    local sock
+    for sock in "$(homeattach_runtime_dir)"/*; do
+        [ -S "$sock" ] || continue
+        printf '%s\n' "${sock##*/}"
+    done
+}
+
+# Create the session if missing; either way exec an owner attach whose
+# lifetime the session follows (--bind: last owner out ends the session).
+# Extra arguments are the command to run inside a newly created session
+# (ignored when attaching to an existing one); zmx spawns a login $SHELL
+# when no command is given.
+attach_homeattach_session_as_pc() {
+    local session_name=$1
+    shift
+    validate_session_name "$session_name" || return 1
+    exec "$(zmx_bin)" attach --bind "$session_name" "$@"
+}
+
+# Grant focus: the pty takes <cols>x<rows> and the child gets SIGWINCH so
+# full-screen TUIs repaint at the new size. Leadership goes vacant: the PC
+# reclaims its size automatically the moment someone types there.
+focus_session() {
+    local session_name=$1 owner=$2 cols=$3 rows=$4
+    validate_session_name "$session_name" || return 1
+    [[ "$cols" =~ ^[1-9][0-9]*$ ]] || { homeattach_fail "bad cols '$cols'"; return 1; }
+    [[ "$rows" =~ ^[1-9][0-9]*$ ]] || { homeattach_fail "bad rows '$rows'"; return 1; }
+    has_homeattach_session "$session_name" ||
+        { homeattach_fail "no session '$session_name'"; return 1; }
+    "$(zmx_bin)" claim "$session_name" "$cols" "$rows" || return 1
+    printf '%s\t%s\t%s\t%s\tfocused\n' "$session_name" "$owner" "$cols" "$rows"
+}
+
+# Release focus back to the PC: the daemon hands size ownership to the first
+# attached owner client, which re-reports its size and WINCHes the child.
+release_session_focus() {
+    local session_name=$1 owner=$2
+    validate_session_name "$session_name" || return 1
+    has_homeattach_session "$session_name" ||
+        { homeattach_fail "no session '$session_name'"; return 1; }
+    "$(zmx_bin)" release "$session_name" || return 1
+    printf '%s\t%s\treleased\n' "$session_name" "$owner"
+}
+
+print_usage() {
+    cat >&2 <<'USAGE'
+usage:
+  tsess-state focus <session> <owner> <cols> <rows>
+  tsess-state release <session> <owner>
+USAGE
+}
+
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+    set -euo pipefail
+    command=${1:-}
+    case "$command" in
+        focus)
+            [ "$#" -eq 5 ] || { print_usage; exit 2; }
+            focus_session "$2" "$3" "$4" "$5"
+            ;;
+        release)
+            [ "$#" -eq 3 ] || { print_usage; exit 2; }
+            release_session_focus "$2" "$3"
+            ;;
+        *)
+            print_usage
+            exit 2
+            ;;
+    esac
+fi

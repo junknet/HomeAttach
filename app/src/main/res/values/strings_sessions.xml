@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Session list screen -->
+    <string name="sessions_title">Terminal sessions</string>
+
+    <!-- Error state -->
+    <string name="sessions_error_title">Couldn\'t load sessions</string>
+    <string name="sessions_error_auth_fallback">Authentication failed</string>
+    <string name="sessions_error_connect_fallback">Connection failed</string>
+    <string name="sessions_error_unexpected">Unexpected error: %1$s</string>
+    <string name="sessions_retry">Retry</string>
+    <string name="sessions_open_settings">Open Settings</string>
+    <string name="sessions_refresh_failed">Refresh failed: %1$s</string>
+
+    <!-- Empty state -->
+    <string name="sessions_empty_title">No sessions</string>
+    <string name="sessions_empty_body">Open a terminal tab on your PC — it attaches here automatically. For a named session, run:</string>
+    <string name="sessions_empty_command" translatable="false">tsess &lt;name&gt;</string>
+    <string name="sessions_empty_hint">New sessions appear here the moment they start.</string>
+
+    <!-- Session card -->
+    <string name="sessions_status_pc">PC focused</string>
+    <string name="sessions_status_phone">Phone focused</string>
+    <string name="sessions_status_idle">Idle</string>
+    <string name="sessions_attach">Attach</string>
+
+    <!-- Kill session -->
+    <string name="sessions_kill_action">End session</string>
+    <string name="sessions_kill_dialog_title">End \'%1$s\'?</string>
+    <string name="sessions_kill_dialog_body">This ends the session on your PC, including whatever is running inside it. It can\'t be undone.</string>
+    <string name="sessions_kill_confirm">End session</string>
+    <string name="sessions_kill_cancel">Cancel</string>
+    <string name="sessions_kill_failed">Couldn\'t end \'%1$s\': %2$s</string>
+
+    <!-- Navigation drawer -->
+    <string name="sessions_drawer_title">Terminal sessions</string>
+</resources>

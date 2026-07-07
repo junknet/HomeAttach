@@ -1,0 +1,18 @@
+#!/bin/bash
+# Ensure a sane PATH: non-interactive SSH exec (e.g. JSch) may hand us a
+# minimal PATH that lacks even coreutils. Absolute-shebang + this keep us safe.
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/bin:/bin${PATH:+:$PATH}"
+# Grant focus to one client: the pty takes that client's size and the child
+# gets SIGWINCH so full-screen TUIs repaint.
+set -euo pipefail
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+state_command="$script_dir/tsess-state"
+[ -x "$state_command" ] || state_command=tsess-state
+
+if [ "$#" -ne 4 ]; then
+    echo "usage: tsess-focus <session> <owner> <cols> <rows>" >&2
+    exit 2
+fi
+
+exec "$state_command" focus "$1" "$2" "$3" "$4"

@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="terminal_back">返回</string>
+    <string name="terminal_connecting_to">正在连接 %1$s…</string>
+    <string name="terminal_connection_failed_title">连接失败</string>
+    <string name="terminal_connection_lost_title">连接已断开</string>
+    <string name="terminal_connection_lost_hint">会话可能仍在电脑上运行——请检查网络后重新连接。</string>
+    <string name="terminal_reconnect">重新连接</string>
+    <string name="terminal_retry">重试</string>
+    <string name="terminal_session_ended_on_pc">会话已在电脑端结束</string>
+    <string name="terminal_status_connecting">连接中</string>
+    <string name="terminal_status_reconnecting">重连中</string>
+    <string name="terminal_status_connected">已连接</string>
+    <string name="terminal_status_disconnected">已断开</string>
+    <string name="terminal_toggle_keyboard">显示/隐藏键盘</string>
+    <string name="terminal_unknown_error">未知错误</string>
+</resources>

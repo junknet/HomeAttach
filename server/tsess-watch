@@ -1,0 +1,40 @@
+#!/bin/bash
+# Ensure a sane PATH: non-interactive SSH exec (e.g. JSch) may hand us a
+# minimal PATH that lacks even coreutils. Absolute-shebang + this keep us safe.
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/bin:/bin${PATH:+:$PATH}"
+# Real-time session feed for the Android app: emits the full tsess-list TSV
+# wrapped in #BEGIN/#END markers - immediately on start, again the instant a
+# session is born or dies (inotify on the runtime dir's socket files), and at
+# least every 5 seconds as a heartbeat so status/size columns stay fresh.
+# Runs until the caller closes the connection.
+set -euo pipefail
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+# shellcheck source=server/tsess-state
+. "$script_dir/tsess-state"
+
+runtime_dir=$(homeattach_runtime_dir)
+mkdir -p "$runtime_dir"
+
+emit_list() {
+    printf '#BEGIN\n'
+    "$script_dir/tsess-list" 2>/dev/null || true
+    printf '#END\n'
+}
+
+if command -v inotifywait >/dev/null 2>&1; then
+    while true; do
+        emit_list
+        # Wakes on session birth/death, or every 5s (exit code 2) as heartbeat.
+        inotifywait -q -q -t 5 \
+            -e create -e delete -e moved_to -e moved_from \
+            "$runtime_dir" >/dev/null 2>&1 || true
+        # Coalesce event bursts (socket create + chmod, multi-tab startup).
+        sleep 0.1
+    done
+else
+    while true; do
+        emit_list
+        sleep 2
+    done
+fi

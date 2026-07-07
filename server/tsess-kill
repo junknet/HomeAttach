@@ -1,0 +1,35 @@
+#!/bin/bash
+# Ensure a sane PATH: non-interactive SSH exec (e.g. JSch) may hand us a
+# minimal PATH that lacks even coreutils. Absolute-shebang + this keep us safe.
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/bin:/bin${PATH:+:$PATH}"
+# Kill a named HomeAttach session outright. Used by the Android app's
+# "end session" swipe action so cleaning up an orphaned session takes
+# one tap instead of a PC trip.
+set -euo pipefail
+
+target=${1:?usage: tsess-kill <name>}
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+# shellcheck source=server/tsess-state
+. "$script_dir/tsess-state"
+
+validate_session_name "$target"
+if ! has_homeattach_session "$target"; then
+    echo "no session named '$target'" >&2
+    exit 1
+fi
+
+# zmx kill SIGHUPs the child (then SIGKILL), tears down every attached
+# client, and removes the socket; it also cleans up stale sockets whose
+# daemon is already gone.
+"$(zmx_bin)" kill "$target" || true
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+    has_homeattach_session "$target" || break
+    sleep 0.2
+done
+if has_homeattach_session "$target"; then
+    # The daemon died without cleaning up; remove the stale socket so
+    # lists stay truthful.
+    rm -f "$(session_socket "$target")"
+fi
+echo "killed $target"

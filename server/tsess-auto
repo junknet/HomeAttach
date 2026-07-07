@@ -1,0 +1,31 @@
+#!/bin/bash
+# Ensure a sane PATH: non-interactive SSH exec (e.g. JSch) may hand us a
+# minimal PATH that lacks even coreutils. Absolute-shebang + this keep us safe.
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/bin:/bin${PATH:+:$PATH}"
+# Terminal-profile entry point: make THIS tab a HomeAttach session with an
+# auto-generated identity. Point your yakuake/Konsole profile's command here
+# and every tab becomes a shareable, view-bound session with zero ceremony.
+#
+# The session name is an internal unique id (startup-timestamp hash) - UIs
+# label sessions by their cwd, not by this id. Lifetime is bound to the tab:
+# closing it ends the session (zmx attach --bind).
+set -euo pipefail
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+# shellcheck source=server/tsess-state
+. "$script_dir/tsess-state"
+
+# Never nest: if this shell is already inside a session (e.g. someone runs
+# tsess-auto by hand from a wrapped tab), just give them a plain shell.
+if [ -n "${ZMX_SESSION:-}" ]; then
+    exec "${SHELL:-/bin/zsh}"
+fi
+
+# Unique id from the startup timestamp (ns) + pid; retry on the astronomically
+# unlikely collision. 9 hex chars keeps `zmx ls` and logs readable.
+for _ in 1 2 3; do
+    name="s$(printf '%s-%s' "$(date +%s%N)" "$$" | sha256sum | cut -c1-9)"
+    has_homeattach_session "$name" || break
+done
+
+attach_homeattach_session_as_pc "$name"

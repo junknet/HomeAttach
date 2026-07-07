@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="terminal_back">Back</string>
+    <string name="terminal_connecting_to">Connecting to %1$s…</string>
+    <string name="terminal_connection_failed_title">Connection failed</string>
+    <string name="terminal_connection_lost_title">Connection lost</string>
+    <string name="terminal_connection_lost_hint">The session may still be running on your PC — check the network, then reconnect.</string>
+    <string name="terminal_reconnect">Reconnect</string>
+    <string name="terminal_retry">Retry</string>
+    <string name="terminal_session_ended_on_pc">Session ended on PC</string>
+    <string name="terminal_status_connecting">Connecting</string>
+    <string name="terminal_status_reconnecting">Reconnecting</string>
+    <string name="terminal_status_connected">Connected</string>
+    <string name="terminal_status_disconnected">Disconnected</string>
+    <string name="terminal_toggle_keyboard">Toggle keyboard</string>
+    <string name="terminal_unknown_error">Unknown error</string>
+
+    <!-- Terminal keycap labels: standard key names, identical across locales. -->
+    <string name="terminal_key_ctrl" translatable="false">Ctrl</string>
+    <string name="terminal_key_alt" translatable="false">Alt</string>
+    <string name="terminal_key_esc" translatable="false">Esc</string>
+    <string name="terminal_key_tab" translatable="false">Tab</string>
+    <string name="terminal_key_home" translatable="false">Home</string>
+    <string name="terminal_key_end" translatable="false">End</string>
+    <string name="terminal_key_page_up" translatable="false">PgUp</string>
+    <string name="terminal_key_page_down" translatable="false">PgDn</string>
+</resources>

@@ -1,0 +1,15 @@
+<resources>
+    <!--
+        Dark-first platform theme shown before Compose takes over (cold start) and behind the
+        system bars. The window background matches the Compose dark scheme's background
+        (md_theme_dark_background, #0B0F0E) so startup never flashes white next to the
+        terminal. System bars are transparent + non-light icons: edge-to-edge friendly and
+        consistent whether or not the activity opts into enableEdgeToEdge().
+    -->
+    <style name="Theme.HomeAttach" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">#FF0B0F0E</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:windowLightStatusBar">false</item>
+    </style>
+</resources>

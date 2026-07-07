@@ -1,0 +1,50 @@
+#!/bin/bash
+# Ensure a sane PATH: non-interactive SSH exec (e.g. JSch) may hand us a
+# minimal PATH that lacks even coreutils. Absolute-shebang + this keep us safe.
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/bin:/bin${PATH:+:$PATH}"
+# Remote/second-screen attach: mirror client that never drives the pty size,
+# with the current screen restored from the daemon's ghostty-vt state.
+#
+#   tsess-attach <session> [replay] [app|focus]
+#
+# The replay argument is accepted for backwards compatibility and ignored:
+# zmx re-hydrates a joining client from tracked terminal state instead of a
+# raw byte ring, so there is no replay window to size.
+#
+# Modes:
+#   interactive (default)  mirror attach; Ctrl+\ detaches (zmx detach key).
+#   app                    mirror attach for the Android app - identical on
+#                          the wire; the app owns the connection lifecycle
+#                          and avoids the Ctrl+\ detach byte itself.
+#   focus                  grab the pty size for this terminal before
+#                          attaching (zmx claim with this tty's dimensions);
+#                          the PC reclaims automatically when someone types
+#                          there.
+#
+# Attaching to a nonexistent session is an error on purpose: sessions are
+# born on the PC (tsess) so their lifetime stays bound to the PC view.
+set -euo pipefail
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+# shellcheck source=server/tsess-state
+. "$script_dir/tsess-state"
+
+session_name=${1:?usage: tsess-attach <session> [replay] [app|focus]}
+mode=${3:-interactive}
+
+validate_session_name "$session_name"
+has_homeattach_session "$session_name" || {
+    echo "no session named '$session_name'" >&2
+    exit 1
+}
+
+if [ "$mode" = focus ]; then
+    size=$(stty size 2>/dev/null || true)
+    rows=${size%% *}
+    cols=${size##* }
+    if [[ "$cols" =~ ^[1-9][0-9]*$ ]] && [[ "$rows" =~ ^[1-9][0-9]*$ ]]; then
+        "$(zmx_bin)" claim "$session_name" "$cols" "$rows"
+    fi
+fi
+
+exec "$(zmx_bin)" attach --mirror "$session_name"

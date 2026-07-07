@@ -1,0 +1,54 @@
+#!/bin/bash
+# Ensure a sane PATH: non-interactive SSH exec (e.g. JSch) may hand us a
+# minimal PATH that lacks even coreutils. Absolute-shebang + this keep us safe.
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/bin:/bin${PATH:+:$PATH}"
+# Machine-readable session list for the Android app: one TSV line per
+# session — name\tcmd\tcwd\towner\tcols\trows\tstatus. No prompts, no
+# interaction.
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+# shellcheck source=server/tsess-state
+. "$script_dir/tsess-state"
+
+session_info() {
+    local child_pid=$1 tpgid child_pgid fg_pid cwd cmd
+    tpgid=$(awk '{print $8}' "/proc/$child_pid/stat" 2>/dev/null)
+    child_pgid=$(ps -o pgid= -p "$child_pid" 2>/dev/null | tr -d ' ')
+    fg_pid=""
+    if [ -n "$tpgid" ] && [ "$tpgid" != "$child_pgid" ]; then
+        fg_pid=$(pgrep -g "$tpgid" 2>/dev/null | head -1)
+    fi
+    [ -z "$fg_pid" ] && fg_pid=$child_pid
+    cwd=$(readlink "/proc/$fg_pid/cwd" 2>/dev/null)
+    cwd=${cwd/#$HOME/\~}
+    cmd=$(ps -o comm= -p "$fg_pid" 2>/dev/null)
+    printf '%s\t%s' "${cmd:-?}" "${cwd:-?}"
+}
+
+while IFS= read -r name; do
+    query=$(session_query "$name") || continue
+    [ -n "$query" ] || continue
+    pid=$(printf '%s' "$query" | tr ' ' '\n' | awk -F= '$1=="pid"{print $2}')
+    cols=$(printf '%s' "$query" | tr ' ' '\n' | awk -F= '$1=="cols"{print $2}')
+    rows=$(printf '%s' "$query" | tr ' ' '\n' | awk -F= '$1=="rows"{print $2}')
+    owners=$(printf '%s' "$query" | tr ' ' '\n' | awk -F= '$1=="owners"{print $2}')
+    mirrors=$(printf '%s' "$query" | tr ' ' '\n' | awk -F= '$1=="mirrors"{print $2}')
+    [ -n "$pid" ] || continue
+
+    info=$(session_info "$pid")
+    cmd=${info%%$'\t'*}
+    cwd=${info#*$'\t'}
+
+    if [ "${owners:-0}" -gt 0 ]; then
+        owner=pc
+        status=focused
+    elif [ "${mirrors:-0}" -gt 0 ]; then
+        owner=android
+        status=focused
+    else
+        owner=none
+        status=detached
+    fi
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$name" "$cmd" "$cwd" "$owner" "${cols:-?}" "${rows:-?}" "$status"
+done < <(list_session_names)
