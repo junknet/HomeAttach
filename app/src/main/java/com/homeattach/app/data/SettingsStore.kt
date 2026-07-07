@@ -53,10 +53,18 @@ class SettingsStore(context: Context) {
 
     fun isConfigured(): Boolean = load().isValid
 
+    /** Terminal font size in pixels, persisted across sessions (set by pinch-zoom). */
+    fun loadTerminalFontPx(default: Int): Int = prefs.getInt(KEY_FONT_PX, default)
+
+    fun saveTerminalFontPx(px: Int) {
+        prefs.edit().putInt(KEY_FONT_PX, px).apply()
+    }
+
     companion object {
         private const val KEY_HOST = "host"
         private const val KEY_PORT = "port"
         private const val KEY_USERNAME = "username"
         private const val KEY_KEY_PEM = "key_pem"
+        private const val KEY_FONT_PX = "terminal_font_px"
     }
 }

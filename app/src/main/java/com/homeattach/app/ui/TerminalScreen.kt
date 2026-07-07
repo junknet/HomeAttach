@@ -100,6 +100,7 @@ import com.homeattach.app.terminal.RemoteTerminalSession
 import android.view.KeyEvent
 import android.view.MotionEvent
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
+import kotlin.math.roundToInt
 import androidx.compose.foundation.layout.width
 import com.termux.terminal.TerminalSession
 import com.termux.view.TerminalView
@@ -365,12 +366,12 @@ fun TerminalScreen(
         }
     }
 
+    // Grab focus on entry so the first tap raises the keyboard, but do NOT auto-pop the IME:
+    // showing it right after entry resizes the terminal (the entry flicker). Tap to type.
     LaunchedEffect(lifecycleOwner, status, terminalView) {
         lifecycleOwner.lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED) {
-            if (status is ConnStatus.Connected && terminalView != null) {
-                delay(150L) // 避开 AndroidView 首帧 measure 和 layout 的竞态冲突
+            if (status is ConnStatus.Connected) {
                 terminalView?.requestFocus()
-                terminalView?.showSoftKeyboard()
             }
         }
     }
@@ -387,11 +388,31 @@ fun TerminalScreen(
         }
     }
 
-    // Termux setTextSize is in pixels; scale the dp constant once and reuse for the view + pinch lock.
-    val terminalTextSizePx = (TERMINAL_TEXT_SIZE_DP * context.resources.displayMetrics.density).toInt()
-    val terminalViewClient = remember(terminalTextSizePx) {
+    // Terminal font size (pixels) is persisted so pinch-zoom sticks across sessions.
+    val density = context.resources.displayMetrics.density
+    val defaultFontPx = (TERMINAL_TEXT_SIZE_DP * density).toInt()
+    val minFontPx = (9 * density).toInt()
+    val maxFontPx = (32 * density).toInt()
+    var terminalFontPx by remember { mutableStateOf(settingsStore.loadTerminalFontPx(defaultFontPx)) }
+    // Bundled CJK monospace (Sarasa Fixed SC): guarantees fixed-width Chinese alignment.
+    val terminalTypeface = remember {
+        runCatching {
+            android.graphics.Typeface.createFromAsset(context.assets, "fonts/sarasa_fixed_sc_regular.ttf")
+        }.getOrDefault(android.graphics.Typeface.MONOSPACE)
+    }
+    val terminalViewClient = remember {
         object : TerminalViewClient {
-            override fun onScale(scale: Float): Float = terminalTextSizePx.toFloat() // pinch-zoom locked
+            override fun onScale(scale: Float): Float {
+                // Pinch-zoom: adjust font size, clamp, apply, persist. Return 1f to reset the
+                // recognizer's accumulator since we track the size ourselves.
+                val newPx = (terminalFontPx * scale).roundToInt().coerceIn(minFontPx, maxFontPx)
+                if (newPx != terminalFontPx) {
+                    terminalFontPx = newPx
+                    terminalView?.setTextSize(newPx)
+                    settingsStore.saveTerminalFontPx(newPx)
+                }
+                return 1.0f
+            }
             override fun onSingleTapUp(e: MotionEvent?) {
                 // The load-bearing fix: a tap on the terminal raises the soft keyboard.
                 terminalView?.requestFocus()
@@ -535,8 +556,8 @@ fun TerminalScreen(
                                             view.attachSession(remoteTerminalSession.session)
                                             // Termux setTextSize is pixels; set before first layout so
                                             // font metrics are non-zero and cols/rows compute correctly.
-                                            view.setTextSize(terminalTextSizePx)
-                                            view.setTypeface(android.graphics.Typeface.MONOSPACE)
+                                            view.setTextSize(terminalFontPx)
+                                            view.setTypeface(terminalTypeface)
                                             view.setBackgroundColor(0xFF0A0B10.toInt())
                                             // Termux's TerminalView (unlike jackpal) does not make
                                             // itself focusable; without this, requestFocus() is a
