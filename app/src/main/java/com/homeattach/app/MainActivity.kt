@@ -5,6 +5,8 @@ import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.compose.animation.EnterTransition
+import androidx.compose.animation.ExitTransition
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.Surface
 import androidx.compose.runtime.Composable
@@ -28,7 +30,9 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         setContent {
             HomeAttachTheme {
-                Surface(modifier = Modifier.fillMaxSize()) {
+                // Dark root so any one-frame relayout gap (keyboard resize, terminal reflow) shows
+                // the terminal color, not a light flash. The list/settings paint their own bg on top.
+                Surface(modifier = Modifier.fillMaxSize(), color = androidx.compose.ui.graphics.Color(0xFF0A0B10)) {
                     HomeAttachApp()
                 }
             }
@@ -53,7 +57,16 @@ fun HomeAttachApp() {
     val settingsStore = remember { SettingsStore(context) }
     val startDestination = if (settingsStore.isConfigured()) ROUTE_SESSIONS else ROUTE_SETTINGS
 
-    NavHost(navController = navController, startDestination = startDestination) {
+    // Instant transitions: the default crossfade alpha-blends the light list against the dark
+    // terminal, producing a one-frame washed-out flash on enter/session-switch. A hard cut avoids it.
+    NavHost(
+        navController = navController,
+        startDestination = startDestination,
+        enterTransition = { EnterTransition.None },
+        exitTransition = { ExitTransition.None },
+        popEnterTransition = { EnterTransition.None },
+        popExitTransition = { ExitTransition.None },
+    ) {
         composable(ROUTE_SETTINGS) {
             val canGoBack = navController.previousBackStackEntry != null
             SettingsScreen(
