@@ -61,7 +61,31 @@ else
     echo "Warning: apksigner not found; skipping signature verification." >&2
 fi
 APK_SHA256=$(sha256sum "$APK_PATH" | awk '{print $1}')
-echo "APK sha256: $APK_SHA256"
+APK_SIZE=$(stat -c%s "$APK_PATH")
+echo "APK sha256: $APK_SHA256  size: $APK_SIZE"
+
+# ---- 3b. Generate the static version manifest (update.json) ----------------
+# The app reads this from the CDN direct-download URL, NOT the GitHub REST API.
+# The asset name must be exactly "update.json"/"app-release.apk", so the temp
+# file is named accordingly (gh derives the asset name from the basename).
+REPO_SLUG=$(gh repo view --json nameWithOwner -q .nameWithOwner)
+APK_ASSET="app-release.apk"
+APK_URL="https://github.com/$REPO_SLUG/releases/download/$TAG_NAME/$APK_ASSET"
+MANIFEST_URL="https://github.com/$REPO_SLUG/releases/latest/download/update.json"
+MANIFEST_DIR=$(mktemp -d)
+trap 'rm -rf "$MANIFEST_DIR"' EXIT
+MANIFEST="$MANIFEST_DIR/update.json"
+cat > "$MANIFEST" <<EOF
+{
+  "versionCode": $VERSION_CODE,
+  "versionName": "$VERSION_NAME",
+  "apkUrl": "$APK_URL",
+  "sha256": "$APK_SHA256",
+  "sizeBytes": $APK_SIZE,
+  "notes": "HomeAttach $VERSION_NAME"
+}
+EOF
+echo "Manifest generated: $MANIFEST_URL -> versionCode $VERSION_CODE"
 
 # ---- 4. Push branch and tag ----------------------------------------------
 echo "Pushing $BRANCH..."
@@ -98,13 +122,40 @@ when signed with the same release certificate.
 EOF
 )
 
-# ---- 6. Create the GitHub Release -----------------------------------------
+# ---- 6. Create the GitHub Release (APK + manifest, forced latest) ----------
+# --latest is mandatory: the app's manifest URL follows the "Latest" pointer,
+# and a release that is never marked latest (or is a prerelease) 404s the whole
+# update channel. Never pass --prerelease.
 echo "Publishing GitHub Release $TAG_NAME..."
 gh release delete "$TAG_NAME" --yes --cleanup-tag=false >/dev/null 2>&1 || true
-gh release create "$TAG_NAME" "$APK_PATH#HomeAttach-$TAG_NAME.apk" \
+gh release create "$TAG_NAME" "$APK_PATH" "$MANIFEST" \
+    --latest \
     --title "$TAG_NAME" \
     --notes "$NOTES"
 
+# ---- 7. Post-publish self-check: the channel contract, verified anonymously -
+# Fetch exactly what an app in the wild would fetch (no token), and assert the
+# just-published versionCode is served and the APK is reachable. This is the
+# durable guard against a silently-broken update channel.
+echo "Verifying update channel (anonymous)..."
+SERVED=""
+for _ in 1 2 3 4 5; do
+    SERVED=$(curl -fsSL "$MANIFEST_URL" 2>/dev/null) && break
+    sleep 3
+done
+[ -n "$SERVED" ] || { echo "Self-check FAILED: manifest not served at $MANIFEST_URL" >&2; exit 1; }
+echo "$SERVED" | grep -qE "\"versionCode\"[[:space:]]*:[[:space:]]*$VERSION_CODE([^0-9]|$)" || {
+    echo "Self-check FAILED: served manifest versionCode != $VERSION_CODE" >&2
+    echo "$SERVED" >&2
+    exit 1
+}
+APK_CODE=$(curl -fsSL -r 0-0 -o /dev/null -w '%{http_code}' "$APK_URL" 2>/dev/null || echo 000)
+case "$APK_CODE" in
+    200|206) : ;;
+    *) echo "Self-check FAILED: apkUrl unreachable (HTTP $APK_CODE): $APK_URL" >&2; exit 1 ;;
+esac
+
 echo "=========================================================="
 echo " Published: $(gh release view "$TAG_NAME" --json url -q .url)"
+echo " Update channel verified: versionCode $VERSION_CODE, APK reachable."
 echo "=========================================================="

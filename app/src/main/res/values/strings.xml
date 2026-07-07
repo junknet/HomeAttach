@@ -41,7 +41,7 @@
     <string name="settings_update_check">Check update</string>
     <string name="settings_update_install">Install update</string>
     <string name="settings_update_current_version">Current version: %1$s</string>
-    <string name="settings_update_checking">Checking GitHub Release…</string>
+    <string name="settings_update_checking">Checking for updates…</string>
     <string name="settings_update_downloading">Downloading %1$s…</string>
     <string name="settings_update_not_configured">Release repository is not configured for this build</string>
     <string name="settings_update_latest">Already latest: %1$s (%2$s)</string>

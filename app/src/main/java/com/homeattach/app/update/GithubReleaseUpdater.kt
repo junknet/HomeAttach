@@ -11,15 +11,17 @@ import java.io.File
 import java.io.IOException
 import java.net.HttpURLConnection
 import java.net.URL
+import java.security.DigestInputStream
+import java.security.MessageDigest
 import java.util.Locale
 import org.json.JSONObject
 
 data class AvailableAppUpdate(
     val tagName: String,
-    val releaseUrl: String,
     val assetName: String,
     val assetUrl: String,
     val assetSizeBytes: Long,
+    val sha256: String,
 )
 
 data class DownloadedAppUpdate(
@@ -39,31 +41,30 @@ enum class InstallLaunchResult {
 }
 
 class GithubReleaseUpdater(private val context: Context) {
+    /**
+     * Reads a static version manifest (update.json) served from a CDN direct-download URL rather
+     * than the GitHub REST API. This deliberately avoids api.github.com: the anonymous REST endpoint
+     * has a 60-req/hour/IP limit and `/releases/latest` hides draft/prerelease, both of which
+     * silently broke the update channel. The manifest URL 302-redirects through GitHub's objects CDN
+     * (no rate limit), and the update decision is a monotonic versionCode integer compare.
+     */
     fun checkForUpdate(): AppUpdateCheckResult {
-        val owner = BuildConfig.UPDATE_REPOSITORY_OWNER.trim()
-        val repo = BuildConfig.UPDATE_REPOSITORY_NAME.trim()
-        if (owner.isBlank() || repo.isBlank()) return AppUpdateCheckResult.NotConfigured
-        require(GITHUB_REPOSITORY_PART.matches(owner)) { "Invalid GitHub owner: $owner" }
-        require(GITHUB_REPOSITORY_PART.matches(repo)) { "Invalid GitHub repository: $repo" }
+        val manifestUrl = BuildConfig.UPDATE_MANIFEST_URL.trim()
+        if (manifestUrl.isBlank()) return AppUpdateCheckResult.NotConfigured
 
-        val releaseJson = getJson(
-            "https://api.github.com/repos/$owner/$repo/releases/latest",
-        )
-        val latestTag = releaseJson.getString("tag_name")
-        val apkAsset = selectApkAsset(releaseJson)
-            ?: throw IOException("Latest GitHub release has no APK asset")
-
-        if (!isReleaseNewerThanInstalled(latestTag, BuildConfig.VERSION_NAME)) {
-            return AppUpdateCheckResult.UpToDate(BuildConfig.VERSION_NAME, latestTag)
+        val manifest = parseManifest(getJson(manifestUrl))
+        if (!isVersionCodeNewer(manifest.versionCode, BuildConfig.VERSION_CODE)) {
+            return AppUpdateCheckResult.UpToDate(BuildConfig.VERSION_NAME, manifest.versionName)
         }
 
         return AppUpdateCheckResult.Available(
             AvailableAppUpdate(
-                tagName = latestTag,
-                releaseUrl = releaseJson.optString("html_url"),
-                assetName = apkAsset.getString("name"),
-                assetUrl = apkAsset.getString("browser_download_url"),
-                assetSizeBytes = apkAsset.optLong("size", -1L),
+                tagName = manifest.versionName,
+                assetName = manifest.apkUrl.substringAfterLast('/').substringBefore('?')
+                    .ifBlank { "HomeAttach.apk" },
+                assetUrl = manifest.apkUrl,
+                assetSizeBytes = manifest.sizeBytes,
+                sha256 = manifest.sha256,
             ),
         )
     }
@@ -86,11 +87,19 @@ class GithubReleaseUpdater(private val context: Context) {
             if (connection.responseCode !in 200..299) {
                 throw IOException("APK download failed: HTTP ${connection.responseCode}")
             }
+            // Hash while streaming (single read) so a corrupt or tampered APK is rejected before it
+            // is ever renamed into place or handed to the system installer.
+            val digest = MessageDigest.getInstance("SHA-256")
             partial.outputStream().use { output ->
-                connection.inputStream.use { input -> input.copyTo(output) }
+                DigestInputStream(connection.inputStream, digest).use { input -> input.copyTo(output) }
             }
             if (partial.length() <= 0L) {
                 throw IOException("Downloaded APK is empty")
+            }
+            val actualSha256 = digest.digest().joinToString("") { "%02x".format(it) }
+            if (!actualSha256.equals(update.sha256, ignoreCase = true)) {
+                partial.delete()
+                throw IOException("APK checksum mismatch: expected ${update.sha256}, got $actualSha256")
             }
             if (target.exists() && !target.delete()) {
                 throw IOException("Could not replace cached APK: ${target.absolutePath}")
@@ -135,8 +144,11 @@ class GithubReleaseUpdater(private val context: Context) {
         val connection = openConnection(url)
         try {
             val responseCode = connection.responseCode
+            if (responseCode == 404) {
+                throw IOException("No update manifest published yet (HTTP 404)")
+            }
             if (responseCode !in 200..299) {
-                throw IOException("GitHub release check failed: HTTP $responseCode")
+                throw IOException("Update check failed: HTTP $responseCode")
             }
             return JSONObject(connection.inputStream.bufferedReader().use { it.readText() })
         } finally {
@@ -148,35 +160,10 @@ class GithubReleaseUpdater(private val context: Context) {
         return (URL(url).openConnection() as HttpURLConnection).apply {
             connectTimeout = NETWORK_TIMEOUT_MS
             readTimeout = NETWORK_TIMEOUT_MS
+            // The manifest URL 302-chains through GitHub's objects CDN; all hops are https->https so
+            // HttpURLConnection follows them (it only refuses cross-protocol redirects).
             instanceFollowRedirects = true
-            setRequestProperty("Accept", "application/vnd.github+json")
-            setRequestProperty("X-GitHub-Api-Version", "2022-11-28")
             setRequestProperty("User-Agent", "HomeAttach/${BuildConfig.VERSION_NAME}")
-        }
-    }
-
-    private fun selectApkAsset(releaseJson: JSONObject): JSONObject? {
-        val assets = releaseJson.getJSONArray("assets")
-        val apkAssets = buildList {
-            for (index in 0 until assets.length()) {
-                val asset = assets.getJSONObject(index)
-                if (asset.getString("name").endsWith(".apk", ignoreCase = true)) {
-                    add(asset)
-                }
-            }
-        }
-        return apkAssets.minWithOrNull(
-            compareBy<JSONObject> { apkAssetPriority(it.getString("name")) }
-                .thenBy { it.getString("name") },
-        )
-    }
-
-    private fun apkAssetPriority(name: String): Int {
-        val lower = name.lowercase(Locale.US)
-        return when {
-            "universal" in lower -> 0
-            "release" in lower -> 1
-            else -> 2
         }
     }
 
@@ -188,26 +175,45 @@ class GithubReleaseUpdater(private val context: Context) {
         private const val APK_MIME_TYPE = "application/vnd.android.package-archive"
         private const val NETWORK_TIMEOUT_MS = 15000
         private const val UPDATE_CACHE_DIR = "updates"
-        private val GITHUB_REPOSITORY_PART = Regex("[A-Za-z0-9_.-]+")
     }
 }
 
-internal fun isReleaseNewerThanInstalled(releaseTag: String, installedVersion: String): Boolean {
-    val release = releaseTag.trim().removePrefix("v").removePrefix("V")
-    val installed = installedVersion.trim().removePrefix("v").removePrefix("V")
-    val releaseParts = release.splitToSequence(Regex("[^0-9]+"))
-        .filter(String::isNotBlank)
-        .mapNotNull(String::toIntOrNull)
-        .toList()
-    val installedParts = installed.splitToSequence(Regex("[^0-9]+"))
-        .filter(String::isNotBlank)
-        .mapNotNull(String::toIntOrNull)
-        .toList()
-    val maxSize = maxOf(releaseParts.size, installedParts.size)
-    for (index in 0 until maxSize) {
-        val left = releaseParts.getOrNull(index) ?: 0
-        val right = installedParts.getOrNull(index) ?: 0
-        if (left != right) return left > right
-    }
-    return false
+/** Parsed shape of the update.json version manifest. */
+internal data class UpdateManifest(
+    val versionCode: Int,
+    val versionName: String,
+    val apkUrl: String,
+    val sha256: String,
+    val sizeBytes: Long,
+    val notes: String,
+)
+
+/**
+ * The whole update decision: a monotonic versionCode compare. versionCode only ever increases
+ * (Android enforces it at install time too), so this can never mis-order releases the way the old
+ * versionName string parsing could.
+ */
+internal fun isVersionCodeNewer(manifestVersionCode: Int, installedVersionCode: Int): Boolean =
+    manifestVersionCode > installedVersionCode
+
+/**
+ * Strict manifest parse. Unknown keys are ignored (opt* accessors) so future fields are
+ * forward-compatible; the fields we depend on are hard-validated so a malformed manifest fails the
+ * check loudly instead of silently producing a bad update.
+ */
+internal fun parseManifest(json: JSONObject): UpdateManifest {
+    val versionCode = json.optInt("versionCode", -1)
+    require(versionCode > 0) { "Manifest missing valid versionCode" }
+    val apkUrl = json.optString("apkUrl")
+    require(apkUrl.startsWith("https://")) { "Manifest apkUrl must be https" }
+    val sha256 = json.optString("sha256").lowercase(Locale.US)
+    require(sha256.matches(Regex("[0-9a-f]{64}"))) { "Manifest sha256 invalid" }
+    return UpdateManifest(
+        versionCode = versionCode,
+        versionName = json.optString("versionName", versionCode.toString()),
+        apkUrl = apkUrl,
+        sha256 = sha256,
+        sizeBytes = json.optLong("sizeBytes", -1L),
+        notes = json.optString("notes"),
+    )
 }

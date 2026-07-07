@@ -56,19 +56,25 @@ android {
         applicationId = "com.homeattach.app"
         minSdk = 26
         targetSdk = 36
-        versionCode = 5
-        versionName = "1.0.3"
+        versionCode = 1
+        versionName = "1.0.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+        // The self-updater reads a static version manifest from a CDN direct-download URL, never the
+        // GitHub REST API (60/h anonymous rate limit + draft/prerelease 404s broke the channel).
+        // Default is derived from the owner/repo so zero-config builds still work; override with
+        // HOMEATTACH_UPDATE_MANIFEST_URL if the manifest is hosted elsewhere.
+        val updateOwner = localPropertyOrEnv("HOMEATTACH_UPDATE_OWNER", githubOwner)
+        val updateRepo = localPropertyOrEnv("HOMEATTACH_UPDATE_REPO", githubRepo)
+        val manifestDefault = if (updateOwner.isNotBlank() && updateRepo.isNotBlank()) {
+            "https://github.com/$updateOwner/$updateRepo/releases/latest/download/update.json"
+        } else {
+            ""
+        }
         buildConfigField(
             "String",
-            "UPDATE_REPOSITORY_OWNER",
-            buildConfigString(localPropertyOrEnv("HOMEATTACH_UPDATE_OWNER", githubOwner)),
-        )
-        buildConfigField(
-            "String",
-            "UPDATE_REPOSITORY_NAME",
-            buildConfigString(localPropertyOrEnv("HOMEATTACH_UPDATE_REPO", githubRepo)),
+            "UPDATE_MANIFEST_URL",
+            buildConfigString(localPropertyOrEnv("HOMEATTACH_UPDATE_MANIFEST_URL", manifestDefault)),
         )
     }
 
@@ -130,6 +136,9 @@ dependencies {
     implementation("androidx.compose.material:material-icons-extended")
 
     testImplementation(libs.junit)
+    // Android's bundled org.json is a stub on the JVM unit-test classpath; the real impl lets
+    // parseManifest be exercised in plain unit tests. Does not affect the app APK.
+    testImplementation("org.json:json:20240303")
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.espresso.core)
     androidTestImplementation(platform(libs.androidx.compose.bom))
