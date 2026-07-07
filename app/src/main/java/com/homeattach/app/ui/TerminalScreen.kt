@@ -77,6 +77,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalView
+import androidx.activity.compose.BackHandler
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
@@ -85,6 +86,7 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.repeatOnLifecycle
+import kotlinx.coroutines.Job
 import com.homeattach.app.R
 import com.homeattach.app.data.SettingsStore
 import com.homeattach.app.ssh.RemoteTerminalSize
@@ -144,6 +146,7 @@ fun TerminalScreen(
     onNavigateToSession: (name: String, label: String) -> Unit,
     sessionLabel: String = sessionName,
 ) {
+    val scope = rememberCoroutineScope()
     var status by remember { mutableStateOf<ConnStatus>(ConnStatus.Connecting) }
     var sessions by remember { mutableStateOf<List<RemoteSession>>(emptyList()) }
     var connectAttempt by remember(sessionName) { mutableIntStateOf(0) }
@@ -154,10 +157,15 @@ fun TerminalScreen(
     val backNavigationRequested = remember(sessionName) { AtomicBoolean(false) }
     val context = LocalContext.current
     val remoteTerminalSession = remember(sessionName, connectAttempt) {
+        var resizeJob: Job? = null
         RemoteTerminalSession(
             onInput = { bytes -> connectionReference.get()?.send(bytes) },
             onResize = { columns, rows ->
-                connectionReference.get()?.resizePty(columns, rows)
+                resizeJob?.cancel()
+                resizeJob = scope.launch {
+                    delay(300L)
+                    connectionReference.get()?.resizePty(columns, rows)
+                }
             },
         )
     }
@@ -342,7 +350,23 @@ fun TerminalScreen(
 
     val imeVisible = WindowInsets.isImeVisible
     val drawerState = rememberDrawerState(initialValue = DrawerValue.Closed)
-    val scope = rememberCoroutineScope()
+
+    BackHandler(enabled = (status is ConnStatus.Connected) || drawerState.isOpen) {
+        if (drawerState.isOpen) {
+            scope.launch { drawerState.close() }
+        } else {
+            closeConnectionAndNavigateBackOnce()
+        }
+    }
+
+    LaunchedEffect(lifecycleOwner, status, terminalView) {
+        lifecycleOwner.lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED) {
+            if (status is ConnStatus.Connected && terminalView != null) {
+                terminalView?.requestFocus()
+                terminalView?.showSoftKeyboard()
+            }
+        }
+    }
 
     LaunchedEffect(imeVisible, terminalView) {
         terminalView?.let { view ->
@@ -524,30 +548,15 @@ fun TerminalScreen(
                                                 }
                                             }
                                             terminalView = view
-                                            view.post {
-                                                view.requestFocus()
-                                                view.showSoftKeyboard()
-                                            }
                                         }
                                     },
-                                    update = { view -> terminalView = view },
+                                    update = {},
                                 )
-                                IconButton(
-                                    onClick = { scope.launch { drawerState.open() } },
-                                    modifier = Modifier
-                                        .align(Alignment.TopEnd)
-                                        .padding(8.dp)
-                                        .size(40.dp)
-                                        .background(Color.Black.copy(alpha = 0.45f), CircleShape),
-                                ) {
-                                    Icon(
-                                        Icons.Default.Menu,
-                                        contentDescription = "Open sessions drawer",
-                                        tint = Color.White.copy(alpha = 0.9f),
-                                    )
-                                }
                             }
-                            ExtraKeysRow(remoteTerminalSession = remoteTerminalSession)
+                            ExtraKeysRow(
+                                remoteTerminalSession = remoteTerminalSession,
+                                onMenuClick = { scope.launch { drawerState.open() } }
+                            )
                         }
                     }
                 }
@@ -761,6 +770,7 @@ private fun ConnectionProblem(
 @Composable
 private fun ExtraKeysRow(
     remoteTerminalSession: RemoteTerminalSession,
+    onMenuClick: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     Row(
@@ -772,6 +782,12 @@ private fun ExtraKeysRow(
         horizontalArrangement = Arrangement.spacedBy(5.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
+        KeyCap(
+            label = "☰",
+            modifier = Modifier.weight(0.72f),
+        ) {
+            onMenuClick()
+        }
         KeyCap(
             label = stringResource(R.string.terminal_key_esc),
             modifier = Modifier.weight(0.9f),
