@@ -2,12 +2,16 @@
 
 # SSH configuration + QR-code generator for HomeAttach.
 #
-# Default : ensure a dedicated HomeAttach keypair exists and is authorized,
-#           then print the connection config as a terminal QR code.
-# --rotate: revoke every previously authorized HomeAttach key, generate a
-#           fresh keypair, authorize it, and print the new QR. The old private
-#           key stops working the moment it leaves authorized_keys, so rescan
-#           the new code in the app afterwards.
+# Default   : ensure a dedicated HomeAttach keypair exists and is authorized,
+#             then print the connection config as a terminal QR code.
+# --rotate  : revoke every previously authorized HomeAttach key, generate a
+#             fresh keypair, authorize it, and print the new QR. The old private
+#             key stops working the moment it leaves authorized_keys, so rescan
+#             the new code in the app afterwards.
+# --host H  : embed hostname/domain H instead of auto-detecting a raw address.
+#             Use this with a dynamic-DNS domain so the QR never goes stale
+#             when the PC's IPv6 rotates — auto-detection picks a point-in-time
+#             address that breaks the moment the address it names changes.
 #
 # Keys are tagged with the comment "homeattach-android-app"; revocation matches
 # on that tag, so it cleans up prior keys even if the key file was replaced.
@@ -20,7 +24,14 @@ AUTHORIZED="$HOME/.ssh/authorized_keys"
 USER_NAME=$(whoami)
 
 ROTATE=0
-[ "${1:-}" = "--rotate" ] && ROTATE=1
+HOST_OVERRIDE=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --rotate) ROTATE=1; shift ;;
+        --host) HOST_OVERRIDE="${2:?--host requires a value}"; shift 2 ;;
+        *) echo "Unknown argument: $1" >&2; exit 1 ;;
+    esac
+done
 
 mkdir -p "$HOME/.ssh"
 chmod 700 "$HOME/.ssh"
@@ -71,11 +82,32 @@ else
     fi
 fi
 
-# Detect a stable global address: prefer non-temporary IPv6, fall back to IPv4.
-IP=$(ip -6 addr show scope global 2>/dev/null | grep -v temporary | awk '/inet6/{print $2}' | cut -d/ -f1 | head -n1)
-[ -n "$IP" ] || IP=$(ip -4 addr show scope global 2>/dev/null | awk '/inet /{print $2}' | cut -d/ -f1 | head -n1)
+if [ -n "$HOST_OVERRIDE" ]; then
+    IP="$HOST_OVERRIDE"
+else
+    # Detect a stable global IPv6: prefer the address whose preferred_lft
+    # equals its valid_lft. A SLAAC privacy-extension (temporary) address
+    # always reports a shorter preferred_lft than valid_lft — the kernel
+    # does not reliably tag it with the literal word "temporary" in `ip addr`
+    # output, so lifetimes are the only dependable signal. Falls back to IPv4.
+    IP=$(ip -o -6 addr show scope global 2>/dev/null | awk '
+        {
+            addr = ""; valid = ""; pref = ""
+            for (i = 1; i <= NF; i++) {
+                if ($i == "inet6") { addr = $(i + 1); sub(/\/.*/, "", addr) }
+                if ($i == "valid_lft") { v = $(i + 1); sub(/sec$/, "", v); valid = v }
+                if ($i == "preferred_lft") { p = $(i + 1); sub(/sec$/, "", p); pref = p }
+            }
+            if (addr == "") next
+            if (valid == pref && stable == "") stable = addr
+            if (fallback == "") fallback = addr
+        }
+        END { print (stable != "") ? stable : fallback }
+    ')
+    [ -n "$IP" ] || IP=$(ip -4 addr show scope global 2>/dev/null | awk '/inet /{print $2}' | cut -d/ -f1 | head -n1)
+fi
 if [ -z "$IP" ]; then
-    echo "Error: could not detect a global-scope network address." >&2
+    echo "Error: could not detect a global-scope network address (use --host to set one explicitly)." >&2
     exit 1
 fi
 

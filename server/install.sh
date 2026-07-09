@@ -56,12 +56,66 @@ for script in tsess tsess-attach tsess-auto tsess-focus tsess-kill tsess-list \
     install -m 755 "$script_dir/$script" "$bin_dir/$script"
 done
 
-# Konsole/yakuake profile: every tab started with it becomes a session.
+# Konsole/yakuake profile: every tab started with it becomes a session. The
+# profile only overrides the launch command; its font and colors are inherited
+# from the terminal's current default profile, so switching yakuake to it
+# changes nothing visible. Konsole's bare FALLBACK/ is avoided on purpose - it
+# resets font size and palette (small font, wrong ANSI colors).
 konsole_dir="$HOME/.local/share/konsole"
-if [ -d "$konsole_dir" ] && [ ! -e "$konsole_dir/HomeAttach.profile" ]; then
-    sed "s|@HOMEATTACH_BIN_DIR@|$bin_dir|g" "$script_dir/HomeAttach.profile" \
-        > "$konsole_dir/HomeAttach.profile"
-    echo "installed Konsole profile: HomeAttach (select it as yakuake's default profile)"
+
+konsole_profile_path() {
+    case "$1" in
+        /*) [ -f "$1" ] && printf '%s' "$1"; return ;;
+    esac
+    local dir
+    for dir in "$konsole_dir" /usr/share/konsole; do
+        [ -f "$dir/$1" ] && { printf '%s' "$dir/$1"; return; }
+    done
+}
+
+# Walk a profile's Parent chain, printing the first Font and ColorScheme found
+# as "font<TAB>scheme". Unset values stay empty for the caller to default.
+konsole_appearance() {
+    local ref="$1" depth=0 font="" scheme="" path parent
+    while [ -n "$ref" ] && [ "$depth" -lt 8 ]; do
+        path=$(konsole_profile_path "$ref")
+        [ -n "$path" ] || break
+        [ -n "$font" ]   || font=$(sed -n 's/^Font=//p' "$path" | head -1)
+        [ -n "$scheme" ] || scheme=$(sed -n 's/^ColorScheme=//p' "$path" | head -1)
+        parent=$(sed -n 's/^Parent=//p' "$path" | head -1)
+        case "$parent" in ""|FALLBACK/) break ;; esac
+        ref="$parent"; depth=$((depth + 1))
+    done
+    printf '%s\t%s\n' "$font" "$scheme"
+}
+
+write_homeattach_profile() {
+    local src font scheme
+    src=$(sed -n 's/^DefaultProfile=//p' "$HOME/.config/yakuakerc" 2>/dev/null | head -1)
+    [ -n "$src" ] || src=$(sed -n 's/^DefaultProfile=//p' "$HOME/.config/konsolerc" 2>/dev/null | head -1)
+    case "$src" in ""|HomeAttach.profile) src=Breath.profile ;; esac
+    IFS=$'\t' read -r font scheme < <(konsole_appearance "$src")
+    [ -n "$font" ]   || font="Monospace,11"
+    [ -n "$scheme" ] || scheme=Breath
+    cat > "$konsole_dir/HomeAttach.profile" <<EOF
+[Appearance]
+ColorScheme=$scheme
+Font=$font
+
+[General]
+Command=$bin_dir/tsess-auto
+Name=HomeAttach
+EOF
+}
+
+# Create when missing; also self-heal an earlier FALLBACK/-based profile that
+# reset the terminal's font and colors.
+if [ -d "$konsole_dir" ]; then
+    profile="$konsole_dir/HomeAttach.profile"
+    if [ ! -e "$profile" ] || grep -q '^Parent=FALLBACK/$' "$profile"; then
+        write_homeattach_profile
+        echo "installed Konsole profile: HomeAttach (select it as yakuake's default profile)"
+    fi
 fi
 
 echo "installed to $bin_dir:"
