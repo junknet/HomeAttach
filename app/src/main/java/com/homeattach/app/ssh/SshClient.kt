@@ -44,6 +44,12 @@ class SshConnectException(message: String, cause: Throwable? = null) : Exception
 
 private const val CONNECT_TIMEOUT_MS = 8000
 
+// 15s probe x 2 misses = a dead transport is detected within ~30s of the radio coming back,
+// bounded by one keepalive round-trip. Short enough to feel responsive on resume, long enough
+// not to kill a session over one slow cellular RTT.
+private const val SERVER_ALIVE_INTERVAL_MS = 15_000
+private const val SERVER_ALIVE_COUNT_MAX = 2
+
 // Non-interactive/non-login exec sessions don't source shell startup files, so PATH is not
 // reliable. $HOME is still provided by sshd, making this portable across host usernames.
 private const val SESSION_LIST_COMMAND = "\$HOME/.local/bin/tsess-list"
@@ -96,6 +102,13 @@ fun openSshSession(config: HostConfig): Session {
         props["StrictHostKeyChecking"] = "no"
         session.setConfig(props)
         session.timeout = CONNECT_TIMEOUT_MS
+        // Half-dead TCP is the norm on mobile: Doze/network handoff kills the path without a
+        // FIN/RST ever reaching us, and a blocked channel read then hangs forever (frozen
+        // terminal, keystrokes silently void). Keepalives make JSch itself probe the transport;
+        // after interval*countMax of silence the session dies, channels EOF, and the reader
+        // thread surfaces ConnectionLost instead of freezing.
+        session.serverAliveInterval = SERVER_ALIVE_INTERVAL_MS
+        session.serverAliveCountMax = SERVER_ALIVE_COUNT_MAX
         session.connect(CONNECT_TIMEOUT_MS)
         return session
     } catch (e: JSchException) {
