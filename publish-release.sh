@@ -149,7 +149,17 @@ echo "$SERVED" | grep -qE "\"versionCode\"[[:space:]]*:[[:space:]]*$VERSION_CODE
     echo "$SERVED" >&2
     exit 1
 }
-APK_CODE=$(curl -fsSL -r 0-0 -o /dev/null -w '%{http_code}' "$APK_URL" 2>/dev/null || echo 000)
+# Retry like the manifest check above: the release-asset redirect endpoint takes a few seconds
+# to become signable after `gh release create`, so a single immediate probe can catch the CDN
+# hop before it is live and report the bare 302 instead of the followed 200/206.
+APK_CODE=000
+for _ in 1 2 3 4 5; do
+    APK_CODE=$(curl -fsSL -r 0-0 -o /dev/null -w '%{http_code}' "$APK_URL" 2>/dev/null || echo 000)
+    case "$APK_CODE" in
+        200|206) break ;;
+    esac
+    sleep 3
+done
 case "$APK_CODE" in
     200|206) : ;;
     *) echo "Self-check FAILED: apkUrl unreachable (HTTP $APK_CODE): $APK_URL" >&2; exit 1 ;;
