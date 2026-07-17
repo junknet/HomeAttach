@@ -6,10 +6,9 @@ import com.jcraft.jsch.Session
 import java.io.InputStream
 import java.io.OutputStream
 import java.util.concurrent.Executors
-import kotlin.concurrent.thread
 
 /**
- * A live interactive shell attached to the same sharepty session as the desktop client. Reads from
+ * A live interactive shell attached to the same zmx session as the desktop client. Reads from
  * [InputStream] are the terminal's stdout/stderr (already merged into one PTY stream by the
  * remote tty layer).
  *
@@ -21,7 +20,6 @@ import kotlin.concurrent.thread
  * single-thread executor here rather than letting callers touch [output] directly.
  */
 class TerminalConnection private constructor(
-    private val config: HostConfig,
     private val attachRequest: TerminalAttachRequest,
     private val session: Session,
     private val channel: ChannelExec,
@@ -73,6 +71,15 @@ class TerminalConnection private constructor(
         resizePty(cols = cols, rows = rows)
     }
 
+    /**
+     * Drops this terminal's channel. The SSH connection underneath is [SharedSshSession]'s and is
+     * left alone: the session list feeds through it too, and re-entering a terminal on a live
+     * connection is a channel open rather than a handshake.
+     *
+     * Focus is deliberately NOT released here either: the reconnect loop closes a dropped
+     * connection on every retry, and releasing focus per retry would hand back size ownership we
+     * are about to re-claim. Both belong to whoever ends the attachment for good.
+     */
     fun close() {
         if (closed) return
         closed = true
@@ -80,31 +87,14 @@ class TerminalConnection private constructor(
             channel.disconnect()
         } catch (_: Exception) {
         }
-        try {
-            session.disconnect()
-        } catch (_: Exception) {
-        }
-        releaseFocusInBackground()
         ioExecutor.shutdownNow()
     }
 
-    private fun releaseFocusInBackground() {
-        thread(name = "ssh-terminal-release-focus", isDaemon = true) {
-            runCatching {
-                releaseRemoteSessionFocus(
-                    config = config,
-                    sessionName = attachRequest.sessionName,
-                    ownerIdentifier = attachRequest.ownerIdentifier,
-                )
-            }
-        }
-    }
-
     companion object {
-        /** Marks Android as focused, then opens a new SSH connection attached to the session. */
+        /** Marks Android as focused, then opens a terminal channel on the shared connection. */
         @Throws(SshAuthException::class, SshConnectException::class)
         fun attach(config: HostConfig, request: TerminalAttachRequest): TerminalConnection {
-            val session = openSshSession(config)
+            val session = SharedSshSession.acquire(config)
             var focusGranted = false
             try {
                 focusRemoteSession(session, request)
@@ -122,7 +112,7 @@ class TerminalConnection private constructor(
                 val input = channel.inputStream
                 val output = channel.outputStream
                 channel.connect(8000)
-                return TerminalConnection(config, request, session, channel, input, output)
+                return TerminalConnection(request, session, channel, input, output)
             } catch (e: Exception) {
                 if (focusGranted) {
                     runCatching {
@@ -133,7 +123,10 @@ class TerminalConnection private constructor(
                         )
                     }
                 }
-                session.disconnect()
+                // The shared connection survives: failing to attach usually means the session is
+                // gone, not the transport. If the transport IS what died, drop it so the next
+                // acquire reconnects immediately instead of waiting out the keepalive.
+                if (!session.isConnected) SharedSshSession.invalidate(session)
                 throw e
             }
         }

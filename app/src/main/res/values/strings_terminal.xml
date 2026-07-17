@@ -15,6 +15,14 @@
     <string name="terminal_toggle_keyboard">Toggle keyboard</string>
     <string name="terminal_unknown_error">Unknown error</string>
 
+    <!-- Attached-terminal foreground service -->
+    <string name="terminal_notification_channel_name">Attached terminal</string>
+    <string name="terminal_notification_detach">Detach</string>
+    <string name="terminal_notification_reconnecting_attempt">Reconnecting (attempt %1$d)…</string>
+    <string name="terminal_reconnecting_banner">Reconnecting (attempt %1$d)… %2$s</string>
+    <string name="terminal_auth_failed_title">Authentication failed</string>
+    <string name="terminal_open_settings">Settings</string>
+
     <!-- Terminal keycap labels: standard key names, identical across locales. -->
     <string name="terminal_key_ctrl" translatable="false">Ctrl</string>
     <string name="terminal_key_alt" translatable="false">Alt</string>

@@ -34,4 +34,6 @@
 
     <!-- Navigation drawer -->
     <string name="sessions_drawer_title">Terminal sessions</string>
+    <string name="sessions_new">New session</string>
+    <string name="sessions_new_failed">Could not start a session: %1$s</string>
 </resources>

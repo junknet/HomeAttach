@@ -23,9 +23,9 @@ data class TerminalAttachRequest(
 
 /**
  * One live terminal session as reported by `tsess-list` on the host. The list format is TSV:
- * `name\tcmd\tcwd\towner\tcols\trows\tstatus`. Older builds of the host script emit only the
- * first three columns, so everything past [cwd] is optional and defaults to "unknown"
- * ([owner]/[status] empty, sizes null) rather than failing the parse.
+ * `name\tcmd\tcwd\towner\tcols\trows\tstatus\tborn`. Older builds of the host script emit fewer
+ * columns, so everything past [cwd] is optional and defaults to "unknown" ([owner]/[status] empty,
+ * sizes null, [bornEpochSeconds] 0) rather than failing the parse.
  */
 data class RemoteSession(
     val name: String,
@@ -37,12 +37,18 @@ data class RemoteSession(
     val rows: Int? = null,
     /** "focused" when a viewer is actively attached, "detached" otherwise. */
     val status: String = "",
+    /**
+     * Unix seconds when the session's daemon came up. The only orderable fact the host reports:
+     * [name] is a content-free hash, so ordering by it is ordering by nothing. 0 when the host
+     * script predates this column.
+     */
+    val bornEpochSeconds: Long = 0,
 )
 
 class SshAuthException(message: String, cause: Throwable? = null) : Exception(message, cause)
 class SshConnectException(message: String, cause: Throwable? = null) : Exception(message, cause)
 
-private const val CONNECT_TIMEOUT_MS = 8000
+internal const val CONNECT_TIMEOUT_MS = 8000
 
 // 15s probe x 2 misses = a dead transport is detected within ~30s of the radio coming back,
 // bounded by one keepalive round-trip. Short enough to feel responsive on resume, long enough
@@ -56,7 +62,8 @@ private const val SESSION_LIST_COMMAND = "\$HOME/.local/bin/tsess-list"
 private const val SESSION_KILL_COMMAND = "\$HOME/.local/bin/tsess-kill"
 private const val SESSION_FOCUS_COMMAND = "\$HOME/.local/bin/tsess-focus"
 private const val SESSION_RELEASE_COMMAND = "\$HOME/.local/bin/tsess-release"
-private const val SESSION_WATCH_COMMAND = "\$HOME/.local/bin/tsess-watch"
+internal const val SESSION_WATCH_COMMAND = "\$HOME/.local/bin/tsess-watch"
+private const val SESSION_NEW_COMMAND = "\$HOME/.local/bin/tsess-new"
 
 @Volatile
 private var ed25519ConfigApplied = false
@@ -181,7 +188,7 @@ fun fetchRemoteSessions(session: Session): List<RemoteSession> {
         .toList()
 }
 
-private fun parseSessionLine(line: String): RemoteSession? {
+internal fun parseSessionLine(line: String): RemoteSession? {
     val parts = line.split("\t")
     if (parts.size < 3) return null
     return RemoteSession(
@@ -192,58 +199,37 @@ private fun parseSessionLine(line: String): RemoteSession? {
         cols = parts.getOrNull(4)?.toIntOrNull(),
         rows = parts.getOrNull(5)?.toIntOrNull(),
         status = parts.getOrElse(6) { "" },
+        bornEpochSeconds = parts.getOrNull(7)?.toLongOrNull() ?: 0,
     )
 }
 
-/**
- * Runs `tsess-watch` over a long-lived exec channel and invokes [onUpdate] with the full
- * session list every time the host emits one: immediately on start, the instant a session is
- * born or dies (inotify on the host), and every ~5s as a heartbeat. Blocks until the channel
- * closes (returns normally on clean EOF) or throws on transport errors. Caller owns the
- * [session]'s lifecycle and should call this from a background dispatcher.
- */
-@Throws(SshConnectException::class)
-fun watchRemoteSessions(session: Session, onUpdate: (List<RemoteSession>) -> Unit) {
-    val channel = session.openChannel("exec") as ChannelExec
-    channel.setCommand(SESSION_WATCH_COMMAND)
-    val input = channel.inputStream
-    channel.connect(CONNECT_TIMEOUT_MS)
-    try {
-        val reader = input.bufferedReader(StandardCharsets.UTF_8)
-        var block: MutableList<RemoteSession>? = null
-        var sawAnyBlock = false
-        while (true) {
-            val line = reader.readLine() ?: break
-            when {
-                line == "#BEGIN" -> block = mutableListOf()
-                line == "#END" -> {
-                    block?.let {
-                        sawAnyBlock = true
-                        onUpdate(it)
-                    }
-                    block = null
-                }
-                else -> block?.let { b -> parseSessionLine(line)?.let(b::add) }
-            }
-        }
-        // An immediate EOF without a single block means the watch script is missing or
-        // failed on the host - surface that so the caller can fall back to polling.
-        if (!sawAnyBlock) {
-            throw SshConnectException("tsess-watch produced no output (exit=${channel.exitStatus})")
-        }
-    } finally {
-        runCatching { channel.disconnect() }
-    }
-}
-
-/** Opens a fresh, one-shot SSH connection, runs `tsess-list`, then disconnects. */
+/** Runs `tsess-list` on the process's shared connection. */
 @Throws(SshAuthException::class, SshConnectException::class)
-fun fetchRemoteSessions(config: HostConfig): List<RemoteSession> {
-    val session = openSshSession(config)
-    try {
-        return fetchRemoteSessions(session)
-    } finally {
-        session.disconnect()
+fun fetchRemoteSessions(config: HostConfig): List<RemoteSession> =
+    fetchRemoteSessions(SharedSshSession.acquire(config))
+
+/**
+ * Opens a real terminal tab on the PC and returns the session it became.
+ *
+ * The phone never creates a session itself, deliberately: a session's lifetime is bound to the
+ * view that owns it (`zmx attach --bind`), and an SSH channel is not a view — one dropped
+ * connection would take the session with it. Asking the PC to open a tab keeps the session owned
+ * by something the user can see and close, and makes the sync bidirectional: it appears on the
+ * desktop, not only in this list.
+ *
+ * Slow by nature (yakuake has to spawn the tab and its profile has to bring the session up), so
+ * call it off the main thread.
+ */
+@Throws(SshAuthException::class, SshConnectException::class)
+fun createRemoteSession(config: HostConfig): String {
+    val result = execRemote(SharedSshSession.acquire(config), SESSION_NEW_COMMAND)
+    if (result.exitStatus != 0) {
+        throw SshConnectException(
+            result.stderr.trim().ifBlank { "tsess-new exited with ${result.exitStatus}" },
+        )
+    }
+    return result.stdout.trim().ifBlank {
+        throw SshConnectException("tsess-new reported no session name")
     }
 }
 
@@ -265,20 +251,10 @@ fun killRemoteSession(session: Session, name: String) {
     }
 }
 
-/**
- * Opens a fresh, one-shot SSH connection, runs `tsess-kill <name>`, then disconnects. Mirrors
- * the [fetchRemoteSessions] config overload for callers that don't hold a live [Session];
- * self-contained and safe to call from any background thread/dispatcher.
- */
+/** Runs `tsess-kill <name>` on the process's shared connection. */
 @Throws(SshAuthException::class, SshConnectException::class)
-fun killRemoteSession(config: HostConfig, name: String) {
-    val session = openSshSession(config)
-    try {
-        killRemoteSession(session, name)
-    } finally {
-        session.disconnect()
-    }
-}
+fun killRemoteSession(config: HostConfig, name: String) =
+    killRemoteSession(SharedSshSession.acquire(config), name)
 
 @Throws(SshConnectException::class)
 fun focusRemoteSession(session: Session, request: TerminalAttachRequest) {
@@ -296,15 +272,10 @@ fun focusRemoteSession(session: Session, request: TerminalAttachRequest) {
     execRemoteOrThrow(session, command, "tsess-focus")
 }
 
+/** Runs `tsess-release` on the process's shared connection. */
 @Throws(SshAuthException::class, SshConnectException::class)
-fun releaseRemoteSessionFocus(config: HostConfig, sessionName: String, ownerIdentifier: String) {
-    val session = openSshSession(config)
-    try {
-        releaseRemoteSessionFocus(session, sessionName, ownerIdentifier)
-    } finally {
-        session.disconnect()
-    }
-}
+fun releaseRemoteSessionFocus(config: HostConfig, sessionName: String, ownerIdentifier: String) =
+    releaseRemoteSessionFocus(SharedSshSession.acquire(config), sessionName, ownerIdentifier)
 
 @Throws(SshConnectException::class)
 fun releaseRemoteSessionFocus(session: Session, sessionName: String, ownerIdentifier: String) {

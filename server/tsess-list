@@ -3,8 +3,14 @@
 # minimal PATH that lacks even coreutils. Absolute-shebang + this keep us safe.
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/bin:/bin${PATH:+:$PATH}"
 # Machine-readable session list for the Android app: one TSV line per
-# session — name\tcmd\tcwd\towner\tcols\trows\tstatus. No prompts, no
+# session — name\tcmd\tcwd\towner\tcols\trows\tstatus\tborn. No prompts, no
 # interaction.
+#
+# `born` is the session socket's mtime (unix seconds), i.e. when the daemon
+# came up. It exists so the app can order the list by something a human can
+# predict: session names are content-free hashes, so sorting by name is
+# sorting by nothing. True last-activity would be better still, but zmx does
+# not track it and inferring it here would mean polling every pty.
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 # shellcheck source=server/tsess-state
@@ -49,6 +55,8 @@ while IFS= read -r name; do
         owner=none
         status=detached
     fi
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-        "$name" "$cmd" "$cwd" "$owner" "${cols:-?}" "${rows:-?}" "$status"
+    born=$(stat -c %Y "$(session_socket "$name")" 2>/dev/null || echo 0)
+
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$name" "$cmd" "$cwd" "$owner" "${cols:-?}" "${rows:-?}" "$status" "$born"
 done < <(list_session_names)

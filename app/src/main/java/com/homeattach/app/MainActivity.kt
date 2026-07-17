@@ -1,10 +1,15 @@
 package com.homeattach.app
 
+import android.Manifest
+import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.content.ContextCompat
 import androidx.compose.animation.EnterTransition
 import androidx.compose.animation.ExitTransition
 import androidx.compose.foundation.layout.fillMaxSize
@@ -28,6 +33,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         enableEdgeToEdge()
         super.onCreate(savedInstanceState)
+        requestNotificationPermissionIfNeeded()
         setContent {
             HomeAttachTheme {
                 // Dark root so any one-frame relayout gap (keyboard resize, terminal reflow) shows
@@ -38,6 +44,27 @@ class MainActivity : ComponentActivity() {
             }
         }
     }
+
+    /**
+     * Asked once, at launch, rather than when a terminal opens: the attached-terminal service
+     * runs regardless, but its notification is the only handle the user has on it — the live
+     * status and the Detach action. Requesting it mid-entry would also pop a system dialog over
+     * the terminal exactly when it is measuring its grid.
+     */
+    private fun requestNotificationPermissionIfNeeded() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) ==
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            return
+        }
+        notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+    }
+
+    // Nothing to do with the answer: a denied notification permission costs the notification, not
+    // the terminal, and re-asking on every launch would be nagging.
+    private val notificationPermission =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
 }
 
 private const val ROUTE_SETTINGS = "settings"

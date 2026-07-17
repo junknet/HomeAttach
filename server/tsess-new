@@ -1,0 +1,65 @@
+#!/bin/bash
+# Ensure a sane PATH: non-interactive SSH exec (e.g. JSch) may hand us a
+# minimal PATH that lacks even coreutils. Absolute-shebang + this keep us safe.
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/bin:/bin${PATH:+:$PATH}"
+# Create a session from the phone: ask yakuake for a real tab, report the
+# session it becomes. Prints the new session name on stdout.
+#
+# The app stays a remote control and never becomes a session owner. Sessions are
+# still born on the PC, in a real tab, view-bound to it (the profile's tsess-auto
+# runs `zmx attach --bind`) exactly as if the user had opened the tab by hand — so
+# closing the tab still ends the session, and the app never owns a lifetime it
+# cannot see. It is also what makes the sync bidirectional: a session started from
+# the phone appears as a tab on the PC, not only in the app's list.
+#
+# This deliberately relies on yakuake's default profile running tsess-auto (see
+# install.sh) rather than pushing a command into the new tab: the profile is
+# already the single definition of "a tab is a session", and a second way to say
+# it would be a second thing to keep in sync.
+set -euo pipefail
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+# shellcheck source=server/tsess-state
+. "$script_dir/tsess-state"
+
+# An sshd exec channel is not a login session. pam_systemd usually still exports
+# DBUS_SESSION_BUS_ADDRESS, but fall back to the well-known user bus rather than
+# depend on it.
+export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/bus}"
+
+qdbus_bin=""
+for candidate in qdbus qdbus6 qdbus-qt6; do
+    if command -v "$candidate" >/dev/null 2>&1; then
+        qdbus_bin=$candidate
+        break
+    fi
+done
+[ -n "$qdbus_bin" ] || {
+    homeattach_fail "no qdbus binary on PATH (install qt tools)"
+    exit 1
+}
+
+"$qdbus_bin" org.kde.yakuake /yakuake/sessions org.kde.yakuake.sessionIdList >/dev/null 2>&1 || {
+    homeattach_fail "yakuake is not reachable on the session bus"
+    exit 1
+}
+
+before=$(list_session_names | sort)
+
+"$qdbus_bin" org.kde.yakuake /yakuake/sessions org.kde.yakuake.addSession >/dev/null
+
+# Wait for the session the tab became. Yakuake's own tab id is not our session
+# name and cannot be mapped to one, so diff the session list instead: whatever
+# name appeared is the tab we just asked for.
+deadline=$(($(date +%s) + NEW_SESSION_TIMEOUT_S))
+while [ "$(date +%s)" -lt "$deadline" ]; do
+    born=$(comm -13 <(printf '%s\n' "$before" | grep -v '^$') <(list_session_names | sort) || true)
+    if [ -n "$born" ]; then
+        printf '%s\n' "$born" | head -1
+        exit 0
+    fi
+    sleep 0.1
+done
+
+homeattach_fail "opened a tab but no session appeared within ${NEW_SESSION_TIMEOUT_S}s; is yakuake's default profile set to tsess-auto?"
+exit 1

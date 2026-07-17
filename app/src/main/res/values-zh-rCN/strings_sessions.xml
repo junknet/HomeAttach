@@ -33,4 +33,6 @@
 
     <!-- 导航抽屉 -->
     <string name="sessions_drawer_title">切换会话</string>
+    <string name="sessions_new">新建会话</string>
+    <string name="sessions_new_failed">新建会话失败:%1$s</string>
 </resources>

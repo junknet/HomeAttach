@@ -14,4 +14,12 @@
     <string name="terminal_status_disconnected">已断开</string>
     <string name="terminal_toggle_keyboard">显示/隐藏键盘</string>
     <string name="terminal_unknown_error">未知错误</string>
+
+    <!-- 终端保活前台服务 -->
+    <string name="terminal_notification_channel_name">已连接的终端</string>
+    <string name="terminal_notification_detach">断开</string>
+    <string name="terminal_notification_reconnecting_attempt">重连中（第 %1$d 次）…</string>
+    <string name="terminal_reconnecting_banner">重连中（第 %1$d 次）… %2$s</string>
+    <string name="terminal_auth_failed_title">认证失败</string>
+    <string name="terminal_open_settings">设置</string>
 </resources>

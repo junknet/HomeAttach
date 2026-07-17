@@ -3,6 +3,12 @@
 
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+    <!-- Holds the process while a terminal is attached, so leaving the app does not drop the SSH
+         channel. See TerminalService for why the type is specialUse and not dataSync. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <!-- Only gates whether the ongoing notification is visible; the service runs either way. -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <application
         android:allowBackup="true"
@@ -23,6 +29,15 @@
                 android:name="android.support.FILE_PROVIDER_PATHS"
                 android:resource="@xml/update_file_paths" />
         </provider>
+
+        <service
+            android:name=".terminal.TerminalService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Holds one user-initiated interactive SSH terminal session open while the user is in another app, so switching away does not drop the connection or lose the terminal's scrollback. The session is started and ended explicitly by the user; no other foreground service type describes an interactive remote shell." />
+        </service>
 
         <activity
             android:name=".MainActivity"

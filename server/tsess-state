@@ -21,6 +21,9 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/bin:/bin${PATH:+:$PATH}"
 
 HOMEATTACH_SESSION_NAME_RE='^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$'
 
+# How long tsess-new waits for a freshly opened tab to become a session.
+NEW_SESSION_TIMEOUT_S=10
+
 homeattach_fail() {
     printf '%s: %s\n' "${0##*/}" "$*" >&2
     return 1
