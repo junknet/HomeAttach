@@ -107,7 +107,11 @@ android {
 
     buildTypes {
         release {
-            isMinifyEnabled = false
+            // R8 full mode: prunes the app's dead code, unused Compose/androidx, and the parts of
+            // BouncyCastle we never call. proguard-rules.pro keeps the reflection-resolved crypto
+            // that R8 cannot see (JSch/BC ed25519), verified by a real ed25519 connect on device.
+            isMinifyEnabled = true
+            isShrinkResources = true
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
