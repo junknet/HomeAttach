@@ -52,7 +52,7 @@ fi
 mkdir -p "$bin_dir"
 install -m 755 "$zmx_out" "$bin_dir/zmx"
 for script in tsess tsess-attach tsess-auto tsess-focus tsess-kill tsess-list \
-    tsess-release tsess-state tsess-watch; do
+    tsess-new tsess-release tsess-state tsess-watch; do
     install -m 755 "$script_dir/$script" "$bin_dir/$script"
 done
 

@@ -1,5 +1,8 @@
 package com.homeattach.app.terminal
 
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
@@ -14,6 +17,7 @@ import com.termux.terminal.TerminalSessionClient
  * which is UTF-8 native and renders 24-bit truecolor and modern TUIs correctly.
  */
 class RemoteTerminalSession(
+    private val context: Context,
     private val onInput: (ByteArray) -> Unit,
     private val onResize: (columns: Int, rows: Int) -> Unit,
 ) {
@@ -36,8 +40,12 @@ class RemoteTerminalSession(
         override fun onTextChanged(changedSession: TerminalSession) = onScreenUpdated()
         override fun onTitleChanged(changedSession: TerminalSession) {}
         override fun onSessionFinished(finishedSession: TerminalSession) {}
-        override fun onCopyTextToClipboard(session: TerminalSession, text: String?) {}
-        override fun onPasteTextFromClipboard(session: TerminalSession?) {}
+        override fun onCopyTextToClipboard(session: TerminalSession, text: String?) {
+            copyTextToClipboard(text)
+        }
+        override fun onPasteTextFromClipboard(session: TerminalSession?) {
+            pasteTextFromClipboard()
+        }
         override fun onBell(session: TerminalSession) {}
         override fun onColorsChanged(session: TerminalSession) {}
         override fun onTerminalCursorStateChange(state: Boolean) {}
@@ -122,6 +130,38 @@ class RemoteTerminalSession(
 
     fun finish() {
         runCatching { session.finishIfRunning() }
+    }
+
+    fun copyTextToClipboard(text: String?) {
+        if (text.isNullOrEmpty()) return
+        try {
+            val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+            val clip = ClipData.newPlainText("terminal", text)
+            clipboard?.setPrimaryClip(clip)
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to copy text to clipboard", e)
+        }
+    }
+
+    fun pasteTextFromClipboard() {
+        try {
+            val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+            val clipData = clipboard?.primaryClip
+            if (clipData != null && clipData.itemCount > 0) {
+                val text = clipData.getItemAt(0).coerceToText(context)?.toString()
+                if (!text.isNullOrEmpty()) {
+                    val emulator = session.emulator
+                    if (emulator != null) {
+                        emulator.paste(text)
+                    } else {
+                        val bytes = text.toByteArray(Charsets.UTF_8)
+                        session.write(bytes, 0, bytes.size)
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to paste text from clipboard", e)
+        }
     }
 
     private companion object {

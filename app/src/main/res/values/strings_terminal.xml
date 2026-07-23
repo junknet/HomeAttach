@@ -32,4 +32,5 @@
     <string name="terminal_key_end" translatable="false">End</string>
     <string name="terminal_key_page_up" translatable="false">PgUp</string>
     <string name="terminal_key_page_down" translatable="false">PgDn</string>
+    <string name="terminal_key_paste" translatable="false">Paste</string>
 </resources>

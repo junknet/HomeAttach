@@ -42,7 +42,7 @@ object AttachedTerminal {
             if (live.sessionName == sessionName) return live
             live.release()
         }
-        val attachment = TerminalAttachment(sessionName, sessionLabel, config, androidOwnerIdentifier())
+        val attachment = TerminalAttachment(sessionName, sessionLabel, config, androidOwnerIdentifier(), context.applicationContext)
         _current.value = attachment
         TerminalService.start(context.applicationContext)
         return attachment

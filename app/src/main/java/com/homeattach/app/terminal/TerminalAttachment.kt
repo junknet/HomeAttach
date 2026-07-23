@@ -1,5 +1,6 @@
 package com.homeattach.app.terminal
 
+import android.content.Context
 import android.util.Log
 import com.homeattach.app.BuildConfig
 import com.homeattach.app.data.HostConfig
@@ -56,6 +57,7 @@ class TerminalAttachment(
     val sessionLabel: String,
     private val config: HostConfig,
     private val ownerIdentifier: String,
+    context: Context,
 ) {
     private val _status = MutableStateFlow<AttachStatus>(AttachStatus.Connecting)
     val status: StateFlow<AttachStatus> = _status.asStateFlow()
@@ -97,6 +99,7 @@ class TerminalAttachment(
     private val retryGate = Object()
 
     val terminal = RemoteTerminalSession(
+        context = context.applicationContext,
         onInput = { bytes -> connection.get()?.send(bytes) },
         onResize = { columns, rows ->
             val size = RemoteTerminalSize(columns, rows)

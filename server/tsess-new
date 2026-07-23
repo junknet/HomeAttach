@@ -27,39 +27,70 @@ script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 # depend on it.
 export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/bus}"
 
-qdbus_bin=""
-for candidate in qdbus qdbus6 qdbus-qt6; do
-    if command -v "$candidate" >/dev/null 2>&1; then
-        qdbus_bin=$candidate
-        break
-    fi
-done
-[ -n "$qdbus_bin" ] || {
-    homeattach_fail "no qdbus binary on PATH (install qt tools)"
-    exit 1
+# Try creating a session tab via Yakuake DBus if available
+create_via_yakuake() {
+    local qdbus_bin="" candidate
+    for candidate in qdbus qdbus6 qdbus-qt6; do
+        if command -v "$candidate" >/dev/null 2>&1; then
+            qdbus_bin=$candidate
+            break
+        fi
+    done
+    [ -n "$qdbus_bin" ] || return 1
+
+    "$qdbus_bin" org.kde.yakuake /yakuake/sessions org.kde.yakuake.sessionIdList >/dev/null 2>&1 || return 1
+
+    local before
+    before=$(list_session_names | sort)
+
+    "$qdbus_bin" org.kde.yakuake /yakuake/sessions org.kde.yakuake.addSession >/dev/null 2>&1 || return 1
+
+    local deadline born
+    deadline=$(($(date +%s) + 5))
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        born=$(comm -13 <(printf '%s\n' "$before" | grep -v '^$') <(list_session_names | sort) || true)
+        if [ -n "$born" ]; then
+            printf '%s\n' "$born" | head -1
+            return 0
+        fi
+        sleep 0.1
+    done
+    return 1
 }
 
-"$qdbus_bin" org.kde.yakuake /yakuake/sessions org.kde.yakuake.sessionIdList >/dev/null 2>&1 || {
-    homeattach_fail "yakuake is not reachable on the session bus"
-    exit 1
+# Direct fallback: spawn a standalone zmx session if Yakuake tab creation is unavailable or timed out
+create_direct_fallback() {
+    local name target_dir cmd
+    target_dir="$HOME/Desktop"
+    if [ -d "$target_dir" ]; then
+        cd "$target_dir"
+    fi
+
+    for _ in 1 2 3 4 5; do
+        name="s$(printf '%s-%s' "$(date +%s%N)" "$$" | sha256sum | cut -c1-9)"
+        has_homeattach_session "$name" || break
+    done
+
+    cmd="claude --dangerously-skip-permissions"
+    if ! command -v claude >/dev/null 2>&1 && [ -x "$HOME/.local/bin/claude" ]; then
+        cmd="$HOME/.local/bin/claude --dangerously-skip-permissions"
+    fi
+
+    "$(zmx_bin)" run "$name" -d "bash -c \"$cmd; exec \${SHELL:-/bin/bash}\"" >/dev/null 2>&1 || true
+    if has_homeattach_session "$name"; then
+        printf '%s\n' "$name"
+        return 0
+    fi
+    return 1
 }
 
-before=$(list_session_names | sort)
+if create_via_yakuake; then
+    exit 0
+fi
 
-"$qdbus_bin" org.kde.yakuake /yakuake/sessions org.kde.yakuake.addSession >/dev/null
+if create_direct_fallback; then
+    exit 0
+fi
 
-# Wait for the session the tab became. Yakuake's own tab id is not our session
-# name and cannot be mapped to one, so diff the session list instead: whatever
-# name appeared is the tab we just asked for.
-deadline=$(($(date +%s) + NEW_SESSION_TIMEOUT_S))
-while [ "$(date +%s)" -lt "$deadline" ]; do
-    born=$(comm -13 <(printf '%s\n' "$before" | grep -v '^$') <(list_session_names | sort) || true)
-    if [ -n "$born" ]; then
-        printf '%s\n' "$born" | head -1
-        exit 0
-    fi
-    sleep 0.1
-done
-
-homeattach_fail "opened a tab but no session appeared within ${NEW_SESSION_TIMEOUT_S}s; is yakuake's default profile set to tsess-auto?"
+homeattach_fail "failed to create new session"
 exit 1

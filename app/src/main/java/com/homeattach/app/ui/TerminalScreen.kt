@@ -747,6 +747,12 @@ private fun ExtraKeysRow(
             remoteTerminalSession.write(byteArrayOf(0x04), 0, 1)
         }
         KeyCap(
+            label = stringResource(R.string.terminal_key_paste),
+            modifier = Modifier.weight(1.1f),
+        ) {
+            remoteTerminalSession.pasteTextFromClipboard()
+        }
+        KeyCap(
             label = "←",
             modifier = Modifier.weight(0.72f),
             repeating = true
