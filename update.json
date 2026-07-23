@@ -1,0 +1,8 @@
+{
+  "versionCode": 8,
+  "versionName": "1.0.7",
+  "apkUrl": "https://github.com/junknet/HomeAttach/releases/download/v1.0.7/app-release.apk",
+  "sha256": "ccd783312e7b9e045c9c28209e346af2f058dadb8f45cd3b3fffc8963418f837",
+  "sizeBytes": 28955288,
+  "notes": "Fix terminal clipboard copy/paste, add direct session fallback, and restore instant Yakuake new tab response"
+}
