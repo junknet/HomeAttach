@@ -544,6 +544,7 @@ private fun KillBackground(dismissState: SwipeToDismissBoxState) {
  * trailing chevron as the attach affordance (whole card is tappable). */
 @Composable
 private fun SessionCard(session: RemoteSession, label: String, onClick: () -> Unit) {
+    val outputActive = rememberSessionOutputActivity(session.outputSequence)
     OutlinedCard(
         onClick = onClick,
         shape = RoundedCornerShape(20.dp),
@@ -579,6 +580,13 @@ private fun SessionCard(session: RemoteSession, label: String, onClick: () -> Un
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
                         modifier = Modifier.weight(1f, fill = false),
+                    )
+                    SessionActivityLamp(
+                        outputActive = outputActive,
+                        connected = session.status == "focused",
+                        modifier = Modifier
+                            .padding(start = 8.dp)
+                            .size(10.dp),
                     )
                     StatusChip(session, modifier = Modifier.padding(start = 8.dp))
                 }

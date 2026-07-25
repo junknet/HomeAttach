@@ -702,6 +702,7 @@ const Daemon = struct {
     command: ?[]const []const u8 = null,
     cwd: []const u8 = "",
     has_pty_output: bool = false,
+    output_sequence: u64 = 0,
     has_had_client: bool = false,
     has_terminal_client: bool = false, // true only after a real attach (.Init received)
     created_at: u64, // unix timestamp (ns)
@@ -1263,8 +1264,8 @@ const Daemon = struct {
         var buf: [160]u8 = undefined;
         const line = try std.fmt.bufPrint(
             &buf,
-            "pid={d} cols={d} rows={d} owners={d} mirrors={d} bound={d}\n",
-            .{ self.pid, size.cols, size.rows, owners, mirrors, @intFromBool(self.view_bound) },
+            "pid={d} cols={d} rows={d} owners={d} mirrors={d} bound={d} output_seq={d}\n",
+            .{ self.pid, size.cols, size.rows, owners, mirrors, @intFromBool(self.view_bound), self.output_sequence },
         );
         try ipc.appendMessage(self.alloc, &client.write_buf, .Stat, line);
         client.has_pending_output = true;
@@ -2825,6 +2826,7 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
                     // Feed PTY output to terminal emulator for state tracking
                     vt_stream.nextSlice(buf[0..n]);
                     daemon.has_pty_output = true;
+                    daemon.output_sequence +%= 1;
 
                     // When no real terminal client has attached yet, respond to
                     // terminal queries (e.g. DA1/DA2) on behalf of the terminal.

@@ -75,7 +75,7 @@ has_homeattach_session() {
 }
 
 # One "key=value ..." status line from the daemon:
-# pid= cols= rows= owners= mirrors= bound=
+# pid= cols= rows= owners= mirrors= bound= output_seq=
 session_query() {
     "$(zmx_bin)" stat "$1" 2>/dev/null
 }

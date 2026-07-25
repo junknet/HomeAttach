@@ -23,7 +23,7 @@ data class TerminalAttachRequest(
 
 /**
  * One live terminal session as reported by `tsess-list` on the host. The list format is TSV:
- * `name\tcmd\tcwd\towner\tcols\trows\tstatus\tborn`. Older builds of the host script emit fewer
+ * `name\tcmd\tcwd\towner\tcols\trows\tstatus\tborn\toutputSequence`. Older builds of the host script emit fewer
  * columns, so everything past [cwd] is optional and defaults to "unknown" ([owner]/[status] empty,
  * sizes null, [bornEpochSeconds] 0) rather than failing the parse.
  */
@@ -43,6 +43,8 @@ data class RemoteSession(
      * script predates this column.
      */
     val bornEpochSeconds: Long = 0,
+    /** Increments on every PTY output chunk; 0 when the host script predates activity reporting. */
+    val outputSequence: Long = 0,
 )
 
 class SshAuthException(message: String, cause: Throwable? = null) : Exception(message, cause)
@@ -200,6 +202,7 @@ internal fun parseSessionLine(line: String): RemoteSession? {
         rows = parts.getOrNull(5)?.toIntOrNull(),
         status = parts.getOrElse(6) { "" },
         bornEpochSeconds = parts.getOrNull(7)?.toLongOrNull() ?: 0,
+        outputSequence = parts.getOrNull(8)?.toLongOrNull() ?: 0,
     )
 }
 

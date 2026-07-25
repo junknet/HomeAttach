@@ -3,14 +3,14 @@
 # minimal PATH that lacks even coreutils. Absolute-shebang + this keep us safe.
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/bin:/bin${PATH:+:$PATH}"
 # Machine-readable session list for the Android app: one TSV line per
-# session — name\tcmd\tcwd\towner\tcols\trows\tstatus\tborn. No prompts, no
+# session — name\tcmd\tcwd\towner\tcols\trows\tstatus\tborn\toutput_seq. No prompts, no
 # interaction.
 #
 # `born` is the session socket's mtime (unix seconds), i.e. when the daemon
 # came up. It exists so the app can order the list by something a human can
 # predict: session names are content-free hashes, so sorting by name is
-# sorting by nothing. True last-activity would be better still, but zmx does
-# not track it and inferring it here would mean polling every pty.
+# sorting by nothing. `output_seq` comes from zmx and increments when the PTY
+# emits output, so the phone can flash an activity lamp without polling a pty.
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 # shellcheck source=server/tsess-state
@@ -39,6 +39,7 @@ while IFS= read -r name; do
     rows=$(printf '%s' "$query" | tr ' ' '\n' | awk -F= '$1=="rows"{print $2}')
     owners=$(printf '%s' "$query" | tr ' ' '\n' | awk -F= '$1=="owners"{print $2}')
     mirrors=$(printf '%s' "$query" | tr ' ' '\n' | awk -F= '$1=="mirrors"{print $2}')
+    output_seq=$(printf '%s' "$query" | tr ' ' '\n' | awk -F= '$1=="output_seq"{print $2}')
     [ -n "$pid" ] || continue
 
     info=$(session_info "$pid")
@@ -57,6 +58,6 @@ while IFS= read -r name; do
     fi
     born=$(stat -c %Y "$(session_socket "$name")" 2>/dev/null || echo 0)
 
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-        "$name" "$cmd" "$cwd" "$owner" "${cols:-?}" "${rows:-?}" "$status" "$born"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$name" "$cmd" "$cwd" "$owner" "${cols:-?}" "${rows:-?}" "$status" "$born" "${output_seq:-0}"
 done < <(list_session_names)

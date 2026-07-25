@@ -105,12 +105,6 @@ import kotlinx.coroutines.launch
 import androidx.compose.ui.unit.sp
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.animation.core.LinearEasing
-import androidx.compose.animation.core.RepeatMode
-import androidx.compose.animation.core.animateFloat
-import androidx.compose.animation.core.infiniteRepeatable
-import androidx.compose.animation.core.rememberInfiniteTransition
-import androidx.compose.animation.core.tween
 import com.homeattach.app.terminal.REMOTE_OUTPUT_ACTIVITY_WINDOW_MS
 import com.homeattach.app.terminal.isRemoteOutputActive
 
@@ -123,8 +117,6 @@ private val ANSI_ARROW_UP = byteArrayOf(0x1b, '['.code.toByte(), 'A'.code.toByte
 private val ANSI_ARROW_DOWN = byteArrayOf(0x1b, '['.code.toByte(), 'B'.code.toByte())
 private val ANSI_ARROW_RIGHT = byteArrayOf(0x1b, '['.code.toByte(), 'C'.code.toByte())
 private val ANSI_ARROW_LEFT = byteArrayOf(0x1b, '['.code.toByte(), 'D'.code.toByte())
-
-private val STATUS_DOT_CONNECTED = Color(0xFF4CAF50)
 
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
@@ -502,7 +494,7 @@ fun TerminalScreen(
 
                 // Kept on the terminal itself, not only in the closed session drawer: output from
                 // a TUI is an activity signal the user should be able to see without navigating.
-                TerminalActivityLamp(
+                SessionActivityLamp(
                     outputActive = remoteOutputActive,
                     connected = status is AttachStatus.Connected,
                     modifier = Modifier
@@ -612,7 +604,7 @@ private fun TerminalSessionDrawerItem(
             .padding(horizontal = 14.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        TerminalActivityLamp(
+        SessionActivityLamp(
             outputActive = outputActive,
             connected = session.status == "focused",
             modifier = Modifier.size(8.dp),
@@ -639,30 +631,6 @@ private fun TerminalSessionDrawerItem(
             }
         }
     }
-}
-
-@Composable
-private fun TerminalActivityLamp(
-    outputActive: Boolean,
-    connected: Boolean,
-    modifier: Modifier = Modifier,
-) {
-    val flashAlpha by rememberInfiniteTransition(label = "terminal activity lamp")
-        .animateFloat(
-            initialValue = 0.25f,
-            targetValue = 1f,
-            animationSpec = infiniteRepeatable(
-                animation = tween(durationMillis = 110, easing = LinearEasing),
-                repeatMode = RepeatMode.Reverse,
-            ),
-            label = "terminal activity lamp alpha",
-        )
-    val color = when {
-        outputActive -> STATUS_DOT_CONNECTED.copy(alpha = flashAlpha)
-        connected -> STATUS_DOT_CONNECTED.copy(alpha = 0.32f)
-        else -> MaterialTheme.colorScheme.outline
-    }
-    Box(modifier = modifier.background(color, CircleShape))
 }
 
 /** Keeps a received-output flash alive briefly after the last remote byte, then turns it off. */
