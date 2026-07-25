@@ -3,6 +3,7 @@ package com.homeattach.app.ui
 import android.app.Activity
 import android.content.Context
 import android.content.ContextWrapper
+import android.os.SystemClock
 import android.view.View
 import android.view.inputmethod.InputMethodManager
 import android.widget.Toast
@@ -59,6 +60,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
@@ -103,6 +105,14 @@ import kotlinx.coroutines.launch
 import androidx.compose.ui.unit.sp
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
+import com.homeattach.app.terminal.REMOTE_OUTPUT_ACTIVITY_WINDOW_MS
+import com.homeattach.app.terminal.isRemoteOutputActive
 
 private const val KEY_REPEAT_INITIAL_DELAY_MS = 400L
 private const val KEY_REPEAT_INTERVAL_MS = 60L
@@ -143,6 +153,7 @@ fun TerminalScreen(
     }
     val remoteTerminalSession = attachment.terminal
     val status by attachment.status.collectAsState()
+    val lastRemoteOutputElapsedMs by attachment.lastRemoteOutputElapsedMs.collectAsState()
     val hasOutput by attachment.hasOutput.collectAsState()
 
     // Live IME composing text (voice dictation stream). A pty can't express rewrites, so the
@@ -376,6 +387,7 @@ fun TerminalScreen(
                             TerminalSessionDrawerItem(
                                 session = session,
                                 selected = isCurrent,
+                                lastRemoteOutputElapsedMs = if (isCurrent) lastRemoteOutputElapsedMs else 0L,
                                 onClick = {
                                     scope.launch { drawerState.close() }
                                     if (!isCurrent) {
@@ -569,6 +581,7 @@ fun TerminalScreen(
 private fun TerminalSessionDrawerItem(
     session: RemoteSession,
     selected: Boolean,
+    lastRemoteOutputElapsedMs: Long,
     onClick: () -> Unit,
 ) {
     val background = if (selected) {
@@ -576,10 +589,21 @@ private fun TerminalSessionDrawerItem(
     } else {
         Color.Transparent
     }
-    val dotColor = if (session.status == "focused") {
-        STATUS_DOT_CONNECTED
-    } else {
-        MaterialTheme.colorScheme.outline
+    val outputActive = rememberRemoteOutputActivity(lastRemoteOutputElapsedMs)
+    val flashAlpha by rememberInfiniteTransition(label = "terminal activity lamp")
+        .animateFloat(
+            initialValue = 0.25f,
+            targetValue = 1f,
+            animationSpec = infiniteRepeatable(
+                animation = tween(durationMillis = 110, easing = LinearEasing),
+                repeatMode = RepeatMode.Reverse,
+            ),
+            label = "terminal activity lamp alpha",
+        )
+    val dotColor = when {
+        outputActive -> STATUS_DOT_CONNECTED.copy(alpha = flashAlpha)
+        session.status == "focused" -> STATUS_DOT_CONNECTED.copy(alpha = 0.32f)
+        else -> MaterialTheme.colorScheme.outline
     }
 
     Row(
@@ -620,6 +644,23 @@ private fun TerminalSessionDrawerItem(
             }
         }
     }
+}
+
+/** Keeps a received-output flash alive briefly after the last remote byte, then turns it off. */
+@Composable
+private fun rememberRemoteOutputActivity(lastOutputElapsedMs: Long): Boolean {
+    val nowElapsedMs by produceState(
+        initialValue = SystemClock.elapsedRealtime(),
+        lastOutputElapsedMs,
+    ) {
+        value = SystemClock.elapsedRealtime()
+        val remainingMs = lastOutputElapsedMs + REMOTE_OUTPUT_ACTIVITY_WINDOW_MS - value
+        if (lastOutputElapsedMs > 0L && remainingMs > 0L) {
+            delay(remainingMs)
+            value = SystemClock.elapsedRealtime()
+        }
+    }
+    return isRemoteOutputActive(lastOutputElapsedMs, nowElapsedMs)
 }
 
 private tailrec fun Context.findHostActivity(): Activity? = when (this) {

@@ -108,10 +108,9 @@ object RemoteSessionFeed {
                                 sawAnyBlock = true
                                 // Ordered here, once, so the list screen and the terminal's
                                 // drawer can never disagree about what order sessions are in.
-                                // Newest first: the host emits them in socket-glob order, which
-                                // is hash order - stable, but meaning nothing to a human, and a
-                                // new session lands in the middle of the list at random.
-                                trySend(it.sortedByDescending { s -> s.bornEpochSeconds })
+                                // The host emits socket-glob order, which is hash order and has
+                                // no useful relationship to the user's work.
+                                trySend(it.sortedForDisplay())
                             }
                             block = null
                         }
@@ -149,3 +148,11 @@ object RemoteSessionFeed {
     private const val LINGER_MS = 5_000L
     private const val RETRY_DELAY_MS = 2_000L
 }
+
+/** Groups sessions by working directory, then by the process running in that directory. */
+internal fun List<RemoteSession>.sortedForDisplay(): List<RemoteSession> = sortedWith(
+    compareBy<RemoteSession, String>(String.CASE_INSENSITIVE_ORDER, RemoteSession::cwd)
+        .thenBy(String.CASE_INSENSITIVE_ORDER) { it.command }
+        // A process can have multiple sessions in the same directory. Keep those stable too.
+        .thenBy(String.CASE_INSENSITIVE_ORDER) { it.name },
+)
