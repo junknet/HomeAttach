@@ -1,8 +1,8 @@
 {
-  "versionCode": 9,
-  "versionName": "1.0.8",
-  "apkUrl": "https://github.com/junknet/HomeAttach/releases/download/v1.0.8/app-release.apk",
-  "sha256": "df875fee1c018c7c29bfc014b015df70fc805bd985d6e559a207958693b2bc97",
-  "sizeBytes": 28955288,
-  "notes": "Sort sessions by working directory and process, and flash the terminal activity lamp when remote output arrives"
+  "versionCode": 10,
+  "versionName": "1.0.9",
+  "apkUrl": "https://github.com/junknet/HomeAttach/releases/download/v1.0.9/app-release.apk",
+  "sha256": "79471fc0d8d880bfaebd77d10b6388fe7bc291789e7fa30fc0b83d83ebb0f235",
+  "sizeBytes": 28971672,
+  "notes": "Show the green terminal activity lamp directly on the terminal screen, and flash it for remote output including TUI refreshes"
 }

@@ -155,6 +155,7 @@ fun TerminalScreen(
     val status by attachment.status.collectAsState()
     val lastRemoteOutputElapsedMs by attachment.lastRemoteOutputElapsedMs.collectAsState()
     val hasOutput by attachment.hasOutput.collectAsState()
+    val remoteOutputActive = rememberRemoteOutputActivity(lastRemoteOutputElapsedMs)
 
     // Live IME composing text (voice dictation stream). A pty can't express rewrites, so the
     // preedit renders locally in an overlay strip; only the finalized text goes down the wire.
@@ -387,7 +388,7 @@ fun TerminalScreen(
                             TerminalSessionDrawerItem(
                                 session = session,
                                 selected = isCurrent,
-                                lastRemoteOutputElapsedMs = if (isCurrent) lastRemoteOutputElapsedMs else 0L,
+                                outputActive = isCurrent && remoteOutputActive,
                                 onClick = {
                                     scope.launch { drawerState.close() }
                                     if (!isCurrent) {
@@ -499,6 +500,17 @@ fun TerminalScreen(
                     }
                 }
 
+                // Kept on the terminal itself, not only in the closed session drawer: output from
+                // a TUI is an activity signal the user should be able to see without navigating.
+                TerminalActivityLamp(
+                    outputActive = remoteOutputActive,
+                    connected = status is AttachStatus.Connected,
+                    modifier = Modifier
+                        .align(Alignment.TopEnd)
+                        .padding(top = 12.dp, end = 12.dp)
+                        .size(10.dp),
+                )
+
                 // 2. Blocking spinner only until the terminal has drawn something. Keyed off
                 //    hasOutput, not the connection state, so a later drop repaints a banner over
                 //    a live screen instead of hiding the content behind a spinner again.
@@ -581,7 +593,7 @@ fun TerminalScreen(
 private fun TerminalSessionDrawerItem(
     session: RemoteSession,
     selected: Boolean,
-    lastRemoteOutputElapsedMs: Long,
+    outputActive: Boolean,
     onClick: () -> Unit,
 ) {
     val background = if (selected) {
@@ -589,23 +601,6 @@ private fun TerminalSessionDrawerItem(
     } else {
         Color.Transparent
     }
-    val outputActive = rememberRemoteOutputActivity(lastRemoteOutputElapsedMs)
-    val flashAlpha by rememberInfiniteTransition(label = "terminal activity lamp")
-        .animateFloat(
-            initialValue = 0.25f,
-            targetValue = 1f,
-            animationSpec = infiniteRepeatable(
-                animation = tween(durationMillis = 110, easing = LinearEasing),
-                repeatMode = RepeatMode.Reverse,
-            ),
-            label = "terminal activity lamp alpha",
-        )
-    val dotColor = when {
-        outputActive -> STATUS_DOT_CONNECTED.copy(alpha = flashAlpha)
-        session.status == "focused" -> STATUS_DOT_CONNECTED.copy(alpha = 0.32f)
-        else -> MaterialTheme.colorScheme.outline
-    }
-
     Row(
         modifier = Modifier
             .fillMaxWidth()
@@ -617,10 +612,10 @@ private fun TerminalSessionDrawerItem(
             .padding(horizontal = 14.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Box(
-            modifier = Modifier
-                .size(8.dp)
-                .background(dotColor, CircleShape),
+        TerminalActivityLamp(
+            outputActive = outputActive,
+            connected = session.status == "focused",
+            modifier = Modifier.size(8.dp),
         )
         Column(
             modifier = Modifier
@@ -644,6 +639,30 @@ private fun TerminalSessionDrawerItem(
             }
         }
     }
+}
+
+@Composable
+private fun TerminalActivityLamp(
+    outputActive: Boolean,
+    connected: Boolean,
+    modifier: Modifier = Modifier,
+) {
+    val flashAlpha by rememberInfiniteTransition(label = "terminal activity lamp")
+        .animateFloat(
+            initialValue = 0.25f,
+            targetValue = 1f,
+            animationSpec = infiniteRepeatable(
+                animation = tween(durationMillis = 110, easing = LinearEasing),
+                repeatMode = RepeatMode.Reverse,
+            ),
+            label = "terminal activity lamp alpha",
+        )
+    val color = when {
+        outputActive -> STATUS_DOT_CONNECTED.copy(alpha = flashAlpha)
+        connected -> STATUS_DOT_CONNECTED.copy(alpha = 0.32f)
+        else -> MaterialTheme.colorScheme.outline
+    }
+    Box(modifier = modifier.background(color, CircleShape))
 }
 
 /** Keeps a received-output flash alive briefly after the last remote byte, then turns it off. */
