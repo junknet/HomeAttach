@@ -58,8 +58,8 @@ android {
         applicationId = "com.homeattach.app"
         minSdk = 26
         targetSdk = 36
-        versionCode = 11
-        versionName = "1.0.10"
+        versionCode = 12
+        versionName = "1.1.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         // The self-updater reads a static version manifest from a CDN direct-download URL, never the
@@ -79,21 +79,6 @@ android {
             buildConfigString(localPropertyOrEnv("HOMEATTACH_UPDATE_MANIFEST_URL", manifestDefault)),
         )
 
-        val debugHost = localPropertyOrEnv("HOMEATTACH_HOME_HOST", "")
-        val debugPort = localPropertyOrEnv("HOMEATTACH_HOME_PORT", "22").toIntOrNull() ?: 22
-        val debugUsername = localPropertyOrEnv("HOMEATTACH_HOME_USERNAME", "")
-        val debugKeyPath = localPropertyOrEnv("HOMEATTACH_HOME_PRIVATE_KEY_FILE", "")
-        val debugKeyContent = if (debugKeyPath.isNotBlank()) {
-            val f = file(debugKeyPath)
-            if (f.exists()) f.readText() else ""
-        } else {
-            ""
-        }
-
-        buildConfigField("String", "HOMEATTACH_DEBUG_HOST", buildConfigString(debugHost))
-        buildConfigField("int", "HOMEATTACH_DEBUG_PORT", debugPort.toString())
-        buildConfigField("String", "HOMEATTACH_DEBUG_USERNAME", buildConfigString(debugUsername))
-        buildConfigField("String", "HOMEATTACH_DEBUG_PRIVATE_KEY", buildConfigString(debugKeyContent))
     }
 
     signingConfigs {
@@ -105,8 +90,20 @@ android {
         }
     }
 
+    // The developer's own host and private key, so a debug build comes up already pointed at their
+    // PC. Declared per build type rather than in defaultConfig on purpose: in defaultConfig the key
+    // is compiled into the release BuildConfig too, and the only thing keeping it out of the
+    // shipped APK is R8 noticing that `if (BuildConfig.DEBUG)` is dead and pruning the constant
+    // with it. That is a real guarantee today and an accident away from not being one — turning
+    // minification off to chase a bug would quietly ship a private key. Release gets empty strings
+    // it can never fill in.
     buildTypes {
         release {
+            buildConfigField("String", "HOMEATTACH_DEBUG_HOST", "\"\"")
+            buildConfigField("int", "HOMEATTACH_DEBUG_PORT", "22")
+            buildConfigField("String", "HOMEATTACH_DEBUG_USERNAME", "\"\"")
+            buildConfigField("String", "HOMEATTACH_DEBUG_PRIVATE_KEY", "\"\"")
+
             // R8 full mode: prunes the app's dead code, unused Compose/androidx, and the parts of
             // BouncyCastle we never call. proguard-rules.pro keeps the reflection-resolved crypto
             // that R8 cannot see (JSch/BC ed25519), verified by a real ed25519 connect on device.
@@ -117,6 +114,29 @@ android {
                 "proguard-rules.pro"
             )
             signingConfig = signingConfigs.getByName("release")
+        }
+
+        debug {
+            val debugKeyPath = localPropertyOrEnv("HOMEATTACH_HOME_PRIVATE_KEY_FILE", "")
+            val debugKeyFile = if (debugKeyPath.isNotBlank()) file(debugKeyPath) else null
+            val debugKeyContent = if (debugKeyFile?.exists() == true) debugKeyFile.readText() else ""
+
+            buildConfigField(
+                "String",
+                "HOMEATTACH_DEBUG_HOST",
+                buildConfigString(localPropertyOrEnv("HOMEATTACH_HOME_HOST", "")),
+            )
+            buildConfigField(
+                "int",
+                "HOMEATTACH_DEBUG_PORT",
+                (localPropertyOrEnv("HOMEATTACH_HOME_PORT", "22").toIntOrNull() ?: 22).toString(),
+            )
+            buildConfigField(
+                "String",
+                "HOMEATTACH_DEBUG_USERNAME",
+                buildConfigString(localPropertyOrEnv("HOMEATTACH_HOME_USERNAME", "")),
+            )
+            buildConfigField("String", "HOMEATTACH_DEBUG_PRIVATE_KEY", buildConfigString(debugKeyContent))
         }
     }
     compileOptions {
