@@ -51,7 +51,7 @@ fi
 
 mkdir -p "$bin_dir"
 install -m 755 "$zmx_out" "$bin_dir/zmx"
-for script in tsess tsess-attach tsess-auto tsess-focus tsess-kill tsess-list \
+for script in tsess tsess-attach tsess-auto tsess-focus tsess-kill tsess-list tsess-mux \
     tsess-new tsess-release tsess-state tsess-watch; do
     install -m 755 "$script_dir/$script" "$bin_dir/$script"
 done
@@ -120,7 +120,7 @@ fi
 
 echo "installed to $bin_dir:"
 echo "  zmx $("$bin_dir/zmx" version | head -1 | awk '{print $NF}')"
-echo "  tsess tsess-attach tsess-auto tsess-focus tsess-kill tsess-list tsess-release tsess-state tsess-watch"
+echo "  tsess tsess-attach tsess-auto tsess-focus tsess-kill tsess-list tsess-mux tsess-release tsess-state tsess-watch"
 echo
 echo "PC usage:   tsess <name>              named session in this tab"
 echo "            tsess-auto                auto-named session (yakuake profile command)"

@@ -1,0 +1,394 @@
+#!/usr/bin/env python3
+"""Carry every attached HomeAttach session over one channel.
+
+The phone opens this once, as a single SSH exec channel, and drives all of its
+terminals through it. That is the whole point: one channel means opening and
+closing a session is a frame rather than an SSH channel lifecycle, so tearing
+one down can no longer disturb the others.
+
+What that buys has to be paid for in scheduling. SSH gives every channel its own
+flow-control window, and collapsing N channels into one throws that away — a
+session dumping a build log would sit on the shared stream and freeze every
+other terminal. So the loop below never lets one session write more than
+[CHUNK_BYTES] before the next one gets a turn, and stops reading a session whose
+backlog is already [SESSION_BUFFER_LIMIT], letting its own pty apply the
+backpressure instead of buffering it here.
+
+Protocol (see server/tests/muxproto.py, which is the spec the tests speak):
+
+    | type:1 | sid:1 | length:4 big-endian | payload |
+
+    client -> mux   OPEN(name) CLOSE INPUT(bytes) FOCUS(cols,rows)
+    mux -> client   READY(name) OUTPUT(bytes) ENDED(reason) ERROR(message)
+"""
+
+from __future__ import annotations
+
+import errno
+import os
+import pty
+import select
+import shlex
+import signal
+import struct
+import subprocess
+import sys
+import termios
+import tty
+from pathlib import Path
+
+# client -> mux
+OPEN = 0x01
+CLOSE = 0x02
+INPUT = 0x03
+FOCUS = 0x04
+
+# mux -> client
+READY = 0x81
+OUTPUT = 0x82
+ENDED = 0x83
+ERROR = 0x84
+
+HEADER = struct.Struct(">BBI")
+MAX_PAYLOAD = 1 << 20
+
+# One session's turn on the shared stream. Small enough that a flood cannot hold
+# the channel long enough to be felt as a stall in another terminal.
+CHUNK_BYTES = 8192
+
+# Backlog past which a session stops being read. Its pty fills, the writer
+# blocks, and the flood throttles itself — which is what the per-channel windows
+# used to do for us.
+SESSION_BUFFER_LIMIT = 256 * 1024
+
+SELECT_TIMEOUT_S = 0.05
+TERMINATE_GRACE_S = 1.0
+
+
+def zmx_environment() -> dict[str, str]:
+    """The environment zmx is spawned with.
+
+    ZMX_SESSION has to go. Any login shell that has been inside a session exports it, and zmx reads
+    it as "switch the session I am already in" rather than "attach to the one named on the command
+    line" — so a mux started over SSH from such an environment would drive the wrong terminal for
+    every session it opens.
+    """
+    env = dict(os.environ)
+    env.pop("ZMX_SESSION", None)
+    return env
+
+
+def zmx_command() -> list[str]:
+    """Same resolution order as tsess-state, so both agree on which zmx runs."""
+    override = os.environ.get("HOMEATTACH_ZMX")
+    if override:
+        return shlex.split(override)
+    here = Path(__file__).resolve().parent
+    for candidate in (here / "zmx", here / "zmx" / "zig-out" / "bin" / "zmx"):
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return [str(candidate)]
+    return ["zmx"]
+
+
+class Session:
+    """One attached session: its mirror client, its pty, and its backlog."""
+
+    def __init__(self, sid: int, name: str, proc: subprocess.Popen, master_fd: int):
+        self.sid = sid
+        self.name = name
+        self.proc = proc
+        self.master_fd = master_fd
+        self.outbuf = bytearray()
+        # Only a session that claimed the pty size has anything to hand back.
+        self.claimed = False
+
+    @property
+    def backlogged(self) -> bool:
+        return len(self.outbuf) >= SESSION_BUFFER_LIMIT
+
+
+class Mux:
+    def __init__(self) -> None:
+        self.zmx = zmx_command()
+        self.zmx_env = zmx_environment()
+        self.sessions: dict[int, Session] = {}
+        self.inbuf = bytearray()
+        self.pending_out = bytearray()
+        self.turn_order: list[int] = []
+        self.turn_index = 0
+        self.reaping: list[subprocess.Popen] = []
+        self.stdin_open = True
+
+    # ---------- framing ----------
+
+    def queue(self, type_: int, sid: int, payload: bytes = b"") -> None:
+        self.pending_out.extend(HEADER.pack(type_, sid, len(payload)) + payload)
+
+    def parse_input(self) -> None:
+        while True:
+            if len(self.inbuf) < HEADER.size:
+                return
+            type_, sid, length = HEADER.unpack_from(self.inbuf, 0)
+            if length > MAX_PAYLOAD:
+                # Framing is lost; there is no way to resynchronise a stream
+                # whose length fields cannot be trusted.
+                raise SystemExit("tsess-mux: framing lost, oversized length")
+            end = HEADER.size + length
+            if len(self.inbuf) < end:
+                return
+            payload = bytes(self.inbuf[HEADER.size:end])
+            del self.inbuf[:end]
+            self.dispatch(type_, sid, payload)
+
+    def dispatch(self, type_: int, sid: int, payload: bytes) -> None:
+        if type_ == OPEN:
+            self.open_session(sid, payload)
+            return
+        session = self.sessions.get(sid)
+        if session is None:
+            self.queue(ERROR, sid, b"no such session slot")
+            return
+        if type_ == INPUT:
+            self.write_to_session(session, payload)
+        elif type_ == FOCUS:
+            self.focus_session(session, payload)
+        elif type_ == CLOSE:
+            self.close_session(session)
+        else:
+            self.queue(ERROR, sid, b"unknown frame type")
+
+    # ---------- sessions ----------
+
+    def open_session(self, sid: int, payload: bytes) -> None:
+        if sid in self.sessions:
+            self.queue(ERROR, sid, b"session slot already in use")
+            return
+        if sid == 0:
+            self.queue(ERROR, sid, b"slot 0 is reserved")
+            return
+        try:
+            name = payload.decode("utf-8")
+        except UnicodeDecodeError:
+            self.queue(ERROR, sid, b"session name is not utf-8")
+            return
+
+        master_fd, slave_fd = pty.openpty()
+        # Raw, and this is not optional: in canonical mode the pty holds input
+        # until a newline, so arrow keys and Ctrl-C never reach the session, and
+        # with ECHO on every keystroke comes back twice — once from the pty and
+        # once from the session itself.
+        try:
+            tty.setraw(slave_fd, termios.TCSANOW)
+        except termios.error:
+            pass
+        try:
+            proc = subprocess.Popen(
+                self.zmx + ["attach", "--mirror", name],
+                stdin=slave_fd, stdout=slave_fd, stderr=slave_fd,
+                env=self.zmx_env, close_fds=True,
+            )
+        except OSError as exc:
+            os.close(master_fd)
+            os.close(slave_fd)
+            self.queue(ERROR, sid, f"cannot attach: {exc}".encode())
+            return
+        os.close(slave_fd)
+        os.set_blocking(master_fd, False)
+
+        self.sessions[sid] = Session(sid, name, proc, master_fd)
+        self.turn_order.append(sid)
+        self.queue(READY, sid, name.encode("utf-8"))
+
+    def write_to_session(self, session: Session, data: bytes) -> None:
+        try:
+            os.write(session.master_fd, data)
+        except OSError:
+            # The session is going away; its EOF will report ENDED on its own.
+            pass
+
+    def focus_session(self, session: Session, payload: bytes) -> None:
+        if len(payload) != 4:
+            self.queue(ERROR, session.sid, b"focus payload must be cols,rows")
+            return
+        cols, rows = struct.unpack(">HH", payload)
+        session.claimed = True
+        self.run_detached(["claim", session.name, str(cols), str(rows)])
+
+    def close_session(self, session: Session) -> None:
+        if session.claimed:
+            self.run_detached(["release", session.name])
+        self.teardown(session)
+
+    def teardown(self, session: Session) -> None:
+        self.sessions.pop(session.sid, None)
+        if session.sid in self.turn_order:
+            self.turn_order.remove(session.sid)
+        # Anything still buffered belongs to a session the client has let go of.
+        session.outbuf.clear()
+        try:
+            os.close(session.master_fd)
+        except OSError:
+            pass
+        self.stop_process(session.proc)
+
+    def stop_process(self, proc: subprocess.Popen) -> None:
+        if proc.poll() is not None:
+            return
+        try:
+            proc.terminate()
+        except OSError:
+            return
+        try:
+            proc.wait(timeout=TERMINATE_GRACE_S)
+        except subprocess.TimeoutExpired:
+            # A mirror client that ignores SIGTERM would otherwise outlive this
+            # process and pile up on the host on every dropped connection.
+            try:
+                proc.kill()
+                proc.wait(timeout=TERMINATE_GRACE_S)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+
+    def run_detached(self, args: list[str]) -> None:
+        """Fire a `zmx` control verb without blocking the data path on it."""
+        try:
+            self.reaping.append(subprocess.Popen(
+                self.zmx + args,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                env=self.zmx_env,
+            ))
+        except OSError as exc:
+            print(f"tsess-mux: {args[0]} failed: {exc}", file=sys.stderr)
+
+    def reap(self) -> None:
+        self.reaping = [p for p in self.reaping if p.poll() is None]
+
+    # ---------- scheduling ----------
+
+    def fill_pending(self) -> None:
+        """One round of turns, so no session can precede another by more than
+        [CHUNK_BYTES] on the shared stream."""
+        if self.pending_out or not self.turn_order:
+            return
+        for _ in range(len(self.turn_order)):
+            if not self.turn_order:
+                return
+            self.turn_index %= len(self.turn_order)
+            sid = self.turn_order[self.turn_index]
+            self.turn_index += 1
+            session = self.sessions.get(sid)
+            if session is None or not session.outbuf:
+                continue
+            take = bytes(session.outbuf[:CHUNK_BYTES])
+            del session.outbuf[:len(take)]
+            self.queue(OUTPUT, sid, take)
+
+    def flush_pending(self) -> bool:
+        """Writes what it can. False means the client is gone."""
+        while self.pending_out:
+            try:
+                written = os.write(1, self.pending_out[:CHUNK_BYTES * 2])
+            except BlockingIOError:
+                return True
+            except OSError as exc:
+                if exc.errno in (errno.EPIPE, errno.EBADF):
+                    return False
+                raise
+            if written == 0:
+                return True
+            del self.pending_out[:written]
+        return True
+
+    def read_session(self, session: Session) -> None:
+        try:
+            data = os.read(session.master_fd, CHUNK_BYTES)
+        except BlockingIOError:
+            return
+        except OSError as exc:
+            # EIO on a pty master is the normal way a slave-side exit shows up.
+            data = b"" if exc.errno == errno.EIO else b""
+        if not data:
+            self.queue(ENDED, session.sid, b"session ended")
+            self.teardown(session)
+            return
+        session.outbuf.extend(data)
+
+    # ---------- main loop ----------
+
+    def run(self) -> int:
+        os.set_blocking(1, False)
+        if self.stdin_open:
+            os.set_blocking(0, False)
+        try:
+            while True:
+                self.reap()
+                self.fill_pending()
+
+                read_fds: list[int] = []
+                if self.stdin_open:
+                    read_fds.append(0)
+                # A backlogged session is not read: its pty fills up and the
+                # writer blocks, which is the backpressure that keeps one noisy
+                # terminal from being buffered at everyone else's expense.
+                read_fds.extend(
+                    s.master_fd for s in self.sessions.values() if not s.backlogged
+                )
+                write_fds = [1] if self.pending_out else []
+
+                if not read_fds and not write_fds and not self.sessions:
+                    return 0
+
+                try:
+                    readable, writable, _ = select.select(
+                        read_fds, write_fds, [], SELECT_TIMEOUT_S)
+                except InterruptedError:
+                    continue
+                except OSError:
+                    return 0
+
+                if 1 in writable and not self.flush_pending():
+                    return 0
+
+                if 0 in readable:
+                    try:
+                        chunk = os.read(0, 65536)
+                    except BlockingIOError:
+                        chunk = b"pending"[:0]
+                    except OSError:
+                        chunk = b""
+                    if chunk == b"" and 0 in readable:
+                        # The client closed the channel: nothing left to serve.
+                        self.stdin_open = False
+                        return 0
+                    self.inbuf.extend(chunk)
+                    self.parse_input()
+
+                for session in list(self.sessions.values()):
+                    if session.master_fd in readable:
+                        self.read_session(session)
+
+                # Give freshly produced output a chance to leave before blocking
+                # in select again.
+                self.fill_pending()
+                if self.pending_out and not self.flush_pending():
+                    return 0
+        finally:
+            self.shutdown()
+
+    def shutdown(self) -> None:
+        for session in list(self.sessions.values()):
+            self.teardown(session)
+        for proc in self.reaping:
+            self.stop_process(proc)
+
+
+def main() -> int:
+    # A dead client must not kill us mid-teardown; the write path reports it.
+    signal.signal(signal.SIGPIPE, signal.SIG_IGN)
+    return Mux().run()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
