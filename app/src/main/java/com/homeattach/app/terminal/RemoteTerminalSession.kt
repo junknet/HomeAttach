@@ -33,8 +33,17 @@ class RemoteTerminalSession(
         private set
 
     private val mainHandler = Handler(Looper.getMainLooper())
+
+    /**
+     * Remote bytes waiting to be parsed. Written by the SSH reader thread, read by the main thread,
+     * so [pending] is its own lock — and [drainScheduled] and [pendingBytes] are guarded by that
+     * same lock rather than being separate atomics. The flag and the queue have to move together:
+     * "the queue is non-empty and nobody is draining it" is the state that must never be observable,
+     * and splitting the two lets a lost update strand the queue with no drain ever scheduled.
+     */
     private val pending = ArrayDeque<ByteArray>()
     private var drainScheduled = false
+    private var pendingBytes = 0
 
     private val sessionClient = object : TerminalSessionClient {
         override fun onTextChanged(changedSession: TerminalSession) = onScreenUpdated()
@@ -81,24 +90,51 @@ class RemoteTerminalSession(
         },
     )
 
-    // Keeps re-posting until the view has laid out and the emulator exists, then drains all pending
-    // output in one pass. TerminalEmulator is not thread-safe, so this runs only on the main thread.
+    // Keeps re-posting until the view has laid out and the emulator exists, then parses pending
+    // output in bounded passes. TerminalEmulator is not thread-safe, so this runs only on the main
+    // thread — which is also why a pass is capped: re-attaching after a long absence hands us the
+    // whole restored screen at once, and parsing it in one uninterrupted loop holds the main thread
+    // for as long as that takes, which is exactly the freeze it looks like. A pass therefore stops
+    // at [MAX_BYTES_PER_DRAIN] and re-posts *delayed*, so the frame it just produced actually gets
+    // drawn before the next pass starts. Posting undelayed would not do it: with an otherwise idle
+    // queue the continuation runs straight back and the whole backlog still lands inside one frame.
     private val drainRunnable = object : Runnable {
         private var firstOutputFired = false
 
         override fun run() {
             val emulator = session.emulator
             if (emulator == null) {
+                // Still holding the scheduled flag: this pass has not run, so nothing else may post.
                 mainHandler.postDelayed(this, FIRST_LAYOUT_RETRY_MS)
                 return
             }
-            drainScheduled = false
             var appended = false
-            while (true) {
-                val chunk = synchronized(pending) { pending.removeFirstOrNull() } ?: break
+            var bytesProcessed = 0
+
+            while (bytesProcessed < MAX_BYTES_PER_DRAIN) {
+                val chunk = synchronized(pending) {
+                    pending.removeFirstOrNull()?.also { pendingBytes -= it.size }
+                } ?: break
                 emulator.append(chunk, chunk.size)
+                bytesProcessed += chunk.size
                 appended = true
             }
+
+            // Yielding costs throughput, so it is spent only while the backlog is small enough for
+            // the user to be watching it arrive. Past the high-water mark a producer is outrunning
+            // us and the queue would grow without bound, so catch up at full speed instead.
+            val nextDelayMs = synchronized(pending) {
+                when {
+                    pending.isEmpty() -> {
+                        drainScheduled = false
+                        null
+                    }
+                    pendingBytes > CATCH_UP_THRESHOLD_BYTES -> 0L
+                    else -> DRAIN_YIELD_MS
+                }
+            }
+            if (nextDelayMs != null) mainHandler.postDelayed(this, nextDelayMs)
+
             if (appended) {
                 onScreenUpdated()
                 if (!firstOutputFired) {
@@ -113,14 +149,14 @@ class RemoteTerminalSession(
     fun appendRemoteOutput(buffer: ByteArray, offset: Int = 0, count: Int = buffer.size) {
         if (count <= 0) return
         val chunk = buffer.copyOfRange(offset, offset + count)
-        synchronized(pending) { pending.addLast(chunk) }
-        scheduleDrain()
-    }
-
-    private fun scheduleDrain() {
-        if (drainScheduled) return
-        drainScheduled = true
-        mainHandler.post(drainRunnable)
+        // Claim the right to schedule under the same lock that takes the chunk, so a drain pass
+        // finishing concurrently either sees this chunk or leaves the flag for us to claim.
+        val startDrain = synchronized(pending) {
+            pending.addLast(chunk)
+            pendingBytes += chunk.size
+            if (drainScheduled) false else true.also { drainScheduled = true }
+        }
+        if (startDrain) mainHandler.post(drainRunnable)
     }
 
     /** User input from the ExtraKeys row (Esc, Ctrl-C/D, arrows). Routed out to SSH via the session. */
@@ -166,6 +202,19 @@ class RemoteTerminalSession(
 
     private companion object {
         const val TAG = "RemoteTerminalSession"
+
+        /** Most remote bytes one main-thread parse pass may consume before yielding for a frame. */
+        const val MAX_BYTES_PER_DRAIN = 16384
+
+        /** Half a 60Hz frame: long enough for the draw this pass dirtied to actually happen. */
+        const val DRAIN_YIELD_MS = 8L
+
+        /**
+         * Backlog past which yielding is dropped. The budget caps a pass, not the producer, so a
+         * remote writing faster than [MAX_BYTES_PER_DRAIN] per [DRAIN_YIELD_MS] would otherwise grow
+         * [pending] without bound. Smoothness is worth nothing once the terminal is this far behind.
+         */
+        const val CATCH_UP_THRESHOLD_BYTES = 512 * 1024
         // Deep scrollback: the buffer is a lazily-allocated row-pointer array, so a big cap
         // costs ~80KB of references up front and real memory only as history fills.
         const val TRANSCRIPT_ROWS = 10000

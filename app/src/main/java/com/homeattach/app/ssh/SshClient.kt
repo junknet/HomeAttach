@@ -15,11 +15,6 @@ data class RemoteTerminalSize(
     val displayText: String = "${columns}x${rows}"
 }
 
-data class TerminalAttachRequest(
-    val sessionName: String,
-    val ownerIdentifier: String,
-    val terminalSize: RemoteTerminalSize,
-)
 
 /**
  * One live terminal session as reported by `tsess-list` on the host. The list format is TSV:
@@ -52,18 +47,18 @@ class SshConnectException(message: String, cause: Throwable? = null) : Exception
 
 internal const val CONNECT_TIMEOUT_MS = 8000
 
-// 15s probe x 2 misses = a dead transport is detected within ~30s of the radio coming back,
-// bounded by one keepalive round-trip. Short enough to feel responsive on resume, long enough
-// not to kill a session over one slow cellular RTT.
-private const val SERVER_ALIVE_INTERVAL_MS = 15_000
+// 4s probe x 2 misses = a dead transport is detected within ~8s. This bound is what a session
+// switch actually waits on: every tsess-* call and every terminal channel rides this one
+// transport, so while a half-dead socket is still believed alive, opening a channel on it blocks
+// instead of failing over. 30s of that reads as "the app froze"; 8s reads as a reconnect. Still
+// two whole probes wide, so one slow cellular RTT does not kill a live session.
+private const val SERVER_ALIVE_INTERVAL_MS = 4_000
 private const val SERVER_ALIVE_COUNT_MAX = 2
 
 // Non-interactive/non-login exec sessions don't source shell startup files, so PATH is not
 // reliable. $HOME is still provided by sshd, making this portable across host usernames.
 private const val SESSION_LIST_COMMAND = "\$HOME/.local/bin/tsess-list"
 private const val SESSION_KILL_COMMAND = "\$HOME/.local/bin/tsess-kill"
-private const val SESSION_FOCUS_COMMAND = "\$HOME/.local/bin/tsess-focus"
-private const val SESSION_RELEASE_COMMAND = "\$HOME/.local/bin/tsess-release"
 internal const val SESSION_WATCH_COMMAND = "\$HOME/.local/bin/tsess-watch"
 private const val SESSION_NEW_COMMAND = "\$HOME/.local/bin/tsess-new"
 
@@ -259,35 +254,4 @@ fun killRemoteSession(session: Session, name: String) {
 fun killRemoteSession(config: HostConfig, name: String) =
     killRemoteSession(SharedSshSession.acquire(config), name)
 
-@Throws(SshConnectException::class)
-fun focusRemoteSession(session: Session, request: TerminalAttachRequest) {
-    val command = buildString {
-        append(SESSION_FOCUS_COMMAND)
-        append(' ')
-        append(shellQuote(request.sessionName))
-        append(' ')
-        append(shellQuote(request.ownerIdentifier))
-        append(' ')
-        append(request.terminalSize.columns)
-        append(' ')
-        append(request.terminalSize.rows)
-    }
-    execRemoteOrThrow(session, command, "tsess-focus")
-}
 
-/** Runs `tsess-release` on the process's shared connection. */
-@Throws(SshAuthException::class, SshConnectException::class)
-fun releaseRemoteSessionFocus(config: HostConfig, sessionName: String, ownerIdentifier: String) =
-    releaseRemoteSessionFocus(SharedSshSession.acquire(config), sessionName, ownerIdentifier)
-
-@Throws(SshConnectException::class)
-fun releaseRemoteSessionFocus(session: Session, sessionName: String, ownerIdentifier: String) {
-    val command = buildString {
-        append(SESSION_RELEASE_COMMAND)
-        append(' ')
-        append(shellQuote(sessionName))
-        append(' ')
-        append(shellQuote(ownerIdentifier))
-    }
-    execRemoteOrThrow(session, command, "tsess-release")
-}

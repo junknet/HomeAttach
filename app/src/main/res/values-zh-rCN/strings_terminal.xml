@@ -21,5 +21,6 @@
     <string name="terminal_notification_reconnecting_attempt">重连中（第 %1$d 次）…</string>
     <string name="terminal_reconnecting_banner">重连中（第 %1$d 次）… %2$s</string>
     <string name="terminal_auth_failed_title">认证失败</string>
+    <string name="terminal_host_setup_title">无法打开终端</string>
     <string name="terminal_open_settings">设置</string>
 </resources>

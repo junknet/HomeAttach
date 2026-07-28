@@ -21,6 +21,7 @@
     <string name="terminal_notification_reconnecting_attempt">Reconnecting (attempt %1$d)…</string>
     <string name="terminal_reconnecting_banner">Reconnecting (attempt %1$d)… %2$s</string>
     <string name="terminal_auth_failed_title">Authentication failed</string>
+    <string name="terminal_host_setup_title">Cannot open terminal</string>
     <string name="terminal_open_settings">Settings</string>
 
     <!-- Terminal keycap labels: standard key names, identical across locales. -->

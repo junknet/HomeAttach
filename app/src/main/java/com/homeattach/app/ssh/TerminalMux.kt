@@ -1,0 +1,289 @@
+package com.homeattach.app.ssh
+
+import android.util.Log
+import com.homeattach.app.BuildConfig
+import com.homeattach.app.data.HostConfig
+import java.util.concurrent.atomic.AtomicReference
+import kotlin.concurrent.thread
+
+/** What the shared mux channel is doing. Session state is layered on top of this by each slot. */
+internal sealed interface MuxState {
+    data object Connecting : MuxState
+    data object Connected : MuxState
+    data class Reconnecting(val attempt: Int, val cause: String) : MuxState
+    data class Failed(val cause: String, val hostSetup: Boolean) : MuxState
+}
+
+/** How one registered session hears about its own frames and about the channel underneath it. */
+internal interface MuxSessionListener {
+    /** The host attached this session; output is about to follow. */
+    fun onReady()
+    fun onOutput(data: ByteArray)
+
+    /** The session is gone on the host — its tab was closed or it was killed. Terminal. */
+    fun onEnded(reason: String)
+
+    /** The host rejected a frame for this slot. Not terminal; the session stays registered. */
+    fun onError(message: String)
+
+    /** The channel carrying every session changed state. */
+    fun onTransportState(state: MuxState)
+}
+
+/**
+ * The process's single multiplexed terminal channel.
+ *
+ * Every attached session is a slot inside one `tsess-mux` invocation rather than an SSH channel of
+ * its own. Two things follow, and they are the whole reason for the design:
+ *
+ *  * opening and closing a terminal is a frame, so closing one cannot disturb the others;
+ *  * there is one reconnect loop instead of one per session, so a radio gap costs a single
+ *    handshake and every terminal comes back together.
+ *
+ * Slot numbers are assigned here because this is what knows which are live. They are safe to reuse
+ * the moment a session closes: frames are ordered on the channel, so the host processes the CLOSE
+ * before any OPEN that follows it.
+ */
+internal object TerminalMux {
+
+    /** One registered session. Identity, not equality — the owner holds this instance. */
+    internal class Slot(
+        val sid: Int,
+        val sessionName: String,
+        val listener: MuxSessionListener,
+    ) {
+        @Volatile
+        var ready: Boolean = false
+            internal set
+    }
+
+    private val lock = Any()
+    private val slots = LinkedHashMap<Int, Slot>()
+    private val connection = AtomicReference<MuxConnection?>(null)
+    private val retryGate = Object()
+
+    private var worker: Thread? = null
+    private var hostConfig: HostConfig? = null
+
+    @Volatile
+    private var state: MuxState = MuxState.Connecting
+
+    /**
+     * Registers [sessionName] and starts the channel if this is the first session. Returns null
+     * only when no slot is free, which means more terminals than the protocol's 255 can address.
+     */
+    fun register(config: HostConfig, sessionName: String, listener: MuxSessionListener): Slot? {
+        val slot: Slot
+        val live: MuxConnection?
+        synchronized(lock) {
+            val sid = (1..MAX_SLOT).firstOrNull { it !in slots } ?: return null
+            slot = Slot(sid, sessionName, listener)
+            slots[sid] = slot
+
+            // A different host means the held channel is answering for somewhere else.
+            val configChanged = hostConfig != null && hostConfig != config
+            hostConfig = config
+            if (configChanged) connection.get()?.close()
+
+            if (worker == null) {
+                state = MuxState.Connecting
+                worker = thread(name = "terminal-mux", isDaemon = true) { runChannelLoop() }
+            }
+            live = connection.get()
+        }
+        listener.onTransportState(state)
+        // Already connected: this session can be opened without waiting for a reconnect.
+        live?.takeIf { !it.closed }?.send(MuxProtocol.open(slot.sid, slot.sessionName))
+        return slot
+    }
+
+    /** Detaches one session. The channel and every other session keep running. */
+    fun unregister(slot: Slot) {
+        val stopping: Boolean
+        synchronized(lock) {
+            if (slots.remove(slot.sid) == null) return
+            stopping = slots.isEmpty()
+        }
+        connection.get()?.takeIf { !it.closed }?.send(MuxProtocol.close(slot.sid))
+        if (stopping) shutdownChannel()
+    }
+
+    fun sendInput(slot: Slot, data: ByteArray) {
+        connection.get()?.takeIf { !it.closed }?.send(MuxProtocol.input(slot.sid, data))
+    }
+
+    /**
+     * Claims remote pty size ownership for [slot]. Only the session actually on screen may do this:
+     * the claim is exclusive per session on the host, and every registered session stays live here.
+     */
+    fun claimFocus(slot: Slot, columns: Int, rows: Int) {
+        if (columns <= 0 || rows <= 0) return
+        connection.get()?.takeIf { !it.closed }?.send(MuxProtocol.focus(slot.sid, columns, rows))
+    }
+
+    /** Cuts the backoff short — the app resumed and the radio is usually back already. */
+    fun retryNow() {
+        synchronized(retryGate) { retryGate.notifyAll() }
+    }
+
+    private fun shutdownChannel() {
+        val stale: Thread?
+        synchronized(lock) {
+            stale = worker
+            worker = null
+        }
+        connection.getAndSet(null)?.close()
+        retryNow()
+        stale?.interrupt()
+    }
+
+    private fun currentSlots(): List<Slot> = synchronized(lock) { slots.values.toList() }
+
+    private fun isRunning(): Boolean = synchronized(lock) { worker === Thread.currentThread() }
+
+    private fun moveTo(next: MuxState) {
+        if (state == next) return
+        state = next
+        if (BuildConfig.DEBUG) Log.i(TAG, "mux $next")
+        for (slot in currentSlots()) slot.listener.onTransportState(next)
+    }
+
+    // ---------- the channel's life ----------
+
+    private fun runChannelLoop() {
+        var attempt = 0
+        while (isRunning()) {
+            val config = synchronized(lock) { hostConfig } ?: return
+            var carriedTraffic = false
+            val failure: Exception? = try {
+                carriedTraffic = pumpOneConnection(config)
+                null
+            } catch (e: SshAuthException) {
+                // A bad key stays a bad key; make the user fix it rather than spin.
+                moveTo(MuxState.Failed(describe(e), hostSetup = false))
+                return
+            } catch (e: MuxUnavailableException) {
+                // The host cannot run the mux. No amount of retrying installs it.
+                moveTo(MuxState.Failed(describe(e), hostSetup = true))
+                return
+            } catch (e: Exception) {
+                e
+            }
+            if (!isRunning()) return
+
+            connection.getAndSet(null)?.close()
+            for (slot in currentSlots()) slot.ready = false
+
+            // Restarting the backoff is keyed on the channel having actually carried frames, not on
+            // it having opened. A channel that opens and dies immediately — a host mid-upgrade, a
+            // captive portal answering the port — would otherwise reset the count every round and
+            // spin at the shortest delay forever, burning battery and never backing off.
+            attempt = if (carriedTraffic) 1 else attempt + 1
+            moveTo(MuxState.Reconnecting(attempt, failure?.let(::describe) ?: CHANNEL_CLOSED))
+            if (!sleepBackoff(attempt)) return
+        }
+    }
+
+    /**
+     * Opens the channel, re-opens every registered session on it, and pumps until it ends. Returns
+     * whether it ever carried a frame, which is what tells the caller a real connection existed.
+     *
+     * Throws [MuxUnavailableException] when the channel died without ever speaking and the host
+     * explained why — the one failure that retrying cannot mend.
+     */
+    private fun pumpOneConnection(config: HostConfig): Boolean {
+        val conn = MuxConnection.open(config)
+        if (!isRunning()) {
+            conn.close()
+            return false
+        }
+        connection.set(conn)
+        // Re-open everything the pool still holds. On a reconnect this is what brings all the
+        // terminals back at once instead of one handshake each.
+        for (slot in currentSlots()) {
+            conn.send(MuxProtocol.open(slot.sid, slot.sessionName))
+        }
+        moveTo(MuxState.Connected)
+
+        val reader = MuxFrameReader()
+        val buffer = ByteArray(READ_BUFFER_BYTES)
+        var carriedTraffic = false
+        try {
+            while (!conn.closed) {
+                val read = try {
+                    conn.input.read(buffer)
+                } catch (e: Exception) {
+                    if (conn.closed) break else throw e
+                }
+                if (read < 0) break
+                if (read == 0) continue
+                reader.feed(buffer, 0, read) { frame ->
+                    carriedTraffic = true
+                    dispatch(frame)
+                }
+            }
+        } catch (e: MuxFramingException) {
+            // The stream is no longer on a frame boundary; only a fresh channel can fix that.
+            conn.invalidateTransport()
+            conn.close()
+            throw e
+        }
+        // Diagnose before closing: the exit status and stderr belong to the channel.
+        if (!carriedTraffic) {
+            val diagnosis = conn.diagnoseSilentExit()
+            if (diagnosis != null) {
+                conn.close()
+                throw MuxUnavailableException(diagnosis)
+            }
+        }
+        conn.close()
+        return carriedTraffic
+    }
+
+    private fun dispatch(frame: MuxFrame) {
+        val slot = synchronized(lock) { slots[frame.sid] }
+        if (slot == null) {
+            if (BuildConfig.DEBUG) Log.w(TAG, "frame for unknown slot: $frame")
+            return
+        }
+        when (frame.type) {
+            MuxProtocol.OUTPUT -> slot.listener.onOutput(frame.payload)
+            MuxProtocol.READY -> {
+                slot.ready = true
+                slot.listener.onReady()
+            }
+            MuxProtocol.ENDED -> {
+                // The session itself is gone, so free the slot; the owner tears itself down off
+                // the callback. Its number is reusable straight away.
+                synchronized(lock) { slots.remove(slot.sid) }
+                slot.listener.onEnded(frame.text.ifBlank { SESSION_ENDED })
+            }
+            MuxProtocol.ERROR -> slot.listener.onError(frame.text)
+            else -> if (BuildConfig.DEBUG) Log.w(TAG, "unexpected frame: $frame")
+        }
+    }
+
+    private fun sleepBackoff(attempt: Int): Boolean {
+        val waitMs = BACKOFF_MS[(attempt - 1).coerceIn(BACKOFF_MS.indices)]
+        synchronized(retryGate) {
+            try {
+                retryGate.wait(waitMs)
+            } catch (_: InterruptedException) {
+                return false
+            }
+        }
+        return isRunning()
+    }
+
+    private fun describe(e: Exception): String = e.message ?: e::class.simpleName ?: CHANNEL_CLOSED
+
+    private const val TAG = "TerminalMux"
+    private const val MAX_SLOT = 255
+    private const val READ_BUFFER_BYTES = 32 * 1024
+    private const val CHANNEL_CLOSED = "connection dropped"
+    private const val SESSION_ENDED = "session ended"
+
+    /** Fast enough that a radio gap is invisible, capped so an hour-long outage costs one probe
+     * every 8s rather than a spin. */
+    private val BACKOFF_MS = longArrayOf(500, 1_000, 2_000, 4_000, 8_000)
+}

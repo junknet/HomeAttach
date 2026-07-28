@@ -87,6 +87,7 @@ import com.homeattach.app.ssh.RemoteSession
 import com.homeattach.app.ssh.RemoteSessionFeed
 import com.homeattach.app.ssh.SessionsSnapshot
 import com.homeattach.app.terminal.AttachStatus
+import com.homeattach.app.terminal.FailureCause
 import com.homeattach.app.terminal.AttachedTerminal
 import com.homeattach.app.terminal.RemoteTerminalSession
 import android.view.KeyEvent
@@ -183,11 +184,18 @@ fun TerminalScreen(
     }
 
     // Detach for good: the only exit from this screen. Back, the session ending on the PC, and a
-    // dead-end auth failure all land here, so the attachment and its foreground service can never
-    // outlive the screen that owns them.
+    // dead-end auth failure all land here, so this session's attachment can never outlive the
+    // screen that owns them.
+    //
+    // Only this session, deliberately. Switching sessions through the drawer never comes through
+    // here — it navigates straight across — so the pool behind this screen is made of terminals the
+    // user is still moving between, and dropping all of them because one was closed would put a
+    // handshake and a full screen restore back in front of the next switch. The whole pool goes
+    // down when the user actually means it: the notification's Detach action, or swiping the app
+    // away. The service stops on its own once this was the last one.
     fun leave() {
         if (!leaveRequested.compareAndSet(false, true)) return
-        AttachedTerminal.close(context)
+        AttachedTerminal.closeSession(context, sessionName)
         onBack()
     }
 
@@ -566,11 +574,17 @@ fun TerminalScreen(
                     }
                 }
 
-                // 4. Dead end: the host rejected our key. Retrying cannot fix that, so there is
-                //    no Retry button - the fix lives in Settings.
+                // 4. Dead end: retrying cannot fix it, so there is no Retry button. The title has
+                //    to follow the cause — a host missing its scripts reported as "authentication
+                //    failed" sends the user to Settings to re-check a key that was never wrong.
                 if (current is AttachStatus.Failed) {
                     ConnectionProblem(
-                        title = stringResource(R.string.terminal_auth_failed_title),
+                        title = stringResource(
+                            when (current.cause) {
+                                FailureCause.AUTHENTICATION -> R.string.terminal_auth_failed_title
+                                FailureCause.HOST_SETUP -> R.string.terminal_host_setup_title
+                            },
+                        ),
                         message = current.message,
                         hint = null,
                         onBack = { leave() },
