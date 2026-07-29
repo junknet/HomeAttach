@@ -2,7 +2,7 @@
   "versionCode": 13,
   "versionName": "1.2.0",
   "apkUrl": "https://github.com/junknet/HomeAttach/releases/download/v1.2.0/app-release.apk",
-  "sha256": "37d3737d6e9fee6a7d2ff4ed1b8493a59ab181607e1a33038fcee6667b7e4eec",
+  "sha256": "52476c50ec85f3cb9f74ccd9be0b89b01540f6c0bd3835645398e26da8042f31",
   "sizeBytes": 28972144,
   "notes": "Update the PC first (run server/install.sh) - this build needs the new tsess-mux and zmx there. Every session now reports its own activity on one channel, reconnecting no longer wipes the screen, and output no longer steals the scroll."
 }
