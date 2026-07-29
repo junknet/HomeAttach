@@ -1,8 +1,8 @@
 {
-  "versionCode": 12,
-  "versionName": "1.1.0",
-  "apkUrl": "https://github.com/junknet/HomeAttach/releases/download/v1.1.0/app-release.apk",
+  "versionCode": 13,
+  "versionName": "1.2.0",
+  "apkUrl": "https://github.com/junknet/HomeAttach/releases/download/v1.2.0/app-release.apk",
   "sha256": "37d3737d6e9fee6a7d2ff4ed1b8493a59ab181607e1a33038fcee6667b7e4eec",
   "sizeBytes": 28972144,
-  "notes": "Update the PC first (run server/install.sh) - this build needs tsess-mux there. Every terminal now shares one SSH channel: switching is instant and closing one session no longer drops the others."
+  "notes": "Update the PC first (run server/install.sh) - this build needs the new tsess-mux and zmx there. Every session now reports its own activity on one channel, reconnecting no longer wipes the screen, and output no longer steals the scroll."
 }
