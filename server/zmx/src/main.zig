@@ -141,8 +141,16 @@ pub fn main() !void {
         //             SIGHUPs the child and exits (HomeAttach "view-bound").
         //   --mirror  attach as a mirror: receive output and type, but never
         //             own the pty size and never answer terminal queries.
+        //   --resume <epoch>:<offset>
+        //             mirror only: continue the stream from [offset] if the
+        //             daemon still holds it, instead of being handed the
+        //             session's whole picture again.
+        //   --tail <rows>
+        //             mirror only: cap the scrollback a snapshot carries.
         var bind_lifetime = false;
         var mirror = false;
+        var resume_req: ?ipc.ResumeInit = null;
+        var tail_rows: u32 = 0;
         var session_name: []const u8 = "";
         while (args.next()) |arg| {
             if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
@@ -151,11 +159,28 @@ pub fn main() !void {
                 bind_lifetime = true;
             } else if (std.mem.eql(u8, arg, "--mirror")) {
                 mirror = true;
+            } else if (std.mem.eql(u8, arg, "--resume")) {
+                const spec = args.next() orelse return error.ResumeSpecRequired;
+                const sep = std.mem.indexOfScalar(u8, spec, ':') orelse return error.ResumeSpecRequired;
+                resume_req = .{
+                    .rows = 0,
+                    .cols = 0,
+                    .epoch = try std.fmt.parseInt(u64, spec[0..sep], 10),
+                    .offset = try std.fmt.parseInt(u64, spec[sep + 1 ..], 10),
+                };
+            } else if (std.mem.eql(u8, arg, "--tail")) {
+                const rows = args.next() orelse return error.TailRowsRequired;
+                tail_rows = try std.fmt.parseInt(u32, rows, 10);
             } else {
                 session_name = arg;
                 break;
             }
         }
+        // A cold mirror still wants the cap; carry it on an empty resume request.
+        if (mirror and tail_rows > 0 and resume_req == null) {
+            resume_req = .{ .rows = 0, .cols = 0 };
+        }
+        if (resume_req) |*req| req.tail_rows = tail_rows;
 
         var command_args: std.ArrayList([]const u8) = .empty;
         defer command_args.deinit(alloc);
@@ -193,7 +218,7 @@ pub fn main() !void {
             error.OutOfMemory => return err,
         };
         std.log.info("socket path={s}", .{daemon.socket_path});
-        return attach(&daemon, mirror);
+        return attach(&daemon, mirror, if (mirror) resume_req else null);
     } else if (std.mem.eql(u8, cmd, "run") or std.mem.eql(u8, cmd, "r")) {
         const session_name = args.next() orelse "";
         if (std.mem.eql(u8, session_name, "--help") or std.mem.eql(u8, session_name, "-h")) {
@@ -747,6 +772,31 @@ const Daemon = struct {
     // when the last owner disconnects. Mirror clients don't keep it alive.
     view_bound: bool = false,
     has_had_owner: bool = false,
+    // Raw broadcast stream, kept so a client that was attached before can be
+    // handed exactly what it missed (HomeAttach). The terminal snapshot answers
+    // "what does the screen look like now", which costs the whole scrollback
+    // every time; this answers "what happened since byte N", which is the only
+    // thing that lets a phone continue a session instead of reloading it.
+    resume_ring: []u8 = &.{},
+    resume_len: usize = 0,
+    resume_head: usize = 0,
+    /// Total bytes ever broadcast; equivalently, the offset of the next byte.
+    output_bytes: u64 = 0,
+    /// Identifies this daemon incarnation to resuming clients. Not [created_at]:
+    /// that has second resolution, and a session killed and recreated inside the
+    /// same second would hand a client an epoch that matches while the stream
+    /// behind it is a different terminal entirely. Set once the daemon starts
+    /// serving; a client holding epoch 0 has nothing to resume.
+    epoch: u64 = 0,
+
+    /// How much raw output stays resumable. Two minutes of a chatty build at
+    /// 20KB/s, or a whole day of an idle shell - past that a client is better
+    /// served by a fresh picture than by replaying history it cannot use.
+    const RESUME_RING_BYTES: usize = 2 * 1024 * 1024;
+
+    /// Chunked so one resume cannot hand the client a single multi-megabyte
+    /// message to buffer whole.
+    const RESUME_CHUNK_BYTES: usize = 64 * 1024;
 
     const EnsureSessionResult = struct {
         created: bool,
@@ -756,7 +806,59 @@ const Daemon = struct {
     pub fn deinit(self: *Daemon) void {
         self.clients.deinit(self.alloc);
         self.pty_write_buf.deinit(self.alloc);
+        if (self.resume_ring.len > 0) self.alloc.free(self.resume_ring);
         self.alloc.free(self.socket_path);
+    }
+
+    /// The oldest offset still resumable.
+    fn resumeStart(self: *const Daemon) u64 {
+        return self.output_bytes - self.resume_len;
+    }
+
+    /// Remember what was just broadcast. Allocation failure costs resumability,
+    /// never output: a client that cannot be continued is simply handed a
+    /// snapshot instead, so the ring is best-effort by design.
+    fn recordOutput(self: *Daemon, data: []const u8) void {
+        defer self.output_bytes +%= data.len;
+        if (self.resume_ring.len == 0) {
+            self.resume_ring = self.alloc.alloc(u8, RESUME_RING_BYTES) catch return;
+        }
+        const cap = self.resume_ring.len;
+        if (data.len >= cap) {
+            @memcpy(self.resume_ring, data[data.len - cap ..]);
+            self.resume_len = cap;
+            self.resume_head = 0;
+            return;
+        }
+        var written: usize = 0;
+        while (written < data.len) {
+            const chunk = @min(cap - self.resume_head, data.len - written);
+            @memcpy(self.resume_ring[self.resume_head..][0..chunk], data[written..][0..chunk]);
+            self.resume_head = (self.resume_head + chunk) % cap;
+            written += chunk;
+        }
+        self.resume_len = @min(cap, self.resume_len + data.len);
+    }
+
+    /// Whether [from, output_bytes) is still held in full.
+    fn canResumeFrom(self: *const Daemon, from: u64) bool {
+        return from <= self.output_bytes and from >= self.resumeStart();
+    }
+
+    /// Queues everything the client missed since [from]. Caller must have
+    /// checked [canResumeFrom]; a partial range would splice a hole into the
+    /// client's terminal, which is worse than starting it over.
+    fn appendResume(self: *Daemon, client: *Client, from: u64) !void {
+        var missing: usize = @intCast(self.output_bytes - from);
+        if (missing == 0) return;
+        const cap = self.resume_ring.len;
+        var pos = (self.resume_head + cap - missing) % cap;
+        while (missing > 0) {
+            const span = @min(@min(missing, cap - pos), RESUME_CHUNK_BYTES);
+            try ipc.appendMessage(self.alloc, &client.write_buf, .Output, self.resume_ring[pos..][0..span]);
+            pos = (pos + span) % cap;
+            missing -= span;
+        }
     }
 
     pub fn shutdown(self: *Daemon) void {
@@ -1108,6 +1210,128 @@ const Daemon = struct {
         return error.NoLeaderFound;
     }
 
+    /// Queues the picture a client with nothing needs: the daemon's tracked
+    /// terminal state, serialized.
+    ///
+    /// Serialized BEFORE any resize, to capture the correct cursor position -
+    /// resizing triggers reflow which can move the cursor, and the shell's
+    /// SIGWINCH-driven redraw runs after this. Only on re-attach
+    /// ([has_had_client]), never on the first one, so it cannot interfere with
+    /// shell initialization (DA1 queries and friends).
+    ///
+    /// [tail_rows] caps the scrollback it carries; 0 means everything the
+    /// daemon holds, which for a long-lived session is megabytes.
+    fn appendSnapshot(
+        self: *Daemon,
+        client: *Client,
+        term: *ghostty_vt.Terminal,
+        tail_rows: u32,
+    ) void {
+        const snapshot = self.buildSnapshot(term, tail_rows) orelse return;
+        defer self.alloc.free(snapshot);
+        self.appendBytes(client, snapshot);
+    }
+
+    /// The terminal picture as bytes, owned by the caller, or null when there is
+    /// nothing to send. Separate from sending it because a resuming client is
+    /// told how many bytes are coming before they arrive.
+    fn buildSnapshot(
+        self: *Daemon,
+        term: *ghostty_vt.Terminal,
+        tail_rows: u32,
+    ) ?[]const u8 {
+        if (!(self.has_pty_output and self.has_had_client)) return null;
+        const cursor = &term.screens.active.cursor;
+        std.log.debug(
+            "cursor before serialize: x={d} y={d} pending_wrap={}",
+            .{ cursor.x, cursor.y, cursor.pending_wrap },
+        );
+        const term_output = util.serializeTerminalState(self.alloc, term, tail_rows) orelse return null;
+        std.log.debug("serialize terminal state tail_rows={d}", .{tail_rows});
+        // Rewrite OSC 133;A to include redraw=0 so the outer terminal does not
+        // clear prompt lines on resize (issue #111).
+        const restore_data = util.rewritePromptRedraw(self.alloc, term_output) orelse return term_output;
+        self.alloc.free(term_output);
+        return restore_data;
+    }
+
+    fn appendBytes(self: *Daemon, client: *Client, data: []const u8) void {
+        ipc.appendMessage(self.alloc, &client.write_buf, .Output, data) catch |err| {
+            std.log.warn("failed to buffer terminal state for client err={s}", .{@errorName(err)});
+            return;
+        };
+        client.has_pending_output = true;
+    }
+
+    /// A mirror that already holds this session's earlier output.
+    ///
+    /// Continues its stream when the ring still has everything it missed, and
+    /// starts its picture over otherwise. That is the whole difference between
+    /// reopening the app costing a few kilobytes and costing the session's
+    /// entire scrollback, every session, every time.
+    pub fn handleInitResume(
+        self: *Daemon,
+        client: *Client,
+        term: *ghostty_vt.Terminal,
+        payload: []const u8,
+    ) !void {
+        if (payload.len != @sizeOf(ipc.ResumeInit)) return;
+        const req = std.mem.bytesToValue(ipc.ResumeInit, payload);
+
+        client.did_init = true;
+        client.is_mirror = true;
+
+        // A client is added to the broadcast list when it connects, which is one
+        // or more loop iterations before its init arrives - so output produced in
+        // that window is already queued for it. Everything that follows accounts
+        // for those bytes: a snapshot is a picture taken after them, and a resume
+        // replays from a cursor that precedes them. Leaving them queued would
+        // print them ahead of a snapshot that then clears the screen (the line
+        // vanishes) or ahead of a replay that repeats them.
+        client.write_buf.clearRetainingCapacity();
+
+        const continued = req.epoch != 0 and req.epoch == self.epoch and
+            self.has_pty_output and
+            self.canResumeFrom(req.offset);
+
+        // Built before the status is sent, because the status has to say how
+        // many bytes are coming - see [ipc.ResumeStatus.replay_bytes].
+        const snapshot: ?[]const u8 = if (continued)
+            null
+        else
+            self.buildSnapshot(term, req.tail_rows);
+        defer if (snapshot) |data| self.alloc.free(data);
+
+        const replay_bytes: u64 = if (continued)
+            self.output_bytes - req.offset
+        else if (snapshot) |data| data.len else 0;
+
+        // Status first: it says whether the bytes that follow continue the
+        // client's screen or replace it, so it has to arrive before them.
+        const status = ipc.ResumeStatus{
+            .mode = if (continued) ipc.RESUME_CONTINUED else ipc.RESUME_SNAPSHOT,
+            .epoch = self.epoch,
+            .offset = self.output_bytes,
+            .replay_bytes = replay_bytes,
+        };
+        try ipc.appendMessage(self.alloc, &client.write_buf, .ResumeInfo, std.mem.asBytes(&status));
+        client.has_pending_output = true;
+
+        if (continued) {
+            std.log.info(
+                "mirror resumed session={s} from={d} to={d}",
+                .{ self.session_name, req.offset, self.output_bytes },
+            );
+            try self.appendResume(client, req.offset);
+        } else {
+            std.log.info(
+                "mirror snapshot session={s} asked={d} held=[{d},{d}] bytes={d}",
+                .{ self.session_name, req.offset, self.resumeStart(), self.output_bytes, replay_bytes },
+            );
+            if (snapshot) |data| self.appendBytes(client, data);
+        }
+    }
+
     pub fn handleInit(
         self: *Daemon,
         client: *Client,
@@ -1118,33 +1342,7 @@ const Daemon = struct {
     ) !void {
         if (payload.len != @sizeOf(ipc.Resize)) return;
 
-        // Serialize terminal state BEFORE resize to capture correct cursor position.
-        // Resizing triggers reflow which can move the cursor, and the shell's
-        // SIGWINCH-triggered redraw will run after our snapshot is sent.
-        // Only serialize on re-attach (has_had_client), not first attach, to avoid
-        // interfering with shell initialization (DA1 queries, etc.)
-        if (self.has_pty_output and self.has_had_client) {
-            const cursor = &term.screens.active.cursor;
-            std.log.debug(
-                "cursor before serialize: x={d} y={d} pending_wrap={}",
-                .{ cursor.x, cursor.y, cursor.pending_wrap },
-            );
-            if (util.serializeTerminalState(self.alloc, term)) |term_output| {
-                std.log.debug("serialize terminal state", .{});
-                // Rewrite OSC 133;A to include redraw=0 so the outer terminal
-                // does not clear prompt lines on resize (issue #111).
-                const restore_data = util.rewritePromptRedraw(self.alloc, term_output) orelse term_output;
-                defer self.alloc.free(term_output);
-                defer if (restore_data.ptr != term_output.ptr) self.alloc.free(restore_data);
-                ipc.appendMessage(self.alloc, &client.write_buf, .Output, restore_data) catch |err| {
-                    std.log.warn(
-                        "failed to buffer terminal state for client err={s}",
-                        .{@errorName(err)},
-                    );
-                };
-                client.has_pending_output = true;
-            }
-        }
+        self.appendSnapshot(client, term, 0);
 
         client.did_init = true;
         if (mirror) {
@@ -1292,11 +1490,25 @@ const Daemon = struct {
             if (q.is_mirror) mirrors += 1 else owners += 1;
         }
         const size = ipc.getTerminalSize(pty_fd);
-        var buf: [160]u8 = undefined;
+        var buf: [256]u8 = undefined;
         const line = try std.fmt.bufPrint(
             &buf,
-            "pid={d} cols={d} rows={d} owners={d} mirrors={d} bound={d} output_seq={d}\n",
-            .{ self.pid, size.cols, size.rows, owners, mirrors, @intFromBool(self.view_bound), self.output_sequence },
+            "pid={d} cols={d} rows={d} owners={d} mirrors={d} bound={d} output_seq={d}" ++
+                " epoch={d} stream_start={d} stream_end={d}\n",
+            .{
+                self.pid,
+                size.cols,
+                size.rows,
+                owners,
+                mirrors,
+                @intFromBool(self.view_bound),
+                self.output_sequence,
+                // What a resuming client needs to know before it asks: which
+                // daemon these offsets belong to, and the window still held.
+                self.epoch,
+                self.resumeStart(),
+                self.output_bytes,
+            },
         );
         try ipc.appendMessage(self.alloc, &client.write_buf, .Stat, line);
         client.has_pending_output = true;
@@ -2219,7 +2431,7 @@ fn switchSesh(daemon: *Daemon, current_sesh: []const u8) !void {
     };
 }
 
-fn attach(daemon: *Daemon, mirror: bool) !void {
+fn attach(daemon: *Daemon, mirror: bool, resume_req: ?ipc.ResumeInit) !void {
     const sesh = socket.getSeshNameFromEnv();
     if (sesh.len > 0) {
         return switchSesh(daemon, sesh);
@@ -2290,7 +2502,7 @@ fn attach(daemon: *Daemon, mirror: bool) !void {
         _ = try posix.write(posix.STDOUT_FILENO, clear_seq);
     }
 
-    const looper = try clientLoop(client_sock, mirror);
+    const looper = try clientLoop(client_sock, mirror, resume_req);
     switch (looper.kind) {
         .detach => return,
         .switch_session => {
@@ -2322,7 +2534,7 @@ fn attach(daemon: *Daemon, mirror: bool) !void {
                     .created_at = @intCast(std.time.timestamp()),
                     .leader_client_fd = null,
                 };
-                return attach(&target_daemon, mirror);
+                return attach(&target_daemon, mirror, null);
             }
         },
     }
@@ -2582,7 +2794,7 @@ const ClientResult = struct {
 
 /// clientLoop sends ipc commands to its corresponding daemon.  It uses poll() as its non-blocking
 /// mechanism. It will send stdin to the daemon and receive stdout from the daemon.
-fn clientLoop(client_sock_fd: i32, mirror: bool) !ClientResult {
+fn clientLoop(client_sock_fd: i32, mirror: bool, resume_req: ?ipc.ResumeInit) !ClientResult {
     // use c_allocator to avoid "reached unreachable code" panic in DebugAllocator when forking
     const alloc = std.heap.c_allocator;
     defer posix.close(client_sock_fd);
@@ -2601,8 +2813,21 @@ fn clientLoop(client_sock_fd: i32, mirror: bool) !ClientResult {
 
     // Send init message with terminal size (buffered)
     const size = ipc.getTerminalSize(posix.STDOUT_FILENO);
-    const init_tag: ipc.Tag = if (mirror) .InitMirror else .Init;
-    try ipc.appendMessage(alloc, &sock_write_buf, init_tag, std.mem.asBytes(&size));
+    if (resume_req) |req| {
+        // A mirror that may already hold this session's earlier output. The
+        // daemon answers on .ResumeInfo with what it did, which this client
+        // reports on stderr - stdout is the terminal stream and nothing that is
+        // not session output may appear in it.
+        var full = req;
+        full.rows = size.rows;
+        full.cols = size.cols;
+        full.xpixel = size.xpixel;
+        full.ypixel = size.ypixel;
+        try ipc.appendMessage(alloc, &sock_write_buf, .InitResume, std.mem.asBytes(&full));
+    } else {
+        const init_tag: ipc.Tag = if (mirror) .InitMirror else .Init;
+        try ipc.appendMessage(alloc, &sock_write_buf, init_tag, std.mem.asBytes(&size));
+    }
 
     var poll_fds = try std.ArrayList(posix.pollfd).initCapacity(alloc, 4);
     defer poll_fds.deinit(alloc);
@@ -2720,6 +2945,23 @@ fn clientLoop(client_sock_fd: i32, mirror: bool) !ClientResult {
                     .Switch => {
                         return ClientResult{ .kind = .switch_session, .session_name = try alloc.dupe(u8, msg.payload) };
                     },
+                    .ResumeInfo => {
+                        if (msg.payload.len == @sizeOf(ipc.ResumeStatus)) {
+                            const st = std.mem.bytesToValue(ipc.ResumeStatus, msg.payload);
+                            var line: [96]u8 = undefined;
+                            const text = std.fmt.bufPrint(
+                                &line,
+                                "zmx-resume mode={s} epoch={d} offset={d} bytes={d}\n",
+                                .{
+                                    if (st.mode == ipc.RESUME_CONTINUED) "continued" else "snapshot",
+                                    st.epoch,
+                                    st.offset,
+                                    st.replay_bytes,
+                                },
+                            ) catch break;
+                            _ = posix.write(posix.STDERR_FILENO, text) catch {};
+                        }
+                    },
                     else => {},
                 }
             }
@@ -2762,6 +3004,8 @@ fn clientLoop(client_sock_fd: i32, mirror: bool) !ClientResult {
 fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
     std.log.info("daemon started session={s} pty_fd={d}", .{ daemon.session_name, pty_fd });
     daemon.pty_fd = pty_fd;
+    // The identity a client's saved byte offset is only valid against.
+    daemon.epoch = std.crypto.random.int(u64);
     try openSignalPipe();
     installWakeHandler(posix.SIG.TERM);
     var poll_fds = try std.ArrayList(posix.pollfd).initCapacity(daemon.alloc, 8);
@@ -2906,6 +3150,10 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
                     // does not clear prompt lines on resize (issue #111).
                     const broadcast_data = util.rewritePromptRedraw(daemon.alloc, buf[0..n]) orelse buf[0..n];
                     defer if (broadcast_data.ptr != buf[0..n].ptr) daemon.alloc.free(broadcast_data);
+                    // Recorded here, not at the read above: what a resuming
+                    // client must be handed is byte-for-byte what the other
+                    // clients got, rewrites included.
+                    daemon.recordOutput(broadcast_data);
                     for (daemon.clients.items) |client| {
                         ipc.appendMessage(daemon.alloc, &client.write_buf, .Output, broadcast_data) catch |err| {
                             std.log.warn(
@@ -2975,6 +3223,9 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
                         .Output => try daemon.handleOutput(msg.payload, &vt_stream),
                         .Init => try daemon.handleInit(client, pty_fd, &term, msg.payload, false),
                         .InitMirror => try daemon.handleInit(client, pty_fd, &term, msg.payload, true),
+                        .InitResume => try daemon.handleInitResume(client, &term, msg.payload),
+                        // Daemon -> client only; a client sending it is noise.
+                        .ResumeInfo => {},
                         .Claim => try daemon.handleClaim(pty_fd, &term, msg.payload),
                         .Release => try daemon.handleRelease(),
                         .Stat => try daemon.handleStat(client, pty_fd),

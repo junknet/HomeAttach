@@ -545,7 +545,18 @@ pub fn isTerminalReply(payload: []const u8) bool {
     return saw_reply;
 }
 
-pub fn serializeTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt.Terminal) ?[]const u8 {
+/// [tail_rows] caps how much scrollback phase 1 emits; 0 means all of it.
+///
+/// A client that keeps its own scrollback - HomeAttach's phone does - only
+/// needs enough history to fill a screen it can scroll a little. Sending it the
+/// daemon's whole buffer instead means re-transferring and re-parsing the
+/// entire session on every attach, which for a long-lived session is megabytes
+/// of work to arrive back where it already was.
+pub fn serializeTerminalState(
+    alloc: std.mem.Allocator,
+    term: *ghostty_vt.Terminal,
+    tail_rows: u32,
+) ?[]const u8 {
     var builder: std.Io.Writer.Allocating = .init(alloc);
     defer builder.deinit();
 
@@ -582,10 +593,18 @@ pub fn serializeTerminalState(alloc: std.mem.Allocator, term: *ghostty_vt.Termin
             var sb_bottom = sb_bottom_row;
             sb_bottom.x = @intCast(pages.cols - 1);
 
+            // Start at most [tail_rows] above the visible screen. `up` returning
+            // null means there is less scrollback than the cap, so the whole of
+            // it is already within budget.
+            const sb_top = if (tail_rows > 0)
+                (active_top.up(tail_rows) orelse screen_top)
+            else
+                screen_top;
+
             var scroll_fmt = ghostty_vt.formatter.TerminalFormatter.init(term, .vt);
             scroll_fmt.content = .{
                 .selection = ghostty_vt.Selection.init(
-                    screen_top,
+                    sb_top,
                     sb_bottom,
                     false,
                 ),
@@ -1056,7 +1075,7 @@ test "serializeTerminalState excludes synchronized output replay" {
     try testing.expect(term.modes.get(.bracketed_paste));
     try testing.expect(term.modes.get(.synchronized_output));
 
-    const output = serializeTerminalState(alloc, &term) orelse return error.TestUnexpectedNull;
+    const output = serializeTerminalState(alloc, &term, 0) orelse return error.TestUnexpectedNull;
     defer alloc.free(output);
 
     // The serialized output should contain bracketed paste (DECSET 2004)
@@ -1094,7 +1113,7 @@ fn expectCursorAt(term: *ghostty_vt.Terminal, row: usize, col: usize) !void {
 }
 
 fn serializeRoundtrip(alloc: std.mem.Allocator, source: *ghostty_vt.Terminal) !ghostty_vt.Terminal {
-    const serialized = serializeTerminalState(alloc, source) orelse
+    const serialized = serializeTerminalState(alloc, source, 0) orelse
         return error.SerializationFailed;
     defer alloc.free(serialized);
 
@@ -1231,7 +1250,7 @@ test "serializeTerminalState nested roundtrip preserves content" {
     const inner_cursor_y = inner.screens.active.cursor.y;
 
     // Serialize inner (simulates inner daemon re-attach to inner client)
-    const inner_serialized = serializeTerminalState(alloc, &inner) orelse
+    const inner_serialized = serializeTerminalState(alloc, &inner, 0) orelse
         return error.SerializationFailed;
     defer alloc.free(inner_serialized);
 
@@ -1324,7 +1343,7 @@ test "serializeTerminalState scrollback + size mismatch nested roundtrip" {
     const inner_cursor_y = inner.screens.active.cursor.y;
 
     // Inner serialize → outer processes → outer serialize → client
-    const inner_ser = serializeTerminalState(alloc, &inner) orelse
+    const inner_ser = serializeTerminalState(alloc, &inner, 0) orelse
         return error.SerializationFailed;
     defer alloc.free(inner_ser);
 

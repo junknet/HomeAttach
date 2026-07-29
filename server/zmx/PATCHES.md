@@ -53,9 +53,38 @@ pty size ("newest typist wins"). Our patches add the HomeAttach policy layer.
    re-attach and the RIS reset its emulator on every dropped connection. The
    snapshot repaints the screen by itself, so a mirror needs neither.
 
-Note that 5 and 6 are the pair that makes reconnecting cheap: 6 stops a
+7. **Resumable output** (`zmx attach --mirror --resume <epoch>:<offset>`,
+   `--tail <rows>`, IPC tags `InitResume=18`, `ResumeInfo=19`).
+   The daemon keeps a 2MB ring of the raw bytes it broadcast, a monotonic
+   `output_bytes` cursor over them, and a random per-incarnation `epoch`. A
+   mirror that already holds part of the session asks to continue from its
+   cursor; when the ring still covers it the daemon sends exactly the missing
+   bytes, otherwise it sends a snapshot capped at `--tail` rows. Either way it
+   answers first with `ResumeInfo` — mode, epoch, the client's new cursor, and
+   how many of the bytes about to arrive are replay that the cursor already
+   counts. The client prints that as one `zmx-resume` line on **stderr**, which
+   is why `tsess-mux` gives each attach its own stderr pipe: stdout is the
+   terminal stream and nothing else may appear in it.
+
+   `epoch` is deliberately not `created_at`: that has second resolution, and a
+   session killed and recreated inside the same second would hand a client an
+   epoch that matches while the stream behind it is a different terminal.
+
+   `handleInitResume` also clears the client's write buffer before answering. A
+   client joins the broadcast list when it connects, one or more loop iterations
+   before its init arrives, so output from that window is already queued for it —
+   and everything that follows accounts for those bytes. Left queued they print
+   ahead of a snapshot that then clears the screen (the line vanishes) or ahead
+   of a replay that repeats them.
+
+   `zmx stat` reports `epoch=`, `stream_start=` and `stream_end=` so a caller can
+   see the window before asking.
+
+Note that 5, 6 and 7 are what make reopening the phone cheap: 6 stops a
 reconnect from costing the user their scrollback, 5 stops the status feed from
-costing the host a process per session per poll.
+costing the host a process per session per poll, and 7 turns reopening the app
+from "re-send the whole session" (measured at 134KB-850KB each) into "send the
+few hundred bytes it missed".
 
 Upstream wire-compat: all additions are new IPC tags; old daemons ignore
 unknown tags by design (`Tag` is non-exhaustive).

@@ -25,10 +25,16 @@ pub const Tag = enum(u8) {
     //   clear the leader until an owner types again.
     // Release: hand the pty size back to the first attached owner client.
     // Stat: one-line key=value status reply for shell scripts.
+    // InitResume: attach as a mirror that already has this session's earlier
+    //   output, asking to be handed only what it missed.
+    // ResumeInfo: the daemon's answer to InitResume - whether it continued the
+    //   stream or started a new picture, and where the client's cursor now is.
     InitMirror = 14,
     Claim = 15,
     Release = 16,
     Stat = 17,
+    InitResume = 18,
+    ResumeInfo = 19,
     // Non-exhaustive: this enum comes off the wire via bytesToValue and
     // @enumFromInt, so out-of-range values (18-255) are representable
     // rather than UB. Switches must handle `_` (unknown tag).
@@ -60,6 +66,51 @@ pub fn getTerminalSize(fd: i32) Resize {
     }
     return .{ .rows = 24, .cols = 160 };
 }
+
+/// A mirror asking to continue where it left off, rather than be handed the
+/// session over again (HomeAttach).
+///
+/// [epoch] is which daemon the offset belongs to. Session names are reused, and
+/// a byte offset from a previous daemon points into a completely different
+/// stream - resuming across that boundary would splice two unrelated terminals
+/// together, so an epoch that does not match is treated as having nothing.
+pub const ResumeInit = extern struct {
+    rows: u16,
+    cols: u16,
+    xpixel: u16 = 0,
+    ypixel: u16 = 0,
+    /// 0 when the client has nothing to continue from.
+    epoch: u64 = 0,
+    offset: u64 = 0,
+    /// Scrollback rows a snapshot may carry; 0 means everything the daemon has.
+    /// A phone keeps its own scrollback and only needs enough to fill a screen.
+    tail_rows: u32 = 0,
+    _reserved: u32 = 0,
+};
+
+/// The daemon started the client's picture over; whatever it had is stale.
+pub const RESUME_SNAPSHOT: u8 = 0;
+/// The daemon sent exactly the bytes the client had not seen; its screen stands.
+pub const RESUME_CONTINUED: u8 = 1;
+
+/// What the daemon just did, and where that leaves the client's cursor. Sent
+/// before the replayed bytes so the client knows whether to keep its screen.
+pub const ResumeStatus = extern struct {
+    mode: u8,
+    _pad: [7]u8 = @splat(0),
+    epoch: u64,
+    /// The client's cursor once it has consumed everything sent with this reply.
+    offset: u64,
+    /// How many bytes follow as part of this reply.
+    ///
+    /// The client counts stream bytes to keep its cursor, and these must not be
+    /// counted: on a snapshot they are a picture the daemon synthesized, which
+    /// was never in the stream at all, and on a resume they are bytes [offset]
+    /// already accounts for. Counting them puts the client's cursor ahead of
+    /// the stream, and a cursor ahead of the stream can never be resumed from
+    /// again - the session silently falls back to a full reload forever.
+    replay_bytes: u64,
+};
 
 pub const MAX_CMD_LEN = 256;
 pub const MAX_CWD_LEN = 256;
