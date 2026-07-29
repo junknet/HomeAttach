@@ -20,3 +20,7 @@ keystores/
 *.p12
 *.pfx
 app/release-keystore.jks
+
+# Python bytecode from the server-side test suite
+__pycache__/
+*.pyc
