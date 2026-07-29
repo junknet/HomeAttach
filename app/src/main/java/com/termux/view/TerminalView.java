@@ -551,13 +551,36 @@ public final class TerminalView extends View {
         onScreenUpdated(false);
     }
 
+    /**
+     * Put the viewport back on the live edge (HomeAttach).
+     *
+     * This is what typing has to mean now that output no longer drags the view down by itself: a
+     * keystroke whose result the user cannot see is a broken terminal, so sending input leaves
+     * scrollback the same way pressing a key leaves a pager.
+     */
+    public void scrollToBottom() {
+        if (mEmulator == null) return;
+        if (mTopRow == 0 && mTopRowOffsetPx == 0f) return;
+        mTopRow = 0;
+        mTopRowOffsetPx = 0f;
+        mScroller.forceFinished(true);
+        invalidate();
+    }
+
     public void onScreenUpdated(boolean skipScrolling) {
         if (mEmulator == null) return;
 
         int rowsInHistory = mEmulator.getScreen().getActiveTranscriptRows();
         if (mTopRow < -rowsInHistory) mTopRow = -rowsInHistory;
 
-        if (isSelectingText() || mEmulator.isAutoScrollDisabled()) {
+        // Sticky bottom (HomeAttach): output follows the viewport only while the viewport is at the
+        // bottom. Scrolled up, the reader keeps the lines they are looking at and new output piles
+        // up below them. Upstream instead yanked the view to the bottom on every chunk, which on a
+        // remote terminal means a build log fighting the finger for the scroll position and
+        // winning several times a second.
+        boolean atBottom = mTopRow == 0 && mTopRowOffsetPx == 0f;
+
+        if (isSelectingText() || mEmulator.isAutoScrollDisabled() || !atBottom) {
 
             // Do not scroll when selecting text.
             int rowShift = mEmulator.getScrollCounter();
@@ -567,7 +590,9 @@ public final class TerminalView extends View {
                 if (isSelectingText())
                     stopTextSelectionMode();
 
-                if (mEmulator.isAutoScrollDisabled()) {
+                if (mEmulator.isAutoScrollDisabled() || !atBottom) {
+                    // The transcript can no longer hold what was anchored: sit at the oldest line
+                    // it still has rather than teleporting to the bottom.
                     mTopRow = -rowsInHistory;
                     skipScrolling = true;
                 }
@@ -942,6 +967,8 @@ public final class TerminalView extends View {
         if (isSelectingText()) {
             stopTextSelectionMode();
         }
+        // Typing rejoins the live edge; see scrollToBottom().
+        scrollToBottom();
 
         if (mClient.onKeyDown(keyCode, event, mTermSession)) {
             invalidate();
@@ -1019,6 +1046,8 @@ public final class TerminalView extends View {
         }
 
         if (mTermSession == null) return;
+        // Also reached straight from the IME, not only via onKeyDown; see scrollToBottom().
+        scrollToBottom();
 
         // Ensure cursor is shown when a key is pressed down like long hold on (arrow) keys
         if (mEmulator != null)

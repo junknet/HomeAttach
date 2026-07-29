@@ -27,6 +27,13 @@ class RemoteTerminalSession(
     /** Fired when the emulator receives and processes the first chunk of remote data. */
     var onFirstOutput: () -> Unit = {}
 
+    /**
+     * Fired for input the user sent from outside the terminal view — the extra-keys row, paste.
+     * The view scrolls itself back to the live edge when it handles a key, but these never reach
+     * it, and output no longer drags the viewport down on its own.
+     */
+    var onUserInput: () -> Unit = {}
+
     var currentColumns = 0
         private set
     var currentRows = 0
@@ -161,6 +168,7 @@ class RemoteTerminalSession(
 
     /** User input from the ExtraKeys row (Esc, Ctrl-C/D, arrows). Routed out to SSH via the session. */
     fun write(data: ByteArray, offset: Int, count: Int) {
+        onUserInput()
         session.write(data, offset, count)
     }
 
@@ -180,6 +188,7 @@ class RemoteTerminalSession(
     }
 
     fun pasteTextFromClipboard() {
+        onUserInput()
         try {
             val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
             val clipData = clipboard?.primaryClip
