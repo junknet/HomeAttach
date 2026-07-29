@@ -2,7 +2,7 @@
   "versionCode": 15,
   "versionName": "1.4.0",
   "apkUrl": "https://github.com/junknet/HomeAttach/releases/download/v1.4.0/app-release.apk",
-  "sha256": "b9512302051e7723d70d6dee2f2f901a65d5edb18c8337cecdc36f4c98129c13",
+  "sha256": "3c9aea05c53d7626db1ff4e7a2b224d07d030469f8aa85f02729a4bb64ccef49",
   "sizeBytes": 28972144,
   "notes": "Update the PC first (run server/install.sh). The app now checks for updates by itself, and a session's picture is drawn at the size it will be shown at instead of the PC's - which was costing up to five lines of scrollback on every attach."
 }
