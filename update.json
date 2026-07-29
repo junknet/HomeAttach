@@ -2,7 +2,7 @@
   "versionCode": 14,
   "versionName": "1.3.0",
   "apkUrl": "https://github.com/junknet/HomeAttach/releases/download/v1.3.0/app-release.apk",
-  "sha256": "52476c50ec85f3cb9f74ccd9be0b89b01540f6c0bd3835645398e26da8042f31",
+  "sha256": "b9512302051e7723d70d6dee2f2f901a65d5edb18c8337cecdc36f4c98129c13",
   "sizeBytes": 28972144,
   "notes": "Update the PC first (run server/install.sh). Reopening the app now continues each session from where it was instead of re-downloading and re-rendering all of it - measured 120 bytes instead of 44KB on a real session."
 }
