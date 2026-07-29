@@ -59,6 +59,16 @@ def zmx_log(tmp_path: Path) -> Path:
     return path
 
 
+@pytest.fixture
+def attach_log(tmp_path: Path) -> Path:
+    """Where fake_zmx records how each attach was spelled: its resume request and
+    its snapshot cap. Separate from [zmx_log] so "the mux asked the host for
+    nothing" stays a statement about control verbs."""
+    path = tmp_path / "zmx-attach.log"
+    path.touch()
+    return path
+
+
 class FakeHost:
     """The host's session state, as the mux is able to observe it.
 
@@ -146,7 +156,8 @@ class MuxClient:
 
     def __init__(self, zmx_log: Path, tmp_path: Path,
                  read_chunk: int = 65536, read_pause_s: float = 0.0,
-                 extra_env: dict[str, str] | None = None):
+                 extra_env: dict[str, str] | None = None,
+                 attach_log: Path | None = None):
         # A throttled reader is not an artificial handicap: the phone parses VT100
         # on its main thread under a per-frame byte budget, so it consumes far
         # slower than the host produces. Starvation only becomes observable once
@@ -158,6 +169,7 @@ class MuxClient:
             **os.environ,
             "HOMEATTACH_ZMX": f"{sys.executable} {FAKE_ZMX}",
             "FAKE_ZMX_LOG": str(zmx_log),
+            "FAKE_ZMX_ATTACH_LOG": str(attach_log or (tmp_path / "zmx-attach.log")),
             "ZMX_DIR": str(tmp_path / "zmx-dir"),
             # Deliberately poisoned. A login shell that has ever been inside a session exports
             # this, and zmx reads it as "switch the current session" instead of "attach to the
@@ -176,6 +188,10 @@ class MuxClient:
         )
         self.pgid = self.proc.pid
         self._frames: queue.Queue[muxproto.Frame] = queue.Queue()
+        # Frames [expect] scanned past. Held, not dropped: another session's
+        # output legitimately arrives while waiting for one session's READY, and
+        # a harness that discards it turns a correct mux into a failing test.
+        self._held: list[muxproto.Frame] = []
         self._reader_error: Exception | None = None
         self._stderr = bytearray()
         self._pump = threading.Thread(target=self._read_stdout, daemon=True)
@@ -234,23 +250,26 @@ class MuxClient:
             ) from None
 
     def expect(self, match, timeout: float = DEFAULT_TIMEOUT_S) -> muxproto.Frame:
-        """The next frame satisfying [match], skipping over the rest."""
+        """The next frame satisfying [match]. Everything else stays queued."""
+        for i, frame in enumerate(self._held):
+            if match(frame):
+                return self._held.pop(i)
         deadline = time.monotonic() + timeout
-        skipped: list[muxproto.Frame] = []
         while time.monotonic() < deadline:
             frame = self.next_frame(timeout=max(0.05, deadline - time.monotonic()))
             if match(frame):
                 return frame
-            skipped.append(frame)
+            self._held.append(frame)
         raise AssertionError(
             f"expected frame never arrived within {timeout}s; "
-            f"saw {skipped[:12]}; mux stderr: {self.stderr_text!r}"
+            f"saw {self._held[:12]}; mux stderr: {self.stderr_text!r}"
         )
 
     def collect(self, duration: float) -> list[muxproto.Frame]:
-        """Every frame arriving over [duration]. For starvation measurements."""
+        """Every frame arriving over [duration], plus anything [expect] held."""
         deadline = time.monotonic() + duration
-        out: list[muxproto.Frame] = []
+        out: list[muxproto.Frame] = self._held
+        self._held = []
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -260,9 +279,11 @@ class MuxClient:
             except queue.Empty:
                 return out
 
-    def open_session(self, sid: int, name: str) -> muxproto.Frame:
-        self.send(muxproto.open_frame(sid, name))
-        return self.expect(lambda f: f.type == muxproto.READY and f.sid == sid)
+    def open_session(self, sid: int, name: str, epoch: int = 0, offset: int = 0,
+                     tail_rows: int = 0) -> muxproto.Ready:
+        self.send(muxproto.open_frame(sid, name, epoch, offset, tail_rows))
+        frame = self.expect(lambda f: f.type == muxproto.READY and f.sid == sid)
+        return muxproto.decode_ready(frame.payload)
 
     def close_stdin(self) -> None:
         self.proc.stdin.close()
@@ -289,8 +310,8 @@ class MuxClient:
 
 
 @pytest.fixture
-def mux(require_mux, zmx_log: Path, tmp_path: Path, host: FakeHost):
-    client = MuxClient(zmx_log, tmp_path, extra_env=host.env())
+def mux(require_mux, zmx_log: Path, attach_log: Path, tmp_path: Path, host: FakeHost):
+    client = MuxClient(zmx_log, tmp_path, extra_env=host.env(), attach_log=attach_log)
     try:
         yield client
     finally:
@@ -298,11 +319,11 @@ def mux(require_mux, zmx_log: Path, tmp_path: Path, host: FakeHost):
 
 
 @pytest.fixture
-def slow_mux(require_mux, zmx_log: Path, tmp_path: Path, host: FakeHost):
+def slow_mux(require_mux, zmx_log: Path, attach_log: Path, tmp_path: Path, host: FakeHost):
     """A mux read at roughly phone speed — 8KB per 20ms, ~400KB/s — so its
     stdout backs up the way it does over a real cellular link."""
     client = MuxClient(zmx_log, tmp_path, read_chunk=8192, read_pause_s=0.02,
-                       extra_env=host.env())
+                       extra_env=host.env(), attach_log=attach_log)
     try:
         yield client
     finally:

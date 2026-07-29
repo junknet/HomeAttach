@@ -32,8 +32,8 @@ def output_of(frames, sid: int) -> bytes:
 
 
 def test_open_is_acknowledged_with_ready_naming_the_session(mux):
-    frame = mux.open_session(1, "quiet-alpha")
-    assert frame.payload.decode() == "quiet-alpha"
+    ready = mux.open_session(1, "quiet-alpha")
+    assert ready.name == "quiet-alpha"
 
 
 def test_session_output_arrives_tagged_with_its_slot(mux):
@@ -210,8 +210,8 @@ def test_a_slot_can_be_reused_after_it_is_closed(mux):
     mux.open_session(1, "quiet-alpha")
     mux.send(muxproto.close_frame(1))
     mux.collect(0.3)
-    frame = mux.open_session(1, "quiet-beta")
-    assert frame.payload.decode() == "quiet-beta"
+    ready = mux.open_session(1, "quiet-beta")
+    assert ready.name == "quiet-beta"
 
 
 def test_frames_split_across_writes_are_reassembled(mux):
@@ -220,6 +220,124 @@ def test_frames_split_across_writes_are_reassembled(mux):
         mux.send_raw(wire[i:i + 1])
         time.sleep(0.005)
     assert mux.expect(lambda f: f.type == muxproto.READY and f.sid == 1)
+
+
+# ---------- resuming a session the client already holds ----------
+#
+# Reopening the app used to re-transfer and re-parse every session's entire
+# scrollback - measured at 134KB-850KB per session on a real host. The client
+# now says what it already has, and the host answers with either the delta or
+# an admission that the delta is gone.
+
+
+def resume_calls(attach_log):
+    return [c for c in read_calls(attach_log) if c.startswith("resume ")]
+
+
+def test_a_client_holding_nothing_is_told_its_screen_is_new(mux, attach_log):
+    ready = mux.open_session(1, "quiet-alpha")
+    assert not ready.continued
+    assert ready.name == "quiet-alpha"
+
+
+def test_a_client_holding_a_live_cursor_is_told_the_stream_continues(
+    require_mux, zmx_log, attach_log, tmp_path, host
+):
+    # The fake host stands where a daemon would: epoch 4242, 5000 bytes emitted.
+    client = MuxClient(
+        zmx_log, tmp_path, attach_log=attach_log,
+        extra_env={**host.env(), "FAKE_ZMX_EPOCH": "4242", "FAKE_ZMX_OFFSET": "5000"},
+    )
+    try:
+        ready = client.open_session(1, "quiet-alpha", epoch=4242, offset=1234)
+        assert ready.continued, "a cursor the host still holds must continue the stream"
+        assert (ready.epoch, ready.offset) == (4242, 5000)
+        # The delta about to arrive, which the new offset already counts. Dropping this on the
+        # floor is invisible until the *next* open: the client's cursor ends up past the stream,
+        # the host can never continue from it, and every reopen silently reloads in full again.
+        assert ready.replay_bytes == 5000 - 1234
+        assert resume_calls(attach_log) == ["resume quiet-alpha continued 4242 1234"]
+    finally:
+        client.shutdown()
+
+
+def test_a_cursor_from_another_daemon_is_refused(
+    require_mux, zmx_log, attach_log, tmp_path, host
+):
+    """Session names are reused. An offset from a previous daemon points into a
+    different stream, and splicing the two would corrupt the terminal silently."""
+    client = MuxClient(
+        zmx_log, tmp_path, attach_log=attach_log,
+        extra_env={**host.env(), "FAKE_ZMX_EPOCH": "4242", "FAKE_ZMX_OFFSET": "5000"},
+    )
+    try:
+        ready = client.open_session(1, "quiet-alpha", epoch=1111, offset=1234)
+        assert not ready.continued
+        assert ready.epoch == 4242, "the client must learn the epoch it should save"
+    finally:
+        client.shutdown()
+
+
+def test_a_host_that_cannot_resume_is_attached_the_old_way(
+    require_mux, zmx_log, attach_log, tmp_path, host
+):
+    """An un-upgraded daemon ignores the init message that asks to resume - and
+    a mirror it never registered as a mirror is a client that can take the pty
+    size, i.e. resize the terminal someone is working in. So the mux must find
+    out before attaching, not after.
+    """
+    client = MuxClient(
+        zmx_log, tmp_path, attach_log=attach_log,
+        extra_env={**host.env(), "FAKE_ZMX_NO_EPOCH": "1"},
+    )
+    try:
+        ready = client.open_session(1, "quiet-alpha", epoch=4242, offset=1234)
+        assert not ready.continued
+        assert resume_calls(attach_log) == [], "resume was requested from a host without it"
+        # And it still works: a plain mirror attach, exactly as before.
+        client.expect(lambda f: f.type == OUT and f.sid == 1 and b"quiet-alpha" in f.payload)
+    finally:
+        client.shutdown()
+
+
+def test_the_snapshot_cap_reaches_the_host(mux, attach_log):
+    """A snapshot the client falls back to must not be the whole scrollback
+    either - that is the case this whole path exists to stop being expensive."""
+    mux.open_session(1, "quiet-alpha")
+    tails = [c for c in read_calls(attach_log) if c.startswith("tail ")]
+    assert tails, "the mux attached without capping the snapshot"
+    assert int(tails[0].split()[2]) > 0
+
+
+def test_no_output_reaches_the_client_before_the_ready_that_explains_it(mux):
+    """READY says whether what follows continues the client's screen or replaces
+    it. Output arriving first would be applied under the wrong assumption."""
+    mux.send(muxproto.open_frame(1, "quiet-alpha"))
+    frames = mux.collect(1.0)
+    for_slot = [f for f in frames if f.sid == 1]
+    assert for_slot, "session produced nothing"
+    assert for_slot[0].type == muxproto.READY, f"first frame was {for_slot[0]}"
+
+
+def test_a_host_too_old_to_answer_still_readies_the_slot(
+    require_mux, zmx_log, attach_log, tmp_path, host
+):
+    """An un-upgraded PC must degrade to "your screen is stale", not to a
+    terminal that never opens."""
+    client = MuxClient(
+        zmx_log, tmp_path, attach_log=attach_log,
+        extra_env={**host.env(), "FAKE_ZMX_SILENT_RESUME": "1"},
+    )
+    try:
+        client.send(muxproto.open_frame(1, "quiet-alpha"))
+        frame = client.expect(
+            lambda f: f.type == muxproto.READY and f.sid == 1, timeout=6.0
+        )
+        ready = muxproto.decode_ready(frame.payload)
+        assert not ready.continued
+        assert ready.name == "quiet-alpha"
+    finally:
+        client.shutdown()
 
 
 # ---------- the host's own state, on the control slot ----------

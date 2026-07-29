@@ -87,4 +87,24 @@ def test_focus_payload_round_trips_the_grid():
 
 def test_open_carries_a_utf8_session_name():
     (frame,) = read_all([muxproto.open_frame(2, "会话-å")])
-    assert frame.payload.decode("utf-8") == "会话-å"
+    assert frame.payload[muxproto.OPEN_HEADER.size:].decode("utf-8") == "会话-å"
+
+
+def test_open_declares_the_clients_cursor_ahead_of_the_name():
+    (frame,) = read_all([muxproto.open_frame(3, "alpha", epoch=9, offset=4096, tail_rows=200)])
+    epoch, offset, tail = muxproto.OPEN_HEADER.unpack_from(frame.payload, 0)
+    assert (epoch, offset, tail) == (9, 4096, 200)
+    assert frame.payload[muxproto.OPEN_HEADER.size:] == b"alpha"
+
+
+def test_ready_answers_with_the_mode_and_the_cursor():
+    wire = muxproto.encode(
+        muxproto.READY, 2,
+        muxproto.READY_HEADER.pack(muxproto.RESUME_CONTINUED, 9, 4096, 512) + b"alpha",
+    )
+    (frame,) = read_all([wire])
+    ready = muxproto.decode_ready(frame.payload)
+    assert (ready.continued, ready.epoch, ready.offset, ready.name) == (True, 9, 4096, "alpha")
+    # The bytes about to arrive that [offset] already counts. Counting them again
+    # is what puts a client's cursor past the stream, permanently unresumable.
+    assert ready.replay_bytes == 512

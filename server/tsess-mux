@@ -24,9 +24,17 @@ Protocol (see server/tests/muxproto.py, which is the spec the tests speak):
 
     | type:1 | sid:1 | length:4 big-endian | payload |
 
-    client -> mux   OPEN(name) CLOSE INPUT(bytes) FOCUS(cols,rows)
-    mux -> client   READY(name) OUTPUT(bytes) ENDED(reason) ERROR(message)
+    client -> mux   OPEN(epoch,offset,tail,name) CLOSE INPUT(bytes) FOCUS(cols,rows)
+    mux -> client   READY(mode,epoch,offset,replay,name) OUTPUT(bytes) ENDED ERROR
     mux -> client   SESSIONS(tsv) ACTIVITY(names)      -- slot 0 only
+
+OPEN carries what the client already holds of that session, and READY answers
+with what the host did about it: `continued` means the OUTPUT frames that follow
+pick up exactly where the client left off, `snapshot` means they replace its
+screen. The client counts OUTPUT bytes from the offset in READY - skipping the
+first `replay` of them, which the offset already accounts for - and that count is
+the cursor it saves. Which is why nothing but session output may ever be carried
+in an OUTPUT frame.
 """
 
 from __future__ import annotations
@@ -34,6 +42,7 @@ from __future__ import annotations
 import errno
 import os
 import pty
+import re
 import select
 import shlex
 import signal
@@ -62,6 +71,24 @@ SESSIONS = 0x85
 ACTIVITY = 0x86
 
 CONTROL_SLOT = 0
+
+# READY modes, mirroring zmx's ResumeStatus.
+RESUME_SNAPSHOT = 0
+RESUME_CONTINUED = 1
+
+# `| epoch:8 | offset:8 | tail_rows:4 |` before the session name in OPEN.
+OPEN_HEADER = struct.Struct(">QQI")
+# `| mode:1 | epoch:8 | offset:8 | replay:8 |` before the session name in READY.
+READY_HEADER = struct.Struct(">BQQQ")
+
+# How long the mux waits for zmx to report what it did with the resume request
+# before giving up and telling the client its screen is stale. Only ever hit by
+# a zmx too old to answer, in which case "assume stale" is the safe reading.
+RESUME_REPORT_TIMEOUT_S = 3.0
+
+# Scrollback rows a snapshot may carry. The phone keeps its own history; this
+# only has to cover the screen it will show plus a little to scroll into.
+SNAPSHOT_TAIL_ROWS = 200
 
 HEADER = struct.Struct(">BBI")
 MAX_PAYLOAD = 1 << 20
@@ -92,6 +119,10 @@ SESSION_LIST_INTERVAL_S = 5.0
 
 # Retry delay for a status command that could not be started at all.
 SPAWN_RETRY_S = 5.0
+
+# Asking one daemon whether it can resume. Short: it is a unix socket round trip
+# on the same machine, and a session open waits on it.
+DAEMON_PROBE_TIMEOUT_S = 2.0
 
 
 def zmx_environment() -> dict[str, str]:
@@ -325,18 +356,32 @@ class SessionStatus:
 class Session:
     """One attached session: its mirror client, its pty, and its backlog."""
 
-    def __init__(self, sid: int, name: str, proc: subprocess.Popen, master_fd: int):
+    def __init__(self, sid: int, name: str, proc: subprocess.Popen, master_fd: int,
+                 err_fd: int):
         self.sid = sid
         self.name = name
         self.proc = proc
         self.master_fd = master_fd
+        # zmx reports what it did with the resume request here. Kept off the pty
+        # deliberately: stdout is the terminal stream, and a control line in it
+        # would be rendered as terminal output on the phone.
+        self.err_fd = err_fd
+        self.err_open = True
+        self.errbuf = bytearray()
         self.outbuf = bytearray()
+        # Nothing may leave for the client until READY says whether what follows
+        # continues its screen or replaces it.
+        self.ready_sent = False
+        self.ready_deadline = time.monotonic() + RESUME_REPORT_TIMEOUT_S
         # Only a session that claimed the pty size has anything to hand back.
         self.claimed = False
 
     @property
     def backlogged(self) -> bool:
         return len(self.outbuf) >= SESSION_BUFFER_LIMIT
+
+
+RESUME_LINE = re.compile(rb"zmx-resume mode=(\w+) epoch=(\d+) offset=(\d+) bytes=(\d+)")
 
 
 class Mux:
@@ -392,6 +437,31 @@ class Mux:
 
     # ---------- sessions ----------
 
+    def daemon_epoch(self, name: str) -> int | None:
+        """The session daemon's resume epoch, or None if it has no such thing.
+
+        A daemon older than the resume patches ignores the init message that
+        asks for one, and a mirror it never registered as a mirror is a client
+        that can take the pty size - i.e. resize the terminal someone is working
+        in. So capability is checked before attaching, not assumed and repaired
+        afterwards. One short-lived process per session open, which is already
+        the most expensive thing that happens there.
+        """
+        try:
+            out = subprocess.run(
+                self.zmx + ["stat", name], capture_output=True, text=True,
+                env=self.zmx_env, timeout=DAEMON_PROBE_TIMEOUT_S,
+            ).stdout
+        except (OSError, subprocess.SubprocessError):
+            return None
+        for field in out.split():
+            if field.startswith("epoch="):
+                try:
+                    return int(field.split("=", 1)[1])
+                except ValueError:
+                    return None
+        return None
+
     def open_session(self, sid: int, payload: bytes) -> None:
         if sid in self.sessions:
             self.queue(ERROR, sid, b"session slot already in use")
@@ -399,6 +469,18 @@ class Mux:
         if sid == 0:
             self.queue(ERROR, sid, b"slot 0 is reserved")
             return
+        # `| epoch:8 | offset:8 | tail:4 | name |`; a bare name is a client that
+        # holds nothing and wants the session from scratch.
+        epoch = offset = 0
+        tail_rows = SNAPSHOT_TAIL_ROWS
+        if len(payload) >= OPEN_HEADER.size:
+            epoch, offset, tail_rows = OPEN_HEADER.unpack_from(payload, 0)
+            payload = payload[OPEN_HEADER.size:]
+        # A client that names no cap gets ours rather than the daemon's whole
+        # scrollback: "unlimited" is never what a phone wants, and a build that
+        # forgets to ask should not be the one that pays for it.
+        if tail_rows <= 0:
+            tail_rows = SNAPSHOT_TAIL_ROWS
         try:
             name = payload.decode("utf-8")
         except UnicodeDecodeError:
@@ -414,23 +496,38 @@ class Mux:
             tty.setraw(slave_fd, termios.TCSANOW)
         except termios.error:
             pass
+        resumable = self.daemon_epoch(name) is not None
+        attach_args = ["attach", "--mirror"]
+        if resumable:
+            attach_args += ["--resume", f"{epoch}:{offset}", "--tail", str(tail_rows)]
+        attach_args.append(name)
+
+        err_r, err_w = os.pipe()
         try:
             proc = subprocess.Popen(
-                self.zmx + ["attach", "--mirror", name],
-                stdin=slave_fd, stdout=slave_fd, stderr=slave_fd,
+                self.zmx + attach_args,
+                stdin=slave_fd, stdout=slave_fd, stderr=err_w,
                 env=self.zmx_env, close_fds=True,
             )
         except OSError as exc:
-            os.close(master_fd)
-            os.close(slave_fd)
+            for fd in (master_fd, slave_fd, err_r, err_w):
+                os.close(fd)
             self.queue(ERROR, sid, f"cannot attach: {exc}".encode())
             return
         os.close(slave_fd)
+        os.close(err_w)
         os.set_blocking(master_fd, False)
+        os.set_blocking(err_r, False)
 
-        self.sessions[sid] = Session(sid, name, proc, master_fd)
-        self.turn_order.append(sid)
-        self.queue(READY, sid, name.encode("utf-8"))
+        # READY waits for zmx to say what it did; see [read_session_err]. Until
+        # then the slot is not in turn_order, so none of its output can precede
+        # the answer the client needs in order to interpret it.
+        session = Session(sid, name, proc, master_fd, err_r)
+        self.sessions[sid] = session
+        if not resumable:
+            # An older daemon: it will send the session's whole picture, the way
+            # it always has. Nothing to wait for, and nothing the client can keep.
+            self.send_ready(session, RESUME_SNAPSHOT, 0, 0)
 
     def write_to_session(self, session: Session, data: bytes) -> None:
         try:
@@ -458,6 +555,7 @@ class Mux:
             self.turn_order.remove(session.sid)
         # Anything still buffered belongs to a session the client has let go of.
         session.outbuf.clear()
+        self.close_err(session)
         try:
             os.close(session.master_fd)
         except OSError:
@@ -541,6 +639,69 @@ class Mux:
             del self.pending_out[:written]
         return True
 
+    def read_session_err(self, session: Session) -> None:
+        """zmx's control channel: one `zmx-resume` line, then whatever it logs.
+
+        The resume line is what READY is waiting on, so this is also where a
+        session becomes eligible to send output at all.
+        """
+        try:
+            data = os.read(session.err_fd, 4096)
+        except BlockingIOError:
+            return
+        except OSError:
+            data = b""
+        if not data:
+            # zmx closed its control channel. If it never answered, it is too old
+            # to know about resuming, and a stream that cannot say otherwise has
+            # to be read as a snapshot.
+            self.close_err(session)
+            if not session.ready_sent:
+                self.send_ready(session, RESUME_SNAPSHOT, 0, 0)
+            return
+
+        session.errbuf.extend(data)
+        match = RESUME_LINE.search(session.errbuf)
+        if match and not session.ready_sent:
+            mode = (RESUME_CONTINUED if match.group(1) == b"continued"
+                    else RESUME_SNAPSHOT)
+            self.send_ready(session, mode, int(match.group(2)), int(match.group(3)),
+                            int(match.group(4)))
+        # Anything else zmx says belongs in our own stderr, not the terminal.
+        # Drained whether or not anyone is listening: an unread pipe fills, and
+        # a zmx blocked writing to it is a terminal that has stopped.
+        while b"\n" in session.errbuf:
+            line, _, rest = session.errbuf.partition(b"\n")
+            session.errbuf = bytearray(rest)
+            if line.strip() and not RESUME_LINE.search(line):
+                print(f"tsess-mux: {session.name}: {line.decode('utf-8', 'replace')}",
+                      file=sys.stderr)
+
+    def close_err(self, session: Session) -> None:
+        if not session.err_open:
+            return
+        session.err_open = False
+        try:
+            os.close(session.err_fd)
+        except OSError:
+            pass
+
+    def send_ready(self, session: Session, mode: int, epoch: int, offset: int,
+                   replay_bytes: int = 0) -> None:
+        session.ready_sent = True
+        self.queue(READY, session.sid,
+                   READY_HEADER.pack(mode, epoch, offset, replay_bytes)
+                   + session.name.encode("utf-8"))
+        if session.sid not in self.turn_order:
+            self.turn_order.append(session.sid)
+
+    def expire_pending_ready(self) -> None:
+        """A zmx that neither answers nor exits must not hold a terminal blank."""
+        now = time.monotonic()
+        for session in list(self.sessions.values()):
+            if not session.ready_sent and now >= session.ready_deadline:
+                self.send_ready(session, RESUME_SNAPSHOT, 0, 0)
+
     def read_session(self, session: Session) -> None:
         try:
             data = os.read(session.master_fd, CHUNK_BYTES)
@@ -580,6 +741,9 @@ class Mux:
                 read_fds.extend(
                     s.master_fd for s in self.sessions.values() if not s.backlogged
                 )
+                read_fds.extend(
+                    s.err_fd for s in self.sessions.values() if s.err_open
+                )
                 write_fds = [1] if self.pending_out else []
 
                 if not read_fds and not write_fds and not self.sessions:
@@ -611,8 +775,12 @@ class Mux:
                     self.parse_input()
 
                 for session in list(self.sessions.values()):
+                    if session.err_open and session.err_fd in readable:
+                        self.read_session_err(session)
+                for session in list(self.sessions.values()):
                     if session.master_fd in readable:
                         self.read_session(session)
+                self.expire_pending_ready()
 
                 self.status.on_readable(readable)
                 self.pump_status()
