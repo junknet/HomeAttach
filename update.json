@@ -1,8 +1,8 @@
 {
-  "versionCode": 13,
-  "versionName": "1.2.0",
-  "apkUrl": "https://github.com/junknet/HomeAttach/releases/download/v1.2.0/app-release.apk",
+  "versionCode": 14,
+  "versionName": "1.3.0",
+  "apkUrl": "https://github.com/junknet/HomeAttach/releases/download/v1.3.0/app-release.apk",
   "sha256": "52476c50ec85f3cb9f74ccd9be0b89b01540f6c0bd3835645398e26da8042f31",
   "sizeBytes": 28972144,
-  "notes": "Update the PC first (run server/install.sh) - this build needs the new tsess-mux and zmx there. Every session now reports its own activity on one channel, reconnecting no longer wipes the screen, and output no longer steals the scroll."
+  "notes": "Update the PC first (run server/install.sh). Reopening the app now continues each session from where it was instead of re-downloading and re-rendering all of it - measured 120 bytes instead of 44KB on a real session."
 }
