@@ -280,8 +280,8 @@ class MuxClient:
                 return out
 
     def open_session(self, sid: int, name: str, epoch: int = 0, offset: int = 0,
-                     tail_rows: int = 0) -> muxproto.Ready:
-        self.send(muxproto.open_frame(sid, name, epoch, offset, tail_rows))
+                     tail_rows: int = 0, cols: int = 0, rows: int = 0) -> muxproto.Ready:
+        self.send(muxproto.open_frame(sid, name, epoch, offset, tail_rows, cols, rows))
         frame = self.expect(lambda f: f.type == muxproto.READY and f.sid == sid)
         return muxproto.decode_ready(frame.payload)
 

@@ -2,6 +2,9 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- Read-only: tells the auto-updater whether it is on someone's cellular data before it
+         spends 28MB of it. Normal permission, never prompts. -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
     <!-- Holds the process while a terminal is attached, so leaving the app does not drop the SSH
          channel. See TerminalService for why the type is specialUse and not dataSync. -->

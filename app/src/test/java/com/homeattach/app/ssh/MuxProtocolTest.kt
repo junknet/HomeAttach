@@ -29,8 +29,8 @@ class MuxProtocolTest {
     fun `open frame matches the host encoder`() {
         assertArrayEquals(
             byteArrayOf(
-                1, 1, 0, 0, 0, 31,
-                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                1, 1, 0, 0, 0, 35,
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
                 113, 117, 105, 101, 116, 45, 97, 108, 112, 104, 97,
             ),
             MuxProtocol.open(1, "quiet-alpha"),
@@ -41,8 +41,8 @@ class MuxProtocolTest {
     fun `open frame encodes a non-ascii session name as utf8`() {
         assertArrayEquals(
             byteArrayOf(
-                1, 2, 0, 0, 0, 29,
-                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                1, 2, 0, 0, 0, 33,
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
                 -28, -68, -102, -24, -81, -99, 45, -61, -91,
             ),
             MuxProtocol.open(2, "会话-å"),
@@ -165,16 +165,31 @@ class MuxProtocolTest {
     // ---------- resuming a session the phone already holds ----------
 
     @Test
-    fun `open declares the cursor ahead of the name`() {
-        val wire = MuxProtocol.open(3, "alpha", epoch = 9, offset = 4096, tailRows = 200)
+    fun `open declares the cursor and the grid ahead of the name`() {
+        val wire = MuxProtocol.open(
+            3, "alpha", epoch = 9, offset = 4096, tailRows = 200, columns = 60, rows = 50,
+        )
         val payload = drain(MuxFrameReader(), wire).single().payload
 
         assertArrayEquals(
-            // epoch 9, offset 4096 (0x1000), tail 200 (0xC8), big-endian throughout
-            byteArrayOf(0, 0, 0, 0, 0, 0, 0, 9, 0, 0, 0, 0, 0, 0, 0x10, 0, 0, 0, 0, 0xC8.toByte()),
+            // epoch 9, offset 4096 (0x1000), tail 200 (0xC8), 60x50 - big-endian throughout
+            byteArrayOf(
+                0, 0, 0, 0, 0, 0, 0, 9,
+                0, 0, 0, 0, 0, 0, 0x10, 0,
+                0, 0, 0, 0xC8.toByte(),
+                0, 60, 0, 50,
+            ),
             payload.copyOfRange(0, MuxProtocol.OPEN_HEADER_BYTES),
         )
         assertEquals("alpha", String(payload, MuxProtocol.OPEN_HEADER_BYTES, 5))
+    }
+
+    @Test
+    fun `a session that is not on screen declares no grid`() {
+        // A size in this frame is a claim. From a backgrounded session that would resize the
+        // terminal the user is actually looking at.
+        val payload = drain(MuxFrameReader(), MuxProtocol.open(1, "alpha")).single().payload
+        assertArrayEquals(byteArrayOf(0, 0, 0, 0), payload.copyOfRange(20, 24))
     }
 
     @Test

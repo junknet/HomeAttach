@@ -91,9 +91,13 @@ def test_open_carries_a_utf8_session_name():
 
 
 def test_open_declares_the_clients_cursor_ahead_of_the_name():
-    (frame,) = read_all([muxproto.open_frame(3, "alpha", epoch=9, offset=4096, tail_rows=200)])
-    epoch, offset, tail = muxproto.OPEN_HEADER.unpack_from(frame.payload, 0)
+    (frame,) = read_all([
+        muxproto.open_frame(3, "alpha", epoch=9, offset=4096, tail_rows=200, cols=60, rows=50)
+    ])
+    epoch, offset, tail, cols, rows = muxproto.OPEN_HEADER.unpack_from(frame.payload, 0)
     assert (epoch, offset, tail) == (9, 4096, 200)
+    # The grid it will be shown at, so the host can take that size before it draws.
+    assert (cols, rows) == (60, 50)
     assert frame.payload[muxproto.OPEN_HEADER.size:] == b"alpha"
 
 

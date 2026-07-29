@@ -106,6 +106,7 @@ class TerminalAttachment(
     private var finished = false
 
     private val slot = AtomicReference<TerminalMux.Slot?>(null)
+    private val attached = AtomicBoolean(false)
 
     // Declared above [init]: Kotlin initializes properties in declaration order, and the restore
     // that init kicks off posts to this.
@@ -137,6 +138,9 @@ class TerminalAttachment(
         onResize = { columns, rows ->
             val size = RemoteTerminalSize(columns, rows)
             val previous = measuredSize.getAndSet(size)
+            // The first measurement is what the attach was waiting for.
+            if (previous == null) attachOnce()
+            if (foreground.get()) declareGrid(size)
             // Only the visible terminal drives the remote size — a mirror attach never owns it, so
             // for a backgrounded session there is nothing to send. And only on a real change: the
             // IME opening and closing re-measures the grid constantly, and re-claiming on every one
@@ -165,11 +169,38 @@ class TerminalAttachment(
         // phone, so there is nothing to wait for, and it is what makes reopening the app feel like
         // returning to a terminal rather than loading one.
         restoreSavedScreen()
+        // Attaching waits for the first layout - see [attachOnce]. If the grid never arrives
+        // (the screen was left before it measured) nothing was attached and nothing leaks.
+        mainHandler.postDelayed({ attachOnce() }, ATTACH_WITHOUT_GRID_MS)
+    }
+
+    /**
+     * Attaches to the host, once, carrying the grid this terminal will be drawn at.
+     *
+     * Deliberately not in [init]: the picture the host sends back is serialized for whatever width
+     * it believes the terminal is, and painting a picture made at the PC's width onto the phone's
+     * wraps lines differently - which shifts everything below them and leaves the snapshot's own
+     * cursor pointing at a line of content that the next output then overwrites. Waiting the one
+     * frame it takes to measure the grid means the host is told the size first and the picture
+     * arrives already correct.
+     *
+     * The wait is bounded: a session that somehow never measures still attaches, just without the
+     * size, which is the behaviour this replaced.
+     */
+    private fun attachOnce() {
+        if (released.get() || !attached.compareAndSet(false, true)) return
+        val size = measuredSize.get()
+        val claim = size?.takeIf { foreground.get() }
         val registered = TerminalMux.register(
             config,
             sessionName,
             muxListener,
-            MuxResume(epoch = epoch.get(), offset = cursor.get()),
+            MuxResume(
+                epoch = epoch.get(),
+                offset = cursor.get(),
+                columns = claim?.columns ?: 0,
+                rows = claim?.rows ?: 0,
+            ),
         )
         if (registered == null) {
             moveTo(AttachStatus.Failed(NO_FREE_SLOT, FailureCause.HOST_SETUP))
@@ -186,7 +217,17 @@ class TerminalAttachment(
      */
     fun setForeground(value: Boolean) {
         if (foreground.getAndSet(value) == value) return
+        // The declared grid follows the foreground. A slot is re-opened on every reconnect, and a
+        // size in that frame is a claim: from a session nobody is looking at, that would resize the
+        // terminal the user *is* looking at.
+        declareGrid(if (value) measuredSize.get() else null)
         if (value) claimFocus()
+    }
+
+    private fun declareGrid(size: RemoteTerminalSize?) {
+        slot.get()?.let {
+            it.resume = it.resume.copy(columns = size?.columns ?: 0, rows = size?.rows ?: 0)
+        }
     }
 
     /**
@@ -265,7 +306,7 @@ class TerminalAttachment(
         if (live != 0L) store.append(sessionName, live, at, data)
         // The slot carries the cursor so a reconnect asks to continue from where the terminal
         // actually is, not from where this attachment started.
-        slot.get()?.resume = MuxResume(epoch = live, offset = at)
+        slot.get()?.let { it.resume = it.resume.copy(epoch = live, offset = at) }
         terminal.appendRemoteOutput(data, 0, data.size)
     }
 
@@ -345,5 +386,8 @@ class TerminalAttachment(
         const val NO_FREE_SLOT = "too many terminals open"
         const val STORE_DIR = "session-stream"
         const val RESTORE_RETRY_MS = 16L
+
+        /** How long the attach waits for a grid before going without one. Two frames. */
+        const val ATTACH_WITHOUT_GRID_MS = 32L
     }
 }

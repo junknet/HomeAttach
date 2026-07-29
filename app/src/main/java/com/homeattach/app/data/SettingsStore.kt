@@ -74,6 +74,13 @@ class SettingsStore(context: Context) {
         prefs.edit().putInt(KEY_FONT_PX, px).apply()
     }
 
+    /** When the app last asked whether a newer version exists; 0 if it never has. */
+    fun loadLastUpdateCheck(): Long = prefs.getLong(KEY_LAST_UPDATE_CHECK, 0L)
+
+    fun saveLastUpdateCheck(atMillis: Long) {
+        prefs.edit().putLong(KEY_LAST_UPDATE_CHECK, atMillis).apply()
+    }
+
     fun loadMaxImeHeight(default: Int): Int = prefs.getInt(KEY_MAX_IME_HEIGHT, default)
 
     fun saveMaxImeHeight(height: Int) {
@@ -87,5 +94,6 @@ class SettingsStore(context: Context) {
         private const val KEY_KEY_PEM = "key_pem"
         private const val KEY_FONT_PX = "terminal_font_px"
         private const val KEY_MAX_IME_HEIGHT = "max_ime_height"
+        private const val KEY_LAST_UPDATE_CHECK = "last_update_check"
     }
 }

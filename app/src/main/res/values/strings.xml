@@ -49,6 +49,11 @@
     <string name="settings_update_installer_opened">System installer opened</string>
     <string name="settings_update_permission_opened">Enable install permission, then tap Install update again</string>
     <string name="settings_update_failure">Update failed: %1$s</string>
+    <string name="update_banner_downloading">Downloading update %1$s…</string>
+    <string name="update_banner_ready">Update %1$s ready</string>
+    <string name="update_banner_available">Update %1$s available (%2$s)</string>
+    <string name="update_banner_install">Install</string>
+    <string name="update_banner_download">Download</string>
 
     <!-- QR Scanner strings -->
     <string name="settings_scan_qr">Scan QR Code</string>

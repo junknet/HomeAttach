@@ -15,6 +15,7 @@ import androidx.compose.animation.ExitTransition
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.Surface
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
@@ -23,7 +24,11 @@ import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navArgument
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.homeattach.app.data.SettingsStore
+import com.homeattach.app.update.AutoUpdate
 import com.homeattach.app.ui.SessionListScreen
 import com.homeattach.app.ui.SettingsScreen
 import com.homeattach.app.ui.TerminalScreen
@@ -83,6 +88,17 @@ fun HomeAttachApp() {
     val context = LocalContext.current
     val settingsStore = remember { SettingsStore(context) }
     val startDestination = if (settingsStore.isConfigured()) ROUTE_SESSIONS else ROUTE_SETTINGS
+
+    // The app is sideloaded, so nothing else will ever tell the user a version exists. Checking is
+    // the app's own job, on every return to the foreground and throttled inside [AutoUpdate].
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_START) AutoUpdate.refresh(context, settingsStore)
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
 
     // Instant transitions: the default crossfade alpha-blends the light list against the dark
     // terminal, producing a one-frame washed-out flash on enter/session-switch. A hard cut avoids it.

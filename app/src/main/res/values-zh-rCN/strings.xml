@@ -50,4 +50,9 @@
     <string name="settings_update_installer_opened">已打开系统安装器</string>
     <string name="settings_update_permission_opened">打开安装权限后，再点一次安装更新</string>
     <string name="settings_update_failure">更新失败:%1$s</string>
+    <string name="update_banner_downloading">正在下载更新 %1$s…</string>
+    <string name="update_banner_ready">更新 %1$s 已就绪</string>
+    <string name="update_banner_available">有新版本 %1$s（%2$s）</string>
+    <string name="update_banner_install">安装</string>
+    <string name="update_banner_download">下载</string>
 </resources>

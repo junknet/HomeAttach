@@ -98,7 +98,12 @@ down, plus SESSIONS/ACTIVITY down on slot 0. Any change must land in all three, 
 - `app/.../ssh/MuxProtocol.kt` + `MuxConnection.kt` (client).
 - `server/tests/muxproto.py` + `test_tsess_mux.py`.
 
-OPEN declares what the phone already holds of that session (`epoch|offset|tailRows`) and READY
+OPEN declares what the phone already holds of that session (`epoch|offset|tailRows`) plus the grid
+it will be drawn at (`cols|rows`, zero unless this session is the one on screen — a size there is a
+claim, and a backgrounded session claiming would resize the terminal the user is looking at). The
+host takes that size before it draws, because a picture serialized at the PC's width and painted at
+the phone's wraps differently, which shifts every line below and leaves the picture's own trailing
+cursor pointing at content the next output overwrites — measured at 5 lines lost per attach. READY
 answers with what the host did (`mode|epoch|offset|replayBytes`). The phone's cursor is READY's
 offset plus every OUTPUT byte beyond the first `replayBytes` of them — replay is content the
 offset already counts, and counting it again puts the cursor past the stream, after which the host

@@ -18,8 +18,9 @@ frames that belong to the connection rather than to a session, so an ERROR with
 no session context has somewhere to go.
 
 OPEN carries what the client already holds of that session - the daemon epoch
-its bytes came from and how many of them it has - and READY answers with what
-the host did about it. `continued` means the OUTPUT frames that follow pick up
+its bytes came from and how many of them it has - plus the grid it will show it
+at, if this terminal is the one on screen. READY answers with what the host did
+about it. `continued` means the OUTPUT frames that follow pick up
 exactly where the client left off; `snapshot` means they replace its screen. The
 client's cursor is the offset in READY plus every OUTPUT byte it then receives
 beyond the first `replay` of them, which the offset already accounts for. Which
@@ -64,8 +65,8 @@ CONNECTION_SLOT = 0
 HEADER = struct.Struct(">BBI")
 HEADER_LEN = HEADER.size
 
-# `| epoch:8 | offset:8 | tail_rows:4 |` ahead of the name in OPEN.
-OPEN_HEADER = struct.Struct(">QQI")
+# `| epoch:8 | offset:8 | tail_rows:4 | cols:2 | rows:2 |` ahead of the name in OPEN.
+OPEN_HEADER = struct.Struct(">QQIHH")
 # `| mode:1 | epoch:8 | offset:8 | replay:8 |` ahead of the name in READY.
 READY_HEADER = struct.Struct(">BQQQ")
 
@@ -98,12 +99,18 @@ def encode(type_: int, sid: int, payload: bytes = b"") -> bytes:
 
 
 def open_frame(sid: int, session_name: str, epoch: int = 0, offset: int = 0,
-               tail_rows: int = 0) -> bytes:
-    """Open a slot, declaring what the client already holds of that session."""
+               tail_rows: int = 0, cols: int = 0, rows: int = 0) -> bytes:
+    """Open a slot, declaring what the client already holds of that session.
+
+    A non-zero grid means "this terminal is on screen and its size is mine" - the
+    host takes it before it draws anything, so the picture it sends is made for
+    the geometry it will be shown at.
+    """
     return encode(
         OPEN,
         sid,
-        OPEN_HEADER.pack(epoch, offset, tail_rows) + session_name.encode("utf-8"),
+        OPEN_HEADER.pack(epoch, offset, tail_rows, cols, rows)
+        + session_name.encode("utf-8"),
     )
 
 

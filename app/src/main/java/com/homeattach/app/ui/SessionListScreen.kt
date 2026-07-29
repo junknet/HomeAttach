@@ -81,6 +81,8 @@ import com.homeattach.app.ssh.SessionsSnapshot
 import com.homeattach.app.ssh.createRemoteSession
 import com.homeattach.app.ssh.killRemoteSession
 import com.homeattach.app.ui.theme.MonoBody
+import com.homeattach.app.update.AutoUpdate
+import com.homeattach.app.update.AutoUpdateState
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -350,12 +352,12 @@ fun SessionListScreen(
                 }
             },
         ) { padding ->
+        Column(modifier = Modifier.padding(padding)) {
+        UpdateBanner()
         PullToRefreshBox(
             isRefreshing = isRefreshing,
             onRefresh = { refresh() },
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(padding),
+            modifier = Modifier.fillMaxSize(),
         ) {
             when (val s = snapshot) {
                 is SessionsSnapshot.Loading -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
@@ -409,6 +411,7 @@ fun SessionListScreen(
                     }
                 }
             }
+        }
         }
     }
     }
@@ -660,4 +663,74 @@ private fun StatusChip(session: RemoteSession, modifier: Modifier = Modifier) {
             modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
         )
     }
+}
+
+/**
+ * What the auto-updater is doing, and the one tap Android insists on.
+ *
+ * On the list rather than in the terminal, and only here: this is the screen where nothing is
+ * running, so it is the one place an installer dialog cannot land on top of someone's work. A
+ * ready update opens that dialog by itself the first time it is seen — the point of checking
+ * automatically is not having to remember to.
+ */
+@Composable
+private fun UpdateBanner() {
+    val context = LocalContext.current
+    val state by AutoUpdate.state.collectAsStateWithLifecycle()
+
+    LaunchedEffect(state) {
+        if (state is AutoUpdateState.Ready) AutoUpdate.offerInstall(context)
+    }
+
+    val (message, action, onAction) = when (val s = state) {
+        is AutoUpdateState.Idle -> return
+        is AutoUpdateState.Downloading -> Triple(
+            stringResource(R.string.update_banner_downloading, s.update.tagName),
+            null,
+            null,
+        )
+        is AutoUpdateState.Ready -> Triple(
+            stringResource(R.string.update_banner_ready, s.downloaded.update.tagName),
+            stringResource(R.string.update_banner_install),
+            { AutoUpdate.offerInstall(context); Unit },
+        )
+        is AutoUpdateState.Available -> Triple(
+            // Found but not fetched: this connection is someone's cellular data.
+            stringResource(
+                R.string.update_banner_available,
+                s.update.tagName,
+                formatBytes(s.update.assetSizeBytes),
+            ),
+            stringResource(R.string.update_banner_download),
+            { AutoUpdate.download(context) },
+        )
+    }
+
+    Surface(
+        color = MaterialTheme.colorScheme.primaryContainer,
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                text = message,
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onPrimaryContainer,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f),
+            )
+            if (action != null && onAction != null) {
+                TextButton(onClick = onAction) { Text(action) }
+            }
+        }
+    }
+}
+
+private fun formatBytes(bytes: Long): String = when {
+    bytes >= 1024 * 1024 -> "%.1f MB".format(bytes / (1024.0 * 1024.0))
+    bytes > 0 -> "%d KB".format(bytes / 1024)
+    else -> "?"
 }

@@ -213,6 +213,8 @@ internal object TerminalMux {
             epoch = resume.epoch,
             offset = resume.offset,
             tailRows = resume.tailRows,
+            columns = resume.columns,
+            rows = resume.rows,
         )
     }
 
@@ -403,6 +405,14 @@ internal data class MuxResume(
     val epoch: Long = 0,
     val offset: Long = 0,
     val tailRows: Int = SNAPSHOT_TAIL_ROWS,
+    /**
+     * The grid this session will be shown at, or 0x0 when it is not the one on screen. Sent so the
+     * host can take the size before drawing: a picture made at the PC's width and painted at the
+     * phone's wraps differently, which shifts every line below it and leaves the snapshot's own
+     * cursor pointing at content the next output then overwrites.
+     */
+    val columns: Int = 0,
+    val rows: Int = 0,
 ) {
     companion object {
         /**

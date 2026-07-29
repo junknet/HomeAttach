@@ -41,8 +41,8 @@ internal object MuxProtocol {
     const val CONNECTION_SLOT = 0
     const val HEADER_BYTES = 6
 
-    /** `epoch:8 | offset:8 | tailRows:4` ahead of the name in OPEN. */
-    const val OPEN_HEADER_BYTES = 20
+    /** `epoch:8 | offset:8 | tailRows:4 | cols:2 | rows:2` ahead of the name in OPEN. */
+    const val OPEN_HEADER_BYTES = 24
 
     /** `mode:1 | epoch:8 | offset:8 | replayBytes:8` ahead of the name in READY. */
     const val READY_HEADER_BYTES = 25
@@ -76,6 +76,12 @@ internal object MuxProtocol {
     /**
      * [epoch]/[offset] are what this phone already holds of the session; 0/0 means nothing.
      * [tailRows] caps the scrollback a snapshot may carry when the host cannot continue.
+     *
+     * [columns]/[rows] are the grid this terminal will be shown at, and are sent only by the
+     * session actually on screen: the host takes that size before it draws anything, so the
+     * picture it sends is made for the geometry it will be drawn at. A backgrounded session must
+     * send zeros - claiming a size it is not showing would resize the terminal the user is looking
+     * at, which is the thing this whole design exists to prevent.
      */
     fun open(
         sid: Int,
@@ -83,14 +89,23 @@ internal object MuxProtocol {
         epoch: Long = 0,
         offset: Long = 0,
         tailRows: Int = 0,
+        columns: Int = 0,
+        rows: Int = 0,
     ): ByteArray {
         val name = sessionName.toByteArray(Charsets.UTF_8)
         val payload = ByteArray(OPEN_HEADER_BYTES + name.size)
         writeLong(payload, 0, epoch)
         writeLong(payload, 8, offset)
         writeInt(payload, 16, tailRows)
+        writeShort(payload, 20, columns)
+        writeShort(payload, 22, rows)
         name.copyInto(payload, OPEN_HEADER_BYTES)
         return encode(OPEN, sid, payload)
+    }
+
+    private fun writeShort(target: ByteArray, at: Int, value: Int) {
+        target[at] = (value ushr 8).toByte()
+        target[at + 1] = value.toByte()
     }
 
     private fun writeLong(target: ByteArray, at: Int, value: Long) {

@@ -76,8 +76,8 @@ CONTROL_SLOT = 0
 RESUME_SNAPSHOT = 0
 RESUME_CONTINUED = 1
 
-# `| epoch:8 | offset:8 | tail_rows:4 |` before the session name in OPEN.
-OPEN_HEADER = struct.Struct(">QQI")
+# `| epoch:8 | offset:8 | tail_rows:4 | cols:2 | rows:2 |` before the session name in OPEN.
+OPEN_HEADER = struct.Struct(">QQIHH")
 # `| mode:1 | epoch:8 | offset:8 | replay:8 |` before the session name in READY.
 READY_HEADER = struct.Struct(">BQQQ")
 
@@ -471,10 +471,10 @@ class Mux:
             return
         # `| epoch:8 | offset:8 | tail:4 | name |`; a bare name is a client that
         # holds nothing and wants the session from scratch.
-        epoch = offset = 0
+        epoch = offset = cols = rows = 0
         tail_rows = SNAPSHOT_TAIL_ROWS
         if len(payload) >= OPEN_HEADER.size:
-            epoch, offset, tail_rows = OPEN_HEADER.unpack_from(payload, 0)
+            epoch, offset, tail_rows, cols, rows = OPEN_HEADER.unpack_from(payload, 0)
             payload = payload[OPEN_HEADER.size:]
         # A client that names no cap gets ours rather than the daemon's whole
         # scrollback: "unlimited" is never what a phone wants, and a build that
@@ -496,6 +496,16 @@ class Mux:
             tty.setraw(slave_fd, termios.TCSANOW)
         except termios.error:
             pass
+        if cols > 0 and rows > 0:
+            # Take the size before the host draws anything, so the picture it
+            # sends is made for the geometry it will be shown at. Without this a
+            # snapshot is serialized at the PC's width and painted at the phone's:
+            # every line that wraps differently shifts the rest down, and the
+            # absolute cursor the snapshot ends with then lands on a line of
+            # content, which the next output overwrites. The client claims this
+            # size a frame later anyway - this only stops it being late.
+            self.run_blocking(["claim", name, str(cols), str(rows)])
+
         resumable = self.daemon_epoch(name) is not None
         attach_args = ["attach", "--mirror"]
         if resumable:
@@ -579,6 +589,16 @@ class Mux:
                 proc.wait(timeout=TERMINATE_GRACE_S)
             except (OSError, subprocess.TimeoutExpired):
                 pass
+
+    def run_blocking(self, args: list[str]) -> None:
+        """A `zmx` control verb whose effect must land before the next step. One
+        unix-socket round trip on the same machine; only ever on session open."""
+        try:
+            subprocess.run(self.zmx + args, stdin=subprocess.DEVNULL,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           env=self.zmx_env, timeout=DAEMON_PROBE_TIMEOUT_S)
+        except (OSError, subprocess.SubprocessError) as exc:
+            print(f"tsess-mux: {args[0]} failed: {exc}", file=sys.stderr)
 
     def run_detached(self, args: list[str]) -> None:
         """Fire a `zmx` control verb without blocking the data path on it."""

@@ -300,6 +300,26 @@ def test_a_host_that_cannot_resume_is_attached_the_old_way(
         client.shutdown()
 
 
+def test_a_visible_session_takes_its_size_before_the_host_draws(mux, zmx_log):
+    """The picture the host sends is serialized for the width it believes the
+    terminal is. Painted at a different width, lines wrap differently, everything
+    below shifts, and the absolute cursor the picture ends with lands on content -
+    which the next output overwrites. So the size goes first, then the picture."""
+    mux.open_session(1, "quiet-alpha", cols=60, rows=50)
+    deadline = time.monotonic() + 3.0
+    while time.monotonic() < deadline and not read_calls(zmx_log):
+        time.sleep(0.05)
+    assert read_calls(zmx_log) == ["claim quiet-alpha 60 50"]
+
+
+def test_a_session_that_is_not_on_screen_takes_no_size(mux, zmx_log):
+    """A backgrounded session's slot is re-opened on every reconnect. A size in
+    that frame would resize the terminal the user is actually looking at."""
+    mux.open_session(1, "quiet-alpha")
+    mux.collect(0.4)
+    assert read_calls(zmx_log) == []
+
+
 def test_the_snapshot_cap_reaches_the_host(mux, attach_log):
     """A snapshot the client falls back to must not be the whole scrollback
     either - that is the case this whole path exists to stop being expensive."""
