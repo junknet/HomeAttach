@@ -37,8 +37,11 @@ internal interface MuxHostListener {
 
 /** How one registered session hears about its own frames and about the channel underneath it. */
 internal interface MuxSessionListener {
-    /** The host attached this session; output is about to follow. */
-    fun onReady()
+    /**
+     * The host attached this session; output is about to follow. [ready] says whether that output
+     * continues the screen this session already has or replaces it, and where its cursor now is.
+     */
+    fun onReady(ready: MuxReady)
     fun onOutput(data: ByteArray)
 
     /** The session is gone on the host — its tab was closed or it was killed. Terminal. */
@@ -72,6 +75,8 @@ internal object TerminalMux {
         val sid: Int,
         val sessionName: String,
         val listener: MuxSessionListener,
+        /** What the phone already holds of this session, re-sent on every re-open. */
+        @Volatile var resume: MuxResume,
     ) {
         @Volatile
         var ready: Boolean = false
@@ -94,18 +99,23 @@ internal object TerminalMux {
      * Registers [sessionName] and starts the channel if this is the first session. Returns null
      * only when no slot is free, which means more terminals than the protocol's 255 can address.
      */
-    fun register(config: HostConfig, sessionName: String, listener: MuxSessionListener): Slot? {
+    fun register(
+        config: HostConfig,
+        sessionName: String,
+        listener: MuxSessionListener,
+        resume: MuxResume,
+    ): Slot? {
         val slot: Slot
         val live: MuxConnection?
         synchronized(lock) {
             val sid = (1..MAX_SLOT).firstOrNull { it !in slots } ?: return null
-            slot = Slot(sid, sessionName, listener)
+            slot = Slot(sid, sessionName, listener, resume)
             slots[sid] = slot
             live = ensureChannel(config)
         }
         listener.onTransportState(state)
         // Already connected: this session can be opened without waiting for a reconnect.
-        live?.takeIf { !it.closed }?.send(MuxProtocol.open(slot.sid, slot.sessionName))
+        live?.takeIf { !it.closed }?.send(openFrame(slot))
         return slot
     }
 
@@ -190,6 +200,22 @@ internal object TerminalMux {
         stale?.interrupt()
     }
 
+    /**
+     * Every open declares the cursor the session has reached, not the one it started with. A
+     * reconnect mid-session must continue from where the terminal actually is, or the phone is
+     * handed the whole screen again for the sake of a dropped radio.
+     */
+    private fun openFrame(slot: Slot): ByteArray {
+        val resume = slot.resume
+        return MuxProtocol.open(
+            slot.sid,
+            slot.sessionName,
+            epoch = resume.epoch,
+            offset = resume.offset,
+            tailRows = resume.tailRows,
+        )
+    }
+
     private fun currentSlots(): List<Slot> = synchronized(lock) { slots.values.toList() }
 
     private fun currentHostListeners(): List<MuxHostListener> =
@@ -258,7 +284,7 @@ internal object TerminalMux {
         // Re-open everything the pool still holds. On a reconnect this is what brings all the
         // terminals back at once instead of one handshake each.
         for (slot in currentSlots()) {
-            conn.send(MuxProtocol.open(slot.sid, slot.sessionName))
+            conn.send(openFrame(slot))
         }
         moveTo(MuxState.Connected)
 
@@ -310,8 +336,13 @@ internal object TerminalMux {
         when (frame.type) {
             MuxProtocol.OUTPUT -> slot.listener.onOutput(frame.payload)
             MuxProtocol.READY -> {
+                val ready = MuxProtocol.readReady(frame.payload)
+                if (ready == null) {
+                    if (BuildConfig.DEBUG) Log.w(TAG, "malformed READY: $frame")
+                    return
+                }
                 slot.ready = true
-                slot.listener.onReady()
+                slot.listener.onReady(ready)
             }
             MuxProtocol.ENDED -> {
                 // The session itself is gone, so free the slot; the owner tears itself down off
@@ -360,4 +391,26 @@ internal object TerminalMux {
     /** Fast enough that a radio gap is invisible, capped so an hour-long outage costs one probe
      * every 8s rather than a spin. */
     private val BACKOFF_MS = longArrayOf(500, 1_000, 2_000, 4_000, 8_000)
+}
+
+/**
+ * What the phone holds of one session: the daemon incarnation its saved bytes came from, how many
+ * of them it has, and the scrollback cap to apply if the host cannot continue from there.
+ *
+ * [epoch] 0 means "nothing saved", which is also what an app that has never seen the session sends.
+ */
+internal data class MuxResume(
+    val epoch: Long = 0,
+    val offset: Long = 0,
+    val tailRows: Int = SNAPSHOT_TAIL_ROWS,
+) {
+    companion object {
+        /**
+         * Scrollback rows to ask for when the host has to start the picture over. The phone keeps
+         * its own history; this only has to cover the screen plus a little to scroll into.
+         */
+        const val SNAPSHOT_TAIL_ROWS = 200
+
+        val NOTHING = MuxResume()
+    }
 }

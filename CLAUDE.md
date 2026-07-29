@@ -38,6 +38,7 @@ python -m pytest server/tests/test_muxproto.py::test_name
 server/install.sh                         # build zmx if stale, install everything to ~/.local/bin
 server/install.sh --build                 # force a zmx rebuild
 server/zmx/test-homeattach.py             # functional test of the zmx patches (drives real ptys)
+server/zmx/test-resume.py                 # byte-exactness of the resume path (drives real ptys)
 ```
 
 `server/install.sh` needs **Zig 0.15.2** (looks in `~/.local/toolchains/zig-x86_64-linux-0.15.2/zig`,
@@ -88,7 +89,7 @@ Consequences that constrain edits:
 ### The mux protocol lives in three places
 
 `| type:1 | sid:1 | length:4 BE | payload |` — OPEN/CLOSE/INPUT/FOCUS up, READY/OUTPUT/ENDED/ERROR
-down, plus SESSIONS/ACTIVITY down on slot 0. Any change must land in all three, and `server/tests/muxproto.py` is the spec the tests speak:
+down, plus SESSIONS/ACTIVITY down on slot 0. Any change must land in all three, and `server/tests/muxproto.py` is the spec the tests speak.
 
 - `server/tsess-mux` (host, Python) — also owns fair scheduling (`CHUNK_BYTES` per session turn,
   stop reading a session past `SESSION_BUFFER_LIMIT` so its own pty applies backpressure) and the
@@ -96,6 +97,13 @@ down, plus SESSIONS/ACTIVITY down on slot 0. Any change must land in all three, 
   change or every 5s, both collected inside the select loop so the data path never blocks).
 - `app/.../ssh/MuxProtocol.kt` + `MuxConnection.kt` (client).
 - `server/tests/muxproto.py` + `test_tsess_mux.py`.
+
+OPEN declares what the phone already holds of that session (`epoch|offset|tailRows`) and READY
+answers with what the host did (`mode|epoch|offset|replayBytes`). The phone's cursor is READY's
+offset plus every OUTPUT byte beyond the first `replayBytes` of them — replay is content the
+offset already counts, and counting it again puts the cursor past the stream, after which the host
+can never continue from it and every reopen silently reloads in full. That is why an OUTPUT frame
+may carry nothing but session output. See `SessionStreamStore` for the phone's half.
 
 ### Host script contract
 

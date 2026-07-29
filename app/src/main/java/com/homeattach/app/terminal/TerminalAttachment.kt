@@ -1,9 +1,13 @@
 package com.homeattach.app.terminal
 
 import android.content.Context
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import com.homeattach.app.BuildConfig
 import com.homeattach.app.data.HostConfig
+import com.homeattach.app.ssh.MuxReady
+import com.homeattach.app.ssh.MuxResume
 import com.homeattach.app.ssh.MuxSessionListener
 import com.homeattach.app.ssh.MuxState
 import com.homeattach.app.ssh.RemoteTerminalSize
@@ -11,7 +15,9 @@ import com.homeattach.app.ssh.TerminalMux
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import java.io.File
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 
 /**
@@ -101,6 +107,30 @@ class TerminalAttachment(
 
     private val slot = AtomicReference<TerminalMux.Slot?>(null)
 
+    // Declared above [init]: Kotlin initializes properties in declaration order, and the restore
+    // that init kicks off posts to this.
+    private val mainHandler = Handler(Looper.getMainLooper())
+
+    /**
+     * Set once the host has replaced this session's picture. A restore that was still waiting for
+     * first layout must not then paint the old screen over the new one.
+     */
+    private val screenReplaced = AtomicBoolean(false)
+
+    /** This session's tail on disk, and the cursor into the host's stream that it ends at. */
+    private val store = SessionStreamStore(File(context.applicationContext.filesDir, STORE_DIR))
+    private val saved = store.load(sessionName)
+
+    /**
+     * Where this attachment is in the host's byte stream. Advanced by every OUTPUT byte, which is
+     * exactly how the host counts, and saved with the bytes so the next process can carry on.
+     */
+    private val cursor = AtomicLong(saved?.offset ?: 0L)
+    private val epoch = AtomicLong(saved?.epoch ?: 0L)
+
+    /** Bytes still to arrive that [cursor] already counts; see [MuxReady.replayBytes]. */
+    private val replayRemaining = AtomicLong(0)
+
     val terminal = RemoteTerminalSession(
         context = context.applicationContext,
         onInput = { bytes -> slot.get()?.let { TerminalMux.sendInput(it, bytes) } },
@@ -123,7 +153,7 @@ class TerminalAttachment(
      * public surface would make every caller of [TerminalAttachment] a caller of the frame layer.
      */
     private val muxListener = object : MuxSessionListener {
-        override fun onReady() = handleReady()
+        override fun onReady(ready: MuxReady) = handleReady(ready)
         override fun onOutput(data: ByteArray) = handleOutput(data)
         override fun onEnded(reason: String) = handleEnded()
         override fun onError(message: String) = handleError(message)
@@ -131,7 +161,16 @@ class TerminalAttachment(
     }
 
     init {
-        val registered = TerminalMux.register(config, sessionName, muxListener)
+        // The saved screen goes up before anything is asked of the host: it is already on this
+        // phone, so there is nothing to wait for, and it is what makes reopening the app feel like
+        // returning to a terminal rather than loading one.
+        restoreSavedScreen()
+        val registered = TerminalMux.register(
+            config,
+            sessionName,
+            muxListener,
+            MuxResume(epoch = epoch.get(), offset = cursor.get()),
+        )
         if (registered == null) {
             moveTo(AttachStatus.Failed(NO_FREE_SLOT, FailureCause.HOST_SETUP))
             finished = true
@@ -177,13 +216,30 @@ class TerminalAttachment(
         terminal.onScreenUpdated = {}
         terminal.onFirstOutput = {}
         terminal.onUserInput = {}
+        store.close()
         terminal.finish()
     }
 
     // ---------- driven by the mux reader thread ----------
 
-    private fun handleReady() {
+    private fun handleReady(ready: MuxReady) {
         if (released.get()) return
+
+        epoch.set(ready.epoch)
+        cursor.set(ready.offset)
+        replayRemaining.set(ready.replayBytes)
+        if (!ready.continued) {
+            // The host started this session's picture over: what was restored from disk describes a
+            // screen that no longer exists, and leaving it up would put stale content above the
+            // content that replaced it.
+            screenReplaced.set(true)
+            mainHandler.post { terminal.resetScreen() }
+            store.reset(sessionName, ready.epoch, ready.offset)
+            if (BuildConfig.DEBUG) Log.i(TAG, "session=$sessionName restarted at ${ready.offset}")
+        } else if (BuildConfig.DEBUG) {
+            Log.i(TAG, "session=$sessionName continued at ${ready.offset}")
+        }
+
         moveTo(AttachStatus.Connected)
         // A re-attach lands with the host's idea of the size, so the visible terminal has to say
         // again that the grid is the phone's.
@@ -192,11 +248,50 @@ class TerminalAttachment(
 
     private fun handleOutput(data: ByteArray) {
         if (released.get()) return
+        // Saved before it is shown, and the cursor moved with it: these bytes are the stream, and
+        // the count has to match the host's byte for byte or a later resume splices a hole into the
+        // terminal. Runs on the mux reader thread, off the main thread's path.
+        //
+        // Replay is saved but not counted - it is content that rebuilds the screen, at a position
+        // the host already told us about.
+        val replay = replayRemaining.get()
+        val counted = if (replay <= 0) data.size.toLong() else {
+            val skipped = minOf(replay, data.size.toLong())
+            replayRemaining.addAndGet(-skipped)
+            data.size - skipped
+        }
+        val at = if (counted > 0) cursor.addAndGet(counted) else cursor.get()
+        val live = epoch.get()
+        if (live != 0L) store.append(sessionName, live, at, data)
+        // The slot carries the cursor so a reconnect asks to continue from where the terminal
+        // actually is, not from where this attachment started.
+        slot.get()?.resume = MuxResume(epoch = live, offset = at)
         terminal.appendRemoteOutput(data, 0, data.size)
+    }
+
+    /**
+     * Paints what this phone last saw, before the host has said anything.
+     *
+     * Retried until the view has laid out and the emulator exists — the same wait the live drain
+     * does — because an attachment is built before the terminal is measured.
+     */
+    private fun restoreSavedScreen() {
+        val bytes = saved?.bytes ?: return
+        mainHandler.post(object : Runnable {
+            override fun run() {
+                if (released.get() || screenReplaced.get()) return
+                if (!terminal.replaySaved(bytes)) {
+                    mainHandler.postDelayed(this, RESTORE_RETRY_MS)
+                }
+            }
+        })
     }
 
     private fun handleEnded() {
         if (released.get()) return
+        // The session is gone for good, so its saved tail describes a terminal that no longer
+        // exists. Keeping it would restore a dead screen if the host ever reuses the name.
+        store.clear(sessionName)
         // The slot is already gone on the mux side; drop ours so nothing tries to speak for it.
         slot.set(null)
         finished = true
@@ -248,5 +343,7 @@ class TerminalAttachment(
     private companion object {
         const val TAG = "TerminalAttachment"
         const val NO_FREE_SLOT = "too many terminals open"
+        const val STORE_DIR = "session-stream"
+        const val RESTORE_RETRY_MS = 16L
     }
 }

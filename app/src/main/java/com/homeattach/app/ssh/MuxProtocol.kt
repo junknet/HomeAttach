@@ -12,6 +12,12 @@ package com.homeattach.app.ssh
  * One SSH channel carries every attached session, so framing is ours to do. Slot 0 is reserved for
  * frames that belong to the connection rather than to a session, which gives an ERROR with no
  * session context somewhere to go.
+ *
+ * OPEN declares what this phone already holds of a session - which daemon its bytes came from and
+ * how many of them it has - and READY answers with what the host did about it. [RESUME_CONTINUED]
+ * means the OUTPUT frames that follow carry on from exactly that point; [RESUME_SNAPSHOT] means
+ * they replace the screen. The cursor to save is the offset in READY plus every OUTPUT byte
+ * received after it, which is why an OUTPUT frame may carry nothing but session output.
  */
 internal object MuxProtocol {
     // phone -> host
@@ -35,6 +41,18 @@ internal object MuxProtocol {
     const val CONNECTION_SLOT = 0
     const val HEADER_BYTES = 6
 
+    /** `epoch:8 | offset:8 | tailRows:4` ahead of the name in OPEN. */
+    const val OPEN_HEADER_BYTES = 20
+
+    /** `mode:1 | epoch:8 | offset:8 | replayBytes:8` ahead of the name in READY. */
+    const val READY_HEADER_BYTES = 25
+
+    /** The host started this session's picture over; anything held for it is stale. */
+    const val RESUME_SNAPSHOT = 0
+
+    /** The host sent exactly what was missed; the screen already on the phone stands. */
+    const val RESUME_CONTINUED = 1
+
     /**
      * A cap is part of the protocol, not a local guard: without it a corrupted length header makes
      * the reader wait for bytes that are never coming, and the terminal simply stops.
@@ -55,8 +73,52 @@ internal object MuxProtocol {
         return frame
     }
 
-    fun open(sid: Int, sessionName: String): ByteArray =
-        encode(OPEN, sid, sessionName.toByteArray(Charsets.UTF_8))
+    /**
+     * [epoch]/[offset] are what this phone already holds of the session; 0/0 means nothing.
+     * [tailRows] caps the scrollback a snapshot may carry when the host cannot continue.
+     */
+    fun open(
+        sid: Int,
+        sessionName: String,
+        epoch: Long = 0,
+        offset: Long = 0,
+        tailRows: Int = 0,
+    ): ByteArray {
+        val name = sessionName.toByteArray(Charsets.UTF_8)
+        val payload = ByteArray(OPEN_HEADER_BYTES + name.size)
+        writeLong(payload, 0, epoch)
+        writeLong(payload, 8, offset)
+        writeInt(payload, 16, tailRows)
+        name.copyInto(payload, OPEN_HEADER_BYTES)
+        return encode(OPEN, sid, payload)
+    }
+
+    private fun writeLong(target: ByteArray, at: Int, value: Long) {
+        for (i in 0 until 8) target[at + i] = (value ushr (56 - 8 * i)).toByte()
+    }
+
+    private fun writeInt(target: ByteArray, at: Int, value: Int) {
+        for (i in 0 until 4) target[at + i] = (value ushr (24 - 8 * i)).toByte()
+    }
+
+    private fun readLong(source: ByteArray, at: Int): Long {
+        var value = 0L
+        for (i in 0 until 8) value = (value shl 8) or (source[at + i].toLong() and 0xff)
+        return value
+    }
+
+    /** The host's answer to an OPEN, or null when the frame is too short to be one. */
+    fun readReady(payload: ByteArray): MuxReady? {
+        if (payload.size < READY_HEADER_BYTES) return null
+        return MuxReady(
+            continued = payload[0].toInt() == RESUME_CONTINUED,
+            epoch = readLong(payload, 1),
+            offset = readLong(payload, 9),
+            replayBytes = readLong(payload, 17),
+            sessionName = String(payload, READY_HEADER_BYTES, payload.size - READY_HEADER_BYTES,
+                Charsets.UTF_8),
+        )
+    }
 
     fun close(sid: Int): ByteArray = encode(CLOSE, sid)
 
@@ -73,6 +135,26 @@ internal object MuxProtocol {
 
     private val EMPTY = ByteArray(0)
 }
+
+/**
+ * What the host did with an OPEN: whether the output that follows continues this phone's screen or
+ * replaces it, and the cursor to count from.
+ */
+internal data class MuxReady(
+    val continued: Boolean,
+    val epoch: Long,
+    val offset: Long,
+    /**
+     * How many of the bytes about to arrive are replay that [offset] already counts.
+     *
+     * They must not advance the cursor. On a snapshot they are a picture the host synthesized,
+     * which was never in the stream; on a continuation they are bytes [offset] is already past.
+     * Counting them puts the cursor beyond the stream, and a cursor beyond the stream can never be
+     * resumed from again - the session quietly reloads in full, forever.
+     */
+    val replayBytes: Long,
+    val sessionName: String,
+)
 
 /** One decoded frame. [payload] is owned by the receiver and is never reused by the reader. */
 internal class MuxFrame(val type: Int, val sid: Int, val payload: ByteArray) {

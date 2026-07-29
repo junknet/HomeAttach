@@ -166,6 +166,43 @@ class RemoteTerminalSession(
         if (startDrain) mainHandler.post(drainRunnable)
     }
 
+    /**
+     * Rebuilds the screen from bytes this phone saved earlier, before anything is on display.
+     *
+     * Deliberately not the drain path: that one parses in capped passes and yields a frame between
+     * them, which is right for output arriving live and wrong here. This is one known-size buffer
+     * with no viewer yet, so parsing it in a single pass costs one frame at open instead of
+     * repainting progressively for a quarter of a second - which is precisely the "it reloads
+     * everything every time" the saved stream exists to remove.
+     *
+     * Returns false when the emulator does not exist yet, i.e. before first layout; the caller
+     * retries. Must run on the main thread, like every other emulator access.
+     */
+    fun replaySaved(data: ByteArray): Boolean {
+        val emulator = session.emulator ?: return false
+        if (data.isEmpty()) return true
+        emulator.append(data, data.size)
+        onScreenUpdated()
+        onFirstOutput()
+        return true
+    }
+
+    /**
+     * Throws away everything on screen and in scrollback.
+     *
+     * Called when the host says it is starting this session's picture over: what was restored from
+     * disk describes a screen that no longer exists, and the fresh picture would otherwise be
+     * painted underneath it.
+     */
+    fun resetScreen() {
+        val emulator = session.emulator ?: return
+        // RIS, through the emulator's own path: it resets modes, clears the transcript, blanks the
+        // screen and homes the cursor in the order a terminal defines. Reaching into the buffer to
+        // do that by hand would be a second, less tested definition of "start over".
+        emulator.append(RESET_TO_INITIAL_STATE, RESET_TO_INITIAL_STATE.size)
+        onScreenUpdated()
+    }
+
     /** User input from the ExtraKeys row (Esc, Ctrl-C/D, arrows). Routed out to SSH via the session. */
     fun write(data: ByteArray, offset: Int, count: Int) {
         onUserInput()
@@ -211,6 +248,9 @@ class RemoteTerminalSession(
 
     private companion object {
         const val TAG = "RemoteTerminalSession"
+
+        /** ESC c - RIS, "forget everything and start over". */
+        val RESET_TO_INITIAL_STATE = byteArrayOf(0x1b, 'c'.code.toByte())
 
         /** Most remote bytes one main-thread parse pass may consume before yielding for a frame. */
         const val MAX_BYTES_PER_DRAIN = 16384

@@ -2,6 +2,8 @@ package com.homeattach.app.ssh
 
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -26,7 +28,11 @@ class MuxProtocolTest {
     @Test
     fun `open frame matches the host encoder`() {
         assertArrayEquals(
-            byteArrayOf(1, 1, 0, 0, 0, 11, 113, 117, 105, 101, 116, 45, 97, 108, 112, 104, 97),
+            byteArrayOf(
+                1, 1, 0, 0, 0, 31,
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                113, 117, 105, 101, 116, 45, 97, 108, 112, 104, 97,
+            ),
             MuxProtocol.open(1, "quiet-alpha"),
         )
     }
@@ -34,7 +40,11 @@ class MuxProtocolTest {
     @Test
     fun `open frame encodes a non-ascii session name as utf8`() {
         assertArrayEquals(
-            byteArrayOf(1, 2, 0, 0, 0, 9, -28, -68, -102, -24, -81, -99, 45, -61, -91),
+            byteArrayOf(
+                1, 2, 0, 0, 0, 29,
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                -28, -68, -102, -24, -81, -99, 45, -61, -91,
+            ),
             MuxProtocol.open(2, "会话-å"),
         )
     }
@@ -151,6 +161,76 @@ class MuxProtocolTest {
     }
 
     // ---------- the control slot ----------
+
+    // ---------- resuming a session the phone already holds ----------
+
+    @Test
+    fun `open declares the cursor ahead of the name`() {
+        val wire = MuxProtocol.open(3, "alpha", epoch = 9, offset = 4096, tailRows = 200)
+        val payload = drain(MuxFrameReader(), wire).single().payload
+
+        assertArrayEquals(
+            // epoch 9, offset 4096 (0x1000), tail 200 (0xC8), big-endian throughout
+            byteArrayOf(0, 0, 0, 0, 0, 0, 0, 9, 0, 0, 0, 0, 0, 0, 0x10, 0, 0, 0, 0, 0xC8.toByte()),
+            payload.copyOfRange(0, MuxProtocol.OPEN_HEADER_BYTES),
+        )
+        assertEquals("alpha", String(payload, MuxProtocol.OPEN_HEADER_BYTES, 5))
+    }
+
+    @Test
+    fun `an open with nothing held still carries a zeroed header`() {
+        // The host reads a fixed-size prefix; a bare name would be parsed as an epoch.
+        val payload = drain(MuxFrameReader(), MuxProtocol.open(1, "alpha")).single().payload
+        assertEquals(MuxProtocol.OPEN_HEADER_BYTES + 5, payload.size)
+        assertTrue(payload.copyOfRange(0, MuxProtocol.OPEN_HEADER_BYTES).all { it == 0.toByte() })
+    }
+
+    @Test
+    fun `ready says whether the output that follows continues the screen`() {
+        val payload = byteArrayOf(MuxProtocol.RESUME_CONTINUED.toByte()) +
+            byteArrayOf(0, 0, 0, 0, 0, 0, 0, 9) +
+            byteArrayOf(0, 0, 0, 0, 0, 0, 0x10, 0) +
+            byteArrayOf(0, 0, 0, 0, 0, 0, 2, 0) +
+            "alpha".toByteArray()
+        val ready = MuxProtocol.readReady(payload)!!
+
+        assertTrue(ready.continued)
+        assertEquals(9L, ready.epoch)
+        assertEquals(4096L, ready.offset)
+        // The bytes about to arrive that the offset already counts. Counting them again is what
+        // puts the cursor past the stream, permanently unresumable.
+        assertEquals(512L, ready.replayBytes)
+        assertEquals("alpha", ready.sessionName)
+    }
+
+    @Test
+    fun `a snapshot ready is not a continuation`() {
+        val payload = ByteArray(MuxProtocol.READY_HEADER_BYTES) + "alpha".toByteArray()
+        val ready = MuxProtocol.readReady(payload)!!
+
+        assertFalse(ready.continued)
+        assertEquals(0L, ready.epoch)
+        assertEquals("alpha", ready.sessionName)
+    }
+
+    @Test
+    fun `a truncated ready is refused rather than half read`() {
+        assertNull(MuxProtocol.readReady(ByteArray(MuxProtocol.READY_HEADER_BYTES - 1)))
+    }
+
+    @Test
+    fun `a cursor past two gigabytes survives the round trip`() {
+        // Offsets are byte counts on a stream that runs for days; they outgrow Int quickly.
+        val far = 9_000_000_000L
+        val payload = drain(MuxFrameReader(), MuxProtocol.open(1, "a", epoch = far, offset = far))
+            .single().payload
+        val ready = MuxProtocol.readReady(
+            byteArrayOf(MuxProtocol.RESUME_CONTINUED.toByte()) +
+                payload.copyOfRange(0, 16) + ByteArray(8) + "a".toByteArray()
+        )!!
+        assertEquals(far, ready.epoch)
+        assertEquals(far, ready.offset)
+    }
 
     @Test
     fun `control frame type codes match the host's`() {
