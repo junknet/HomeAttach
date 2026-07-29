@@ -176,6 +176,54 @@ def main():
     zmx("kill", "t2")
     wait_for(lambda: not session_exists("t2"), 5.0)
 
+    print("== a mirror never clears or resets the caller's terminal ==")
+    # The mirror's stdout is HomeAttach's pipe to a phone that keeps the session
+    # on screen across detaches: a clear costs it the scrollback, an RIS costs it
+    # the whole emulator state.
+    owner4 = PtyClient(["attach", "--bind", "t4"], cols=100, rows=30)
+    wait_for(lambda: stat("t4").get("owners") == "1")
+    owner4.drain(0.6)
+    mirror4 = PtyClient(["attach", "--mirror", "t4"], cols=100, rows=30)
+    seen = mirror4.drain(1.0)
+    check("mirror attach sends no clear-screen", b"\x1b[2J" not in seen,
+          repr(seen[:120]))
+    mirror4.close()
+    time.sleep(0.3)
+    trailing = b""
+    try:
+        trailing = os.read(mirror4.master, 65536)
+    except (BlockingIOError, OSError):
+        pass
+    check("mirror detach sends no RIS reset", b"\x1bc" not in trailing,
+          repr(trailing[-120:]))
+
+    print("== bulk stat answers for every session in one process ==")
+    mirror4b = PtyClient(["attach", "--mirror", "t4"], cols=80, rows=24)
+    owner5 = PtyClient(["attach", "--bind", "t5"], cols=80, rows=24)
+    wait_for(lambda: stat("t5").get("owners") == "1")
+    bulk = zmx("stat")
+    names = sorted(
+        dict(kv.split("=", 1) for kv in line.split())["name"]
+        for line in bulk.splitlines() if line.strip()
+    )
+    check("every live session is listed", names == ["t4", "t5"], bulk)
+    per_session = {
+        dict(kv.split("=", 1) for kv in line.split())["name"]:
+            dict(kv.split("=", 1) for kv in line.split())
+        for line in bulk.splitlines() if line.strip()
+    }
+    check("bulk lines carry the same fields as `stat <name>`",
+          per_session["t5"].get("output_seq") == stat("t5").get("output_seq"), bulk)
+    before = int(per_session["t5"]["output_seq"])
+    owner5.send(b"echo BULK_SEQ\r")
+    ok = wait_for(lambda: int(stat("t5").get("output_seq", "0")) > before)
+    check("output_seq advances when the pty prints", ok, str(stat("t5")))
+    mirror4b.close()
+    owner5.close()
+    owner4.close()
+    wait_for(lambda: not session_exists("t4"), 5.0)
+    wait_for(lambda: not session_exists("t5"), 5.0)
+
     print("== view-bound session with command ==")
     owner3 = PtyClient(["attach", "--bind", "t3", "bash", "--norc"], cols=90, rows=25)
     ok = wait_for(lambda: stat("t3").get("owners") == "1")

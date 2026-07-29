@@ -14,12 +14,19 @@ other terminal. So the loop below never lets one session write more than
 backlog is already [SESSION_BUFFER_LIMIT], letting its own pty apply the
 backpressure instead of buffering it here.
 
+The same channel also carries the host's own state on slot 0 — the session list
+and which sessions are producing output. That is not a convenience: the phone
+lights a lamp for every session it can see, not only the ones it has attached,
+and a second channel for that meant a second protocol, a second reconnect loop
+and a second clock. Two clocks is precisely why the lamps used to disagree.
+
 Protocol (see server/tests/muxproto.py, which is the spec the tests speak):
 
     | type:1 | sid:1 | length:4 big-endian | payload |
 
     client -> mux   OPEN(name) CLOSE INPUT(bytes) FOCUS(cols,rows)
     mux -> client   READY(name) OUTPUT(bytes) ENDED(reason) ERROR(message)
+    mux -> client   SESSIONS(tsv) ACTIVITY(names)      -- slot 0 only
 """
 
 from __future__ import annotations
@@ -34,6 +41,7 @@ import struct
 import subprocess
 import sys
 import termios
+import time
 import tty
 from pathlib import Path
 
@@ -49,6 +57,12 @@ OUTPUT = 0x82
 ENDED = 0x83
 ERROR = 0x84
 
+# mux -> client, slot 0: the host's state rather than any one session's.
+SESSIONS = 0x85
+ACTIVITY = 0x86
+
+CONTROL_SLOT = 0
+
 HEADER = struct.Struct(">BBI")
 MAX_PAYLOAD = 1 << 20
 
@@ -63,6 +77,21 @@ SESSION_BUFFER_LIMIT = 256 * 1024
 
 SELECT_TIMEOUT_S = 0.05
 TERMINATE_GRACE_S = 1.0
+
+# How often the host is asked which sessions emitted output, and the floor on
+# how often that gets reported. A lamp says "something is happening over
+# there", so a quarter second is below what the eye reads as lag, while one
+# `zmx stat` covering every session keeps the poll to four processes a second
+# no matter how many sessions exist.
+ACTIVITY_POLL_S = 0.25
+
+# The full list walks /proc per session in a shell script. It only has to be as
+# fresh as the running command and cwd, which change on human timescales; a
+# session appearing or disappearing does not wait for it (see [SessionStatus]).
+SESSION_LIST_INTERVAL_S = 5.0
+
+# Retry delay for a status command that could not be started at all.
+SPAWN_RETRY_S = 5.0
 
 
 def zmx_environment() -> dict[str, str]:
@@ -88,6 +117,209 @@ def zmx_command() -> list[str]:
         if candidate.is_file() and os.access(candidate, os.X_OK):
             return [str(candidate)]
     return ["zmx"]
+
+
+def session_list_command() -> list[str]:
+    """The one definition of what a session list is: `tsess-list`, next to us.
+
+    Rebuilding the list here in Python would be cheaper by one process and
+    wrong by one implementation — the columns, the /proc walk and the cwd
+    shortening would then exist twice and drift apart.
+    """
+    override = os.environ.get("HOMEATTACH_TSESS_LIST")
+    if override:
+        return shlex.split(override)
+    return [str(Path(__file__).resolve().parent / "tsess-list")]
+
+
+class BackgroundCommand:
+    """A host command whose output is collected inside the select loop.
+
+    The data path must never block on one: `tsess-list` walks /proc for every
+    session, and waiting for it inline would be that walk's whole duration of
+    stall in every attached terminal, several times a minute.
+    """
+
+    def __init__(self, argv: list[str], env: dict[str, str]):
+        self.proc = subprocess.Popen(
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            env=env,
+        )
+        self.fd = self.proc.stdout.fileno()
+        os.set_blocking(self.fd, False)
+        self.out = bytearray()
+
+    def read(self) -> bool:
+        """Drains what is ready. True once the command is done and [out] is whole."""
+        while True:
+            try:
+                chunk = os.read(self.fd, 65536)
+            except BlockingIOError:
+                return False
+            except OSError:
+                return True
+            if not chunk:
+                return True
+            self.out.extend(chunk)
+
+    def close(self) -> subprocess.Popen:
+        try:
+            self.proc.stdout.close()
+        except OSError:
+            pass
+        return self.proc
+
+    def failed(self) -> bool:
+        """Whether the command exited non-zero. Only called on EOF, so the wait
+        is a formality with a bound on it rather than a blocking join."""
+        try:
+            return self.proc.wait(timeout=0.2) != 0
+        except subprocess.TimeoutExpired:
+            return False
+
+    @property
+    def text(self) -> str:
+        return bytes(self.out).decode("utf-8", "replace")
+
+
+def parse_stat(text: str) -> dict[str, int]:
+    """`zmx stat` bulk output -> {session name: output sequence}."""
+    sequences: dict[str, int] = {}
+    for line in text.splitlines():
+        fields = dict(
+            field.split("=", 1) for field in line.split() if "=" in field
+        )
+        name = fields.get("name")
+        if not name:
+            continue
+        try:
+            sequences[name] = int(fields.get("output_seq", "0"))
+        except ValueError:
+            sequences[name] = 0
+    return sequences
+
+
+class SessionStatus:
+    """The host's session list and per-session activity, on the control slot.
+
+    Every session the phone can see needs its own activity signal, not just the
+    attached ones: the list screen and the drawer light a lamp per row. Attached
+    sessions report themselves through [note_output] the moment their bytes
+    arrive; the rest come from `zmx stat`, which answers for all of them in one
+    process, so the poll costs the same whether the user keeps two sessions or
+    twenty.
+
+    Membership changes do not wait for the list heartbeat — the stat poll is
+    what notices a session was born or died, and it runs four times a second.
+    """
+
+    def __init__(self, zmx: list[str], env: dict[str, str]):
+        self.zmx = zmx
+        self.env = env
+        self.list_command = session_list_command()
+        self.active: set[str] = set()
+        self.sequences: dict[str, int] = {}
+        self.stat_job: BackgroundCommand | None = None
+        self.list_job: BackgroundCommand | None = None
+        self.reaping: list[subprocess.Popen] = []
+        self.pending: list[tuple[int, bytes]] = []
+        self.next_stat_at = 0.0
+        self.next_activity_at = 0.0
+        self.next_list_at = 0.0
+        self.unstartable: set[str] = set()
+
+    def note_output(self, name: str) -> None:
+        """An attached session just produced bytes — no poll can beat this."""
+        self.active.add(name)
+
+    def fds(self) -> list[int]:
+        return [job.fd for job in (self.stat_job, self.list_job) if job is not None]
+
+    def on_readable(self, readable: list[int]) -> None:
+        if self.stat_job is not None and self.stat_job.fd in readable:
+            if self.stat_job.read():
+                self.finish_stat()
+        if self.list_job is not None and self.list_job.fd in readable:
+            if self.list_job.read():
+                self.finish_list()
+
+    def finish_stat(self) -> None:
+        job, self.stat_job = self.stat_job, None
+        if job is None:
+            return
+        self.reaping.append(job.close())
+        sequences = parse_stat(job.text)
+        for name, sequence in sequences.items():
+            previous = self.sequences.get(name)
+            if previous is not None and sequence != previous:
+                self.active.add(name)
+        if sequences.keys() != self.sequences.keys():
+            # Born or died: the list on the phone is wrong right now, not in
+            # five seconds.
+            self.next_list_at = 0.0
+        self.sequences = sequences
+
+    def finish_list(self) -> None:
+        job, self.list_job = self.list_job, None
+        if job is None:
+            return
+        proc = job.close()
+        self.reaping.append(proc)
+        if job.failed():
+            # An empty list is the normal answer when nothing is running; an
+            # empty list from a script that could not run is not, and the phone
+            # can only tell them apart if we say which one this was.
+            self.pending.append(
+                (ERROR, f"{self.list_command[0]} failed".encode("utf-8"))
+            )
+            return
+        self.pending.append((SESSIONS, bytes(job.out)))
+
+    def drain(self, now: float) -> list[tuple[int, bytes]]:
+        """Frames to send on the control slot, and the work that produces them."""
+        frames, self.pending = self.pending, []
+        self.reaping = [p for p in self.reaping if p.poll() is None]
+
+        if self.stat_job is None and now >= self.next_stat_at:
+            self.stat_job = self.spawn(self.zmx + ["stat"])
+            # A command that cannot even start will not start 250ms from now
+            # either; retrying at poll speed would only spin and flood stderr.
+            self.next_stat_at = now + (ACTIVITY_POLL_S if self.stat_job else SPAWN_RETRY_S)
+
+        if self.list_job is None and now >= self.next_list_at:
+            self.list_job = self.spawn(self.list_command)
+            self.next_list_at = now + (
+                SESSION_LIST_INTERVAL_S if self.list_job else SPAWN_RETRY_S
+            )
+
+        if self.active and now >= self.next_activity_at:
+            self.next_activity_at = now + ACTIVITY_POLL_S
+            frames.append((ACTIVITY, "\n".join(sorted(self.active)).encode("utf-8")))
+            self.active.clear()
+
+        return frames
+
+    def spawn(self, argv: list[str]) -> BackgroundCommand | None:
+        try:
+            return BackgroundCommand(argv, self.env)
+        except OSError as exc:
+            # Once per command: this is polled, and the same missing binary
+            # reported four times a second would bury everything else on stderr.
+            if argv[0] not in self.unstartable:
+                self.unstartable.add(argv[0])
+                print(f"tsess-mux: cannot run {argv[0]}: {exc}", file=sys.stderr)
+            return None
+
+    def shutdown(self) -> None:
+        for job in (self.stat_job, self.list_job):
+            if job is None:
+                continue
+            proc = job.close()
+            if proc.poll() is None:
+                proc.kill()
 
 
 class Session:
@@ -118,6 +350,7 @@ class Mux:
         self.turn_index = 0
         self.reaping: list[subprocess.Popen] = []
         self.stdin_open = True
+        self.status = SessionStatus(self.zmx, self.zmx_env)
 
     # ---------- framing ----------
 
@@ -265,6 +498,13 @@ class Mux:
     def reap(self) -> None:
         self.reaping = [p for p in self.reaping if p.poll() is None]
 
+    def pump_status(self) -> None:
+        """Control-slot frames go ahead of session output on purpose: they are
+        tens of bytes, and a lamp that lags the flood it is reporting is worse
+        than useless."""
+        for type_, payload in self.status.drain(time.monotonic()):
+            self.queue(type_, CONTROL_SLOT, payload)
+
     # ---------- scheduling ----------
 
     def fill_pending(self) -> None:
@@ -313,6 +553,9 @@ class Mux:
             self.queue(ENDED, session.sid, b"session ended")
             self.teardown(session)
             return
+        # An attached session's own bytes are the activity signal for it; the
+        # stat poll exists for the sessions nobody has attached.
+        self.status.note_output(session.name)
         session.outbuf.extend(data)
 
     # ---------- main loop ----------
@@ -324,11 +567,13 @@ class Mux:
         try:
             while True:
                 self.reap()
+                self.pump_status()
                 self.fill_pending()
 
                 read_fds: list[int] = []
                 if self.stdin_open:
                     read_fds.append(0)
+                read_fds.extend(self.status.fds())
                 # A backlogged session is not read: its pty fills up and the
                 # writer blocks, which is the backpressure that keeps one noisy
                 # terminal from being buffered at everyone else's expense.
@@ -369,6 +614,9 @@ class Mux:
                     if session.master_fd in readable:
                         self.read_session(session)
 
+                self.status.on_readable(readable)
+                self.pump_status()
+
                 # Give freshly produced output a chance to leave before blocking
                 # in select again.
                 self.fill_pending()
@@ -380,6 +628,7 @@ class Mux:
     def shutdown(self) -> None:
         for session in list(self.sessions.values()):
             self.teardown(session)
+        self.status.shutdown()
         for proc in self.reaping:
             self.stop_process(proc)
 

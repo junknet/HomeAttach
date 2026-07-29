@@ -174,6 +174,11 @@ fun SessionListScreen(
     // and no connection of our own to babysit.
     val snapshot by RemoteSessionFeed.sessions(settingsStore).collectAsStateWithLifecycle()
 
+    // Which sessions are producing output, for every row — including the ones this phone has never
+    // attached. It rides the same channel as the list, so a lamp here and the same session's lamp
+    // in the terminal drawer are reading the same tick.
+    val activity by RemoteSessionFeed.activity.collectAsStateWithLifecycle()
+
     // A killed session leaves its card the moment the host is asked rather than on the next feed
     // tick, so the swipe visibly did something. The feed remains the authority: a name that turns
     // out to have survived reappears, and one that really died stops being listed at all.
@@ -392,6 +397,7 @@ fun SessionListScreen(
                                     SessionCard(
                                         session = session,
                                         label = label,
+                                        activityTick = activity[session.name] ?: 0L,
                                         onClick = { onOpenSession(session.name, label) },
                                     )
                                 }
@@ -543,8 +549,13 @@ private fun KillBackground(dismissState: SwipeToDismissBoxState) {
 /** Compact, information-first card: label + focus chip, running command, cwd in monospace, and a
  * trailing chevron as the attach affordance (whole card is tappable). */
 @Composable
-private fun SessionCard(session: RemoteSession, label: String, onClick: () -> Unit) {
-    val outputActive = rememberSessionOutputActivity(session.outputSequence)
+private fun SessionCard(
+    session: RemoteSession,
+    label: String,
+    activityTick: Long,
+    onClick: () -> Unit,
+) {
+    val outputActive = rememberSessionOutputActivity(activityTick)
     OutlinedCard(
         onClick = onClick,
         shape = RoundedCornerShape(20.dp),
@@ -584,9 +595,10 @@ private fun SessionCard(session: RemoteSession, label: String, onClick: () -> Un
                     SessionActivityLamp(
                         outputActive = outputActive,
                         connected = session.status == "focused",
+                        // Wider than the dot it draws: the halo lives in the outer third.
                         modifier = Modifier
                             .padding(start = 8.dp)
-                            .size(10.dp),
+                            .size(16.dp),
                     )
                     StatusChip(session, modifier = Modifier.padding(start = 8.dp))
                 }

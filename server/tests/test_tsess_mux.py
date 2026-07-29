@@ -19,7 +19,7 @@ from __future__ import annotations
 import time
 
 import muxproto
-from conftest import pgid_process_count, read_calls
+from conftest import MuxClient, pgid_process_count, read_calls
 
 OUT = muxproto.OUTPUT
 
@@ -193,7 +193,7 @@ def test_ending_one_session_does_not_end_the_others(mux):
 def test_input_for_an_unknown_slot_is_an_error_not_a_crash(mux):
     mux.open_session(1, "quiet-alpha")
     mux.send(muxproto.input_frame(200, b"nobody home"))
-    mux.expect(lambda f: f.type == muxproto.ERROR)
+    mux.expect(lambda f: f.type == muxproto.ERROR and f.sid == 200)
     # the live session has to survive a bad frame
     mux.send(muxproto.input_frame(1, b"still here"))
     mux.collect(0.3)
@@ -220,6 +220,103 @@ def test_frames_split_across_writes_are_reassembled(mux):
         mux.send_raw(wire[i:i + 1])
         time.sleep(0.005)
     assert mux.expect(lambda f: f.type == muxproto.READY and f.sid == 1)
+
+
+# ---------- the host's own state, on the control slot ----------
+#
+# The phone lights a lamp per session, including sessions it has never
+# attached. That used to come from a second SSH channel on its own clock, which
+# is why an attached session's lamp and its neighbour's could never agree.
+
+
+def names_in(frames, type_) -> list[str]:
+    out: list[str] = []
+    for frame in frames:
+        if frame.type != type_ or frame.sid != muxproto.CONNECTION_SLOT:
+            continue
+        if type_ == muxproto.SESSIONS:
+            out.extend(row[0] for row in muxproto.decode_sessions(frame.payload))
+        else:
+            out.extend(muxproto.decode_activity(frame.payload))
+    return out
+
+
+def test_the_session_list_arrives_on_the_control_slot(mux, host):
+    host.set_sessions({"alpha": 1, "beta": 1})
+    frame = mux.expect(
+        lambda f: f.type == muxproto.SESSIONS and b"alpha" in f.payload, timeout=2.0
+    )
+    assert frame.sid == muxproto.CONNECTION_SLOT
+    rows = muxproto.decode_sessions(frame.payload)
+    assert [row[0] for row in rows] == ["alpha", "beta"]
+    # tsess-list's columns, unchanged: the mux carries the list, it does not
+    # reinvent it.
+    assert rows[0][1:3] == ["bash", "~/work"]
+
+
+def test_a_session_that_disappears_updates_the_list_without_waiting_for_the_heartbeat(mux, host):
+    host.set_sessions({"alpha": 1, "beta": 1})
+    mux.expect(lambda f: f.type == muxproto.SESSIONS and b"beta" in f.payload, timeout=2.0)
+
+    host.set_sessions({"alpha": 1})
+    started = time.monotonic()
+    frame = mux.expect(
+        lambda f: f.type == muxproto.SESSIONS and b"beta" not in f.payload, timeout=3.0
+    )
+    # The list heartbeat is 5s; membership has to be noticed by the activity
+    # poll instead, or a killed session sits on the phone's screen for seconds.
+    assert time.monotonic() - started < 2.0
+    assert [row[0] for row in muxproto.decode_sessions(frame.payload)] == ["alpha"]
+
+
+def test_activity_names_a_session_the_client_never_attached(mux, host):
+    host.set_sessions({"alpha": 1, "beta": 1})
+    mux.expect(lambda f: f.type == muxproto.SESSIONS and b"alpha" in f.payload, timeout=2.0)
+
+    # Keep printing, the way a session the lamp is meant to report does. A single
+    # bump can land inside the poll window that first read this host, and a
+    # sequence nobody has seen before is not a change — so one bump proves
+    # nothing either way, while a stream has to be noticed.
+    for sequence in range(2, 9):
+        host.set_sessions({"alpha": sequence, "beta": 1})
+        time.sleep(0.15)
+
+    frame = mux.expect(lambda f: f.type == muxproto.ACTIVITY, timeout=2.0)
+    # beta never printed, so it must not be in there.
+    assert muxproto.decode_activity(frame.payload) == ["alpha"]
+
+
+def test_activity_names_an_attached_session_from_its_own_bytes(mux, host):
+    """An attached session must not wait for a poll to be seen as busy: its
+    output is already crossing this channel."""
+    host.set_sessions({})
+    mux.open_session(1, "beat-alpha")
+    frame = mux.expect(lambda f: f.type == muxproto.ACTIVITY, timeout=2.0)
+    assert "beat-alpha" in muxproto.decode_activity(frame.payload)
+
+
+def test_a_quiet_host_produces_no_activity_frames(mux, host):
+    host.set_sessions({"alpha": 7})
+    mux.expect(lambda f: f.type == muxproto.SESSIONS and b"alpha" in f.payload, timeout=2.0)
+    # Nothing changes from here: a lamp that blinks on a still session is a
+    # lamp nobody can read.
+    assert names_in(mux.collect(1.0), muxproto.ACTIVITY) == []
+
+
+def test_a_list_command_that_cannot_run_is_reported_not_silently_empty(
+    require_mux, zmx_log, tmp_path, host
+):
+    host.fail_list = True
+    client = MuxClient(zmx_log, tmp_path, extra_env=host.env())
+    try:
+        frame = client.expect(
+            lambda f: f.type == muxproto.ERROR and f.sid == muxproto.CONNECTION_SLOT,
+            timeout=3.0,
+        )
+        assert b"failed" in frame.payload
+        assert names_in(client.collect(0.5), muxproto.SESSIONS) == []
+    finally:
+        client.shutdown()
 
 
 def test_closing_the_channel_leaves_no_orphan_host_processes(mux):

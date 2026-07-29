@@ -14,6 +14,27 @@ internal sealed interface MuxState {
     data class Failed(val cause: String, val hostSetup: Boolean) : MuxState
 }
 
+/**
+ * How a subscriber hears about the host itself rather than about one session.
+ *
+ * The session list and the activity ticks arrive on the same channel as terminal output, so a
+ * screen showing lamps and a screen showing a terminal are reading one connection, one reconnect
+ * loop and one clock. Two channels is what used to let an attached session's lamp and its
+ * neighbour's disagree about what was happening on the same host.
+ */
+internal interface MuxHostListener {
+    /** The host's session list, verbatim `tsess-list` TSV. */
+    fun onSessions(tsv: String)
+
+    /** Sessions that produced output since the previous tick — attached or not. */
+    fun onActivity(sessionNames: List<String>)
+
+    /** The host could not answer for itself; the list on screen is stale, not empty. */
+    fun onControlError(message: String)
+
+    fun onTransportState(state: MuxState)
+}
+
 /** How one registered session hears about its own frames and about the channel underneath it. */
 internal interface MuxSessionListener {
     /** The host attached this session; output is about to follow. */
@@ -59,6 +80,7 @@ internal object TerminalMux {
 
     private val lock = Any()
     private val slots = LinkedHashMap<Int, Slot>()
+    private val hostListeners = LinkedHashSet<MuxHostListener>()
     private val connection = AtomicReference<MuxConnection?>(null)
     private val retryGate = Object()
 
@@ -79,17 +101,7 @@ internal object TerminalMux {
             val sid = (1..MAX_SLOT).firstOrNull { it !in slots } ?: return null
             slot = Slot(sid, sessionName, listener)
             slots[sid] = slot
-
-            // A different host means the held channel is answering for somewhere else.
-            val configChanged = hostConfig != null && hostConfig != config
-            hostConfig = config
-            if (configChanged) connection.get()?.close()
-
-            if (worker == null) {
-                state = MuxState.Connecting
-                worker = thread(name = "terminal-mux", isDaemon = true) { runChannelLoop() }
-            }
-            live = connection.get()
+            live = ensureChannel(config)
         }
         listener.onTransportState(state)
         // Already connected: this session can be opened without waiting for a reconnect.
@@ -99,12 +111,50 @@ internal object TerminalMux {
 
     /** Detaches one session. The channel and every other session keep running. */
     fun unregister(slot: Slot) {
-        val stopping: Boolean
         synchronized(lock) {
             if (slots.remove(slot.sid) == null) return
-            stopping = slots.isEmpty()
         }
         connection.get()?.takeIf { !it.closed }?.send(MuxProtocol.close(slot.sid))
+        stopIfUnused()
+    }
+
+    /**
+     * Starts listening to the host's own state, bringing the channel up if nothing else has. The
+     * session list is a subscriber like any terminal is, which is what lets the list screen run
+     * with no session attached and still share one connection with the terminals.
+     */
+    fun subscribeHost(config: HostConfig, listener: MuxHostListener) {
+        synchronized(lock) {
+            hostListeners.add(listener)
+            ensureChannel(config)
+        }
+        listener.onTransportState(state)
+    }
+
+    fun unsubscribeHost(listener: MuxHostListener) {
+        synchronized(lock) {
+            if (!hostListeners.remove(listener)) return
+        }
+        stopIfUnused()
+    }
+
+    /** Caller holds [lock]. Returns the live connection, if there already is one. */
+    private fun ensureChannel(config: HostConfig): MuxConnection? {
+        // A different host means the held channel is answering for somewhere else.
+        val configChanged = hostConfig != null && hostConfig != config
+        hostConfig = config
+        if (configChanged) connection.get()?.close()
+
+        if (worker == null) {
+            state = MuxState.Connecting
+            worker = thread(name = "terminal-mux", isDaemon = true) { runChannelLoop() }
+        }
+        return connection.get()
+    }
+
+    /** The channel exists for its subscribers; with none left there is nothing to hold open. */
+    private fun stopIfUnused() {
+        val stopping = synchronized(lock) { slots.isEmpty() && hostListeners.isEmpty() }
         if (stopping) shutdownChannel()
     }
 
@@ -120,6 +170,9 @@ internal object TerminalMux {
         if (columns <= 0 || rows <= 0) return
         connection.get()?.takeIf { !it.closed }?.send(MuxProtocol.focus(slot.sid, columns, rows))
     }
+
+    /** What the channel is doing, for callers that have to tell "not answering" from "not up". */
+    fun transportState(): MuxState = state
 
     /** Cuts the backoff short — the app resumed and the radio is usually back already. */
     fun retryNow() {
@@ -139,6 +192,9 @@ internal object TerminalMux {
 
     private fun currentSlots(): List<Slot> = synchronized(lock) { slots.values.toList() }
 
+    private fun currentHostListeners(): List<MuxHostListener> =
+        synchronized(lock) { hostListeners.toList() }
+
     private fun isRunning(): Boolean = synchronized(lock) { worker === Thread.currentThread() }
 
     private fun moveTo(next: MuxState) {
@@ -146,6 +202,7 @@ internal object TerminalMux {
         state = next
         if (BuildConfig.DEBUG) Log.i(TAG, "mux $next")
         for (slot in currentSlots()) slot.listener.onTransportState(next)
+        for (listener in currentHostListeners()) listener.onTransportState(next)
     }
 
     // ---------- the channel's life ----------
@@ -241,6 +298,10 @@ internal object TerminalMux {
     }
 
     private fun dispatch(frame: MuxFrame) {
+        if (frame.sid == MuxProtocol.CONNECTION_SLOT) {
+            dispatchHostState(frame)
+            return
+        }
         val slot = synchronized(lock) { slots[frame.sid] }
         if (slot == null) {
             if (BuildConfig.DEBUG) Log.w(TAG, "frame for unknown slot: $frame")
@@ -260,6 +321,19 @@ internal object TerminalMux {
             }
             MuxProtocol.ERROR -> slot.listener.onError(frame.text)
             else -> if (BuildConfig.DEBUG) Log.w(TAG, "unexpected frame: $frame")
+        }
+    }
+
+    private fun dispatchHostState(frame: MuxFrame) {
+        val listeners = currentHostListeners()
+        when (frame.type) {
+            MuxProtocol.SESSIONS -> for (listener in listeners) listener.onSessions(frame.text)
+            MuxProtocol.ACTIVITY -> {
+                val names = frame.text.lineSequence().filter { it.isNotBlank() }.toList()
+                if (names.isNotEmpty()) for (listener in listeners) listener.onActivity(names)
+            }
+            MuxProtocol.ERROR -> for (listener in listeners) listener.onControlError(frame.text)
+            else -> if (BuildConfig.DEBUG) Log.w(TAG, "unexpected control frame: $frame")
         }
     }
 

@@ -40,9 +40,15 @@ OUTPUT = 0x82
 ENDED = 0x83
 ERROR = 0x84
 
+# mux -> client, on the connection slot only: the host's own state, which
+# belongs to the connection rather than to any one session.
+SESSIONS = 0x85
+ACTIVITY = 0x86
+
 NAMES = {
     OPEN: "OPEN", CLOSE: "CLOSE", INPUT: "INPUT", FOCUS: "FOCUS",
     READY: "READY", OUTPUT: "OUTPUT", ENDED: "ENDED", ERROR: "ERROR",
+    SESSIONS: "SESSIONS", ACTIVITY: "ACTIVITY",
 }
 
 CONNECTION_SLOT = 0
@@ -93,6 +99,22 @@ def focus_frame(sid: int, cols: int, rows: int) -> bytes:
 
 def decode_focus(payload: bytes) -> tuple[int, int]:
     return struct.unpack(">HH", payload)
+
+
+def decode_sessions(payload: bytes) -> list[list[str]]:
+    """The session list as rows of `tsess-list` TSV fields."""
+    return [
+        line.split("\t")
+        for line in payload.decode("utf-8", "replace").splitlines()
+        if line.strip()
+    ]
+
+
+def decode_activity(payload: bytes) -> list[str]:
+    """Names of the sessions that produced output since the previous frame."""
+    return [
+        line for line in payload.decode("utf-8", "replace").splitlines() if line.strip()
+    ]
 
 
 class FrameReader:

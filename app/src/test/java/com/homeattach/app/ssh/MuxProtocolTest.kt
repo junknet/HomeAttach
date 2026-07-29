@@ -150,6 +150,39 @@ class MuxProtocolTest {
         assertThrows(MuxFramingException::class.java) { drain(MuxFrameReader(), poisoned) }
     }
 
+    // ---------- the control slot ----------
+
+    @Test
+    fun `control frame type codes match the host's`() {
+        // Byte-for-byte with server/tests/muxproto.py. A drifted code here does not fail loudly;
+        // it makes the phone quietly ignore the host's session list.
+        assertEquals(0x85, MuxProtocol.SESSIONS)
+        assertEquals(0x86, MuxProtocol.ACTIVITY)
+        assertEquals(0, MuxProtocol.CONNECTION_SLOT)
+    }
+
+    @Test
+    fun `a session list arrives on slot zero as tsv`() {
+        val tsv = "s1\tbash\t~/a\tnone\t80\t24\tdetached\t10\t2\n"
+        val wire = MuxProtocol.encode(MuxProtocol.SESSIONS, 0, tsv.toByteArray())
+        val frame = drain(MuxFrameReader(), wire).single()
+
+        assertEquals(MuxProtocol.SESSIONS, frame.type)
+        assertEquals(MuxProtocol.CONNECTION_SLOT, frame.sid)
+        assertEquals(listOf("s1"), parseSessionList(frame.text).map { it.name })
+    }
+
+    @Test
+    fun `an activity frame is a newline separated name list`() {
+        val wire = MuxProtocol.encode(MuxProtocol.ACTIVITY, 0, "alpha\nbeta\n".toByteArray())
+        val frame = drain(MuxFrameReader(), wire).single()
+
+        assertEquals(
+            listOf("alpha", "beta"),
+            frame.text.lineSequence().filter { it.isNotBlank() }.toList(),
+        )
+    }
+
     @Test
     fun `refuses to encode an out of range slot`() {
         assertThrows(IllegalArgumentException::class.java) {

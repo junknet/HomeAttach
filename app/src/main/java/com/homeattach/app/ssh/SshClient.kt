@@ -18,9 +18,13 @@ data class RemoteTerminalSize(
 
 /**
  * One live terminal session as reported by `tsess-list` on the host. The list format is TSV:
- * `name\tcmd\tcwd\towner\tcols\trows\tstatus\tborn\toutputSequence`. Older builds of the host script emit fewer
- * columns, so everything past [cwd] is optional and defaults to "unknown" ([owner]/[status] empty,
- * sizes null, [bornEpochSeconds] 0) rather than failing the parse.
+ * `name\tcmd\tcwd\towner\tcols\trows\tstatus\tborn\toutputSeq`. Older builds of the host script emit
+ * fewer columns, so everything past [cwd] is optional and defaults to "unknown" ([owner]/[status]
+ * empty, sizes null, [bornEpochSeconds] 0) rather than failing the parse.
+ *
+ * The trailing output sequence is deliberately not carried here. Activity is what the mux's
+ * ACTIVITY frames report, for attached and unattached sessions alike; a second copy of it riding
+ * the list would be a second clock, which is exactly what made the lamps disagree.
  */
 data class RemoteSession(
     val name: String,
@@ -38,8 +42,6 @@ data class RemoteSession(
      * script predates this column.
      */
     val bornEpochSeconds: Long = 0,
-    /** Increments on every PTY output chunk; 0 when the host script predates activity reporting. */
-    val outputSequence: Long = 0,
 )
 
 class SshAuthException(message: String, cause: Throwable? = null) : Exception(message, cause)
@@ -59,7 +61,6 @@ private const val SERVER_ALIVE_COUNT_MAX = 2
 // reliable. $HOME is still provided by sshd, making this portable across host usernames.
 private const val SESSION_LIST_COMMAND = "\$HOME/.local/bin/tsess-list"
 private const val SESSION_KILL_COMMAND = "\$HOME/.local/bin/tsess-kill"
-internal const val SESSION_WATCH_COMMAND = "\$HOME/.local/bin/tsess-watch"
 private const val SESSION_NEW_COMMAND = "\$HOME/.local/bin/tsess-new"
 
 @Volatile
@@ -197,7 +198,6 @@ internal fun parseSessionLine(line: String): RemoteSession? {
         rows = parts.getOrNull(5)?.toIntOrNull(),
         status = parts.getOrElse(6) { "" },
         bornEpochSeconds = parts.getOrNull(7)?.toLongOrNull() ?: 0,
-        outputSequence = parts.getOrNull(8)?.toLongOrNull() ?: 0,
     )
 }
 

@@ -3,7 +3,6 @@ package com.homeattach.app.ui
 import android.app.Activity
 import android.content.Context
 import android.content.ContextWrapper
-import android.os.SystemClock
 import android.view.View
 import android.view.inputmethod.InputMethodManager
 import android.widget.Toast
@@ -60,7 +59,6 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
@@ -106,8 +104,6 @@ import kotlinx.coroutines.launch
 import androidx.compose.ui.unit.sp
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.ui.text.font.FontWeight
-import com.homeattach.app.terminal.REMOTE_OUTPUT_ACTIVITY_WINDOW_MS
-import com.homeattach.app.terminal.isRemoteOutputActive
 
 private const val KEY_REPEAT_INITIAL_DELAY_MS = 400L
 private const val KEY_REPEAT_INTERVAL_MS = 60L
@@ -129,10 +125,12 @@ fun TerminalScreen(
     sessionLabel: String = sessionName,
 ) {
     val scope = rememberCoroutineScope()
-    // The drawer's session list is the same process-wide feed the list screen collects - one
-    // tsess-watch on the host, not one per screen.
+    // The drawer's session list is the same process-wide feed the list screen collects, arriving on
+    // the same mux channel as this terminal's own output - one subscription on the host, not one
+    // per screen and not one per session.
     val snapshot by RemoteSessionFeed.sessions(settingsStore).collectAsStateWithLifecycle()
     val sessions = (snapshot as? SessionsSnapshot.Live)?.sessions.orEmpty()
+    val activity by RemoteSessionFeed.activity.collectAsStateWithLifecycle()
     var terminalView by remember { mutableStateOf<TerminalView?>(null) }
     val leaveRequested = remember(sessionName) { AtomicBoolean(false) }
     val context = LocalContext.current
@@ -146,9 +144,7 @@ fun TerminalScreen(
     }
     val remoteTerminalSession = attachment.terminal
     val status by attachment.status.collectAsState()
-    val lastRemoteOutputElapsedMs by attachment.lastRemoteOutputElapsedMs.collectAsState()
     val hasOutput by attachment.hasOutput.collectAsState()
-    val remoteOutputActive = rememberRemoteOutputActivity(lastRemoteOutputElapsedMs)
 
     // Live IME composing text (voice dictation stream). A pty can't express rewrites, so the
     // preedit renders locally in an overlay strip; only the finalized text goes down the wire.
@@ -388,7 +384,9 @@ fun TerminalScreen(
                             TerminalSessionDrawerItem(
                                 session = session,
                                 selected = isCurrent,
-                                outputActive = isCurrent && remoteOutputActive,
+                                // Every row, not only the one on screen: the drawer exists to
+                                // answer "is anything happening in the others".
+                                activityTick = activity[session.name] ?: 0L,
                                 onClick = {
                                     scope.launch { drawerState.close() }
                                     if (!isCurrent) {
@@ -453,12 +451,14 @@ fun TerminalScreen(
                                         if (hasFocus) attachment.claimFocus()
                                     }
                                     remoteTerminalSession.onScreenUpdated = { view.onScreenUpdated() }
+                                    remoteTerminalSession.onUserInput = { view.scrollToBottom() }
                                     terminalView = view
                                 }
                             },
                             update = { view ->
                                 view.attachSession(remoteTerminalSession.session)
                                 remoteTerminalSession.onScreenUpdated = { view.onScreenUpdated() }
+                                remoteTerminalSession.onUserInput = { view.scrollToBottom() }
                             },
                         )
                         // Left-edge swipe zone: only this thin strip opens the drawer, so the
@@ -500,16 +500,9 @@ fun TerminalScreen(
                     }
                 }
 
-                // Kept on the terminal itself, not only in the closed session drawer: output from
-                // a TUI is an activity signal the user should be able to see without navigating.
-                SessionActivityLamp(
-                    outputActive = remoteOutputActive,
-                    connected = status is AttachStatus.Connected,
-                    modifier = Modifier
-                        .align(Alignment.TopEnd)
-                        .padding(top = 12.dp, end = 12.dp)
-                        .size(10.dp),
-                )
+                // No lamp over the terminal itself. The session on screen reports its activity by
+                // being the session on screen — a light saying "this is printing" on top of the
+                // printing is redundant, and it sat where a full-screen TUI draws.
 
                 // 2. Blocking spinner only until the terminal has drawn something. Keyed off
                 //    hasOutput, not the connection state, so a later drop repaints a banner over
@@ -599,9 +592,10 @@ fun TerminalScreen(
 private fun TerminalSessionDrawerItem(
     session: RemoteSession,
     selected: Boolean,
-    outputActive: Boolean,
+    activityTick: Long,
     onClick: () -> Unit,
 ) {
+    val outputActive = rememberSessionOutputActivity(activityTick)
     val background = if (selected) {
         MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.72f)
     } else {
@@ -621,7 +615,8 @@ private fun TerminalSessionDrawerItem(
         SessionActivityLamp(
             outputActive = outputActive,
             connected = session.status == "focused",
-            modifier = Modifier.size(8.dp),
+            // Wider than the dot it draws: the halo lives in the outer third.
+            modifier = Modifier.size(14.dp),
         )
         Column(
             modifier = Modifier
@@ -645,23 +640,6 @@ private fun TerminalSessionDrawerItem(
             }
         }
     }
-}
-
-/** Keeps a received-output flash alive briefly after the last remote byte, then turns it off. */
-@Composable
-private fun rememberRemoteOutputActivity(lastOutputElapsedMs: Long): Boolean {
-    val nowElapsedMs by produceState(
-        initialValue = SystemClock.elapsedRealtime(),
-        lastOutputElapsedMs,
-    ) {
-        value = SystemClock.elapsedRealtime()
-        val remainingMs = lastOutputElapsedMs + REMOTE_OUTPUT_ACTIVITY_WINDOW_MS - value
-        if (lastOutputElapsedMs > 0L && remainingMs > 0L) {
-            delay(remainingMs)
-            value = SystemClock.elapsedRealtime()
-        }
-    }
-    return isRemoteOutputActive(lastOutputElapsedMs, nowElapsedMs)
 }
 
 private tailrec fun Context.findHostActivity(): Activity? = when (this) {

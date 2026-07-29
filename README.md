@@ -51,8 +51,9 @@ exits (or is killed), the socket and the ring buffer disappear with it.
    cp server/tsess server/tsess-* server/sharepty/sharepty ~/.local/bin/
    chmod +x ~/.local/bin/tsess ~/.local/bin/tsess-* ~/.local/bin/sharepty
    ```
-   The app execs `tsess-list`/`tsess-kill`/`tsess-focus`/`tsess-release`/
-   `tsess-watch`/`tsess-attach` from `$HOME/.local/bin`. Non-login SSH exec
+   The app execs `tsess-mux` (which carries every attached terminal and the
+   session list) plus `tsess-list`/`tsess-kill`/`tsess-new` from
+   `$HOME/.local/bin`. Non-login SSH exec
    shells do not source `.zshrc`, so relying on `PATH` is intentionally
    avoided.
 

@@ -2,23 +2,21 @@ package com.homeattach.app.ssh
 
 import com.homeattach.app.data.HostConfig
 import com.homeattach.app.data.SettingsStore
-import com.jcraft.jsch.ChannelExec
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.callbackFlow
-import kotlinx.coroutines.flow.first
-import kotlinx.coroutines.flow.flow
-import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.stateIn
-import kotlinx.coroutines.withTimeoutOrNull
-import java.nio.charset.StandardCharsets
-import kotlin.concurrent.thread
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
 
 /** The host's live session list, as the app last managed to see it. */
 sealed interface SessionsSnapshot {
@@ -32,122 +30,147 @@ sealed interface SessionsSnapshot {
 }
 
 /**
- * The host's session list as one process-wide feed.
+ * The host's own state — which sessions exist, and which of them are producing output — as one
+ * process-wide feed riding the shared mux channel.
  *
- * Both the list screen and the terminal's drawer want exactly this list, and each used to run its
- * own SSH connection and its own `tsess-watch` for it. That did not merely duplicate work, it
- * leaked: cancelling a coroutine cannot interrupt a blocked socket read, so the reader survived
- * its collector and every trip into a terminal and back stranded another connection and another
- * watch process on the host, without bound.
- *
- * One feed fixes both. `WhileSubscribed` tears the channel down once the last collector leaves,
- * and [awaitClose] closing the channel is what actually unblocks the reader — the thing the old
- * code had no way to express.
+ * It reads the connection slot of [TerminalMux] rather than running a channel of its own. That is
+ * the whole point: the list screen, the terminal's drawer and the attached terminals are then one
+ * connection, one reconnect loop and one clock. When this was a separate `tsess-watch` channel, an
+ * attached session's activity came from its arriving bytes while every other session's came from a
+ * five-second list poll, so no two lamps on screen could agree about the same host.
  */
 object RemoteSessionFeed {
     // Process-scoped on purpose: the feed must survive the gap between one screen leaving and the
-    // next arriving, or navigating would restart tsess-watch on every hop.
+    // next arriving, or navigating would drop the subscription on every hop.
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val retryRequests = MutableSharedFlow<Unit>(extraBufferCapacity = 1)
 
     @Volatile
     private var shared: StateFlow<SessionsSnapshot>? = null
 
+    private val _activity = MutableStateFlow<Map<String, Long>>(emptyMap())
+
+    /**
+     * Session name to a counter that increases every time that session emitted output. A counter
+     * rather than a timestamp because the UI wants "it moved again", and a repeated timestamp
+     * cannot say that; how long a lamp stays lit for one tick is the screen's business.
+     */
+    val activity: StateFlow<Map<String, Long>> = _activity.asStateFlow()
+
     /** The shared feed, started on first collect and stopped [LINGER_MS] after the last one. */
     @Synchronized
     fun sessions(settingsStore: SettingsStore): StateFlow<SessionsSnapshot> =
         shared ?: feed(settingsStore)
-            .flowOn(Dispatchers.IO)
             .stateIn(scope, SharingStarted.WhileSubscribed(LINGER_MS), SessionsSnapshot.Loading)
             .also { shared = it }
 
     /** Skip the backoff (pull-to-refresh, or the app coming back to the foreground). */
     fun retryNow() {
+        // Both: the request re-reads settings for whoever is collecting, and the direct call still
+        // cuts the backoff when nothing is.
         retryRequests.tryEmit(Unit)
+        TerminalMux.retryNow()
     }
 
-    private fun feed(settingsStore: SettingsStore): Flow<SessionsSnapshot> = flow {
+    private fun feed(settingsStore: SettingsStore): Flow<SessionsSnapshot> = callbackFlow {
         var everLive = false
-        while (true) {
-            try {
-                watchStream(settingsStore.load()).collect { list ->
-                    everLive = true
-                    emit(SessionsSnapshot.Live(list))
-                }
-                // Clean EOF: the host closed the feed. Re-establish.
-            } catch (e: Exception) {
-                // Losing the feed must never blank a list the user is reading: keep the last good
-                // one on screen and retry quietly. Only a feed that never produced anything has an
-                // error worth showing in place of data.
-                if (!everLive) emit(SessionsSnapshot.Failed(describe(e)))
+        val listener = object : MuxHostListener {
+            override fun onSessions(tsv: String) {
+                val sessions = parseSessionList(tsv)
+                everLive = true
+                pruneActivity(sessions)
+                trySend(SessionsSnapshot.Live(sessions))
             }
-            awaitRetry()
+
+            override fun onActivity(sessionNames: List<String>) = bumpActivity(sessionNames)
+
+            override fun onControlError(message: String) {
+                // The host answered but could not describe itself. A list already on screen is
+                // stale, not wrong, and blanking it would cost the user more than the staleness.
+                if (!everLive) trySend(SessionsSnapshot.Failed(message))
+            }
+
+            override fun onTransportState(state: MuxState) {
+                // Reconnects are the mux's business and it retries on its own; only a state
+                // nothing can revive from replaces a list the user is reading.
+                if (state is MuxState.Failed && !everLive) {
+                    trySend(SessionsSnapshot.Failed(state.cause))
+                }
+            }
         }
-    }
 
-    /**
-     * One run of `tsess-watch`: the host pushes the full list on start, the instant a session is
-     * born or dies (inotify), and every ~5s as a heartbeat.
-     */
-    private fun watchStream(config: HostConfig): Flow<List<RemoteSession>> = callbackFlow {
-        val session = SharedSshSession.acquire(config)
-        val channel = session.openChannel("exec") as ChannelExec
-        channel.setCommand(SESSION_WATCH_COMMAND)
-        val input = channel.inputStream
-        channel.connect(CONNECT_TIMEOUT_MS)
+        var subscribedWith = settingsStore.load()
+        TerminalMux.subscribeHost(subscribedWith, listener)
 
-        val reader = thread(name = "remote-session-feed", isDaemon = true) {
-            try {
-                var block: MutableList<RemoteSession>? = null
-                var sawAnyBlock = false
-                input.bufferedReader(StandardCharsets.UTF_8).forEachLine { line ->
-                    when {
-                        line == "#BEGIN" -> block = mutableListOf()
-                        line == "#END" -> {
-                            block?.let {
-                                sawAnyBlock = true
-                                // Ordered here, once, so the list screen and the terminal's
-                                // drawer can never disagree about what order sessions are in.
-                                // The host emits socket-glob order, which is hash order and has
-                                // no useful relationship to the user's work.
-                                trySend(it.sortedForDisplay())
-                            }
-                            block = null
-                        }
-                        else -> block?.let { open -> parseSessionLine(line)?.let(open::add) }
-                    }
+        val hostTooOld = launch {
+            // A channel that is up and still has not said a word about the host is a PC running a
+            // `tsess-mux` from before the session list moved onto this channel. Nothing will ever
+            // arrive, and an empty list forever is the least useful way to say so.
+            while (!everLive) {
+                delay(HOST_SILENCE_TIMEOUT_MS)
+                if (everLive) break
+                if (TerminalMux.transportState() is MuxState.Connected) {
+                    trySend(SessionsSnapshot.Failed(HOST_TOO_OLD))
+                    break
                 }
-                if (sawAnyBlock) {
-                    close()
-                } else {
-                    // Immediate EOF without a single block means tsess-watch is missing or broke
-                    // on the host - surface it rather than spinning on a feed that cannot work.
-                    close(SshConnectException("tsess-watch produced no output (exit=${channel.exitStatus})"))
+            }
+        }
+
+        val retries = launch {
+            retryRequests.collect {
+                // Settings can have changed the host under us since we subscribed; re-subscribing
+                // with the new one is what makes "pull to refresh" mean the machine the user just
+                // typed in rather than the one they left.
+                val latest = settingsStore.load()
+                if (latest != subscribedWith) {
+                    TerminalMux.unsubscribeHost(listener)
+                    subscribedWith = latest
+                    TerminalMux.subscribeHost(latest, listener)
                 }
-            } catch (e: Exception) {
-                close(e)
+                TerminalMux.retryNow()
             }
         }
 
         awaitClose {
-            // The reader is parked in a blocking read that ignores both cancellation and
-            // interrupt; closing the channel under it is the only thing that wakes it up. Skip
-            // this and the thread — and its tsess-watch on the host — outlive us forever.
-            runCatching { channel.disconnect() }
-            reader.interrupt()
+            retries.cancel()
+            hostTooOld.cancel()
+            TerminalMux.unsubscribeHost(listener)
         }
     }
 
-    /** Waits out the reconnect backoff, cut short by [retryNow]. */
-    private suspend fun awaitRetry() {
-        withTimeoutOrNull(RETRY_DELAY_MS) { retryRequests.first() }
+    private fun bumpActivity(sessionNames: List<String>) {
+        _activity.update { current ->
+            val next = HashMap(current)
+            for (name in sessionNames) next[name] = (next[name] ?: 0L) + 1L
+            next
+        }
     }
 
-    private fun describe(e: Exception): String = e.message ?: e::class.simpleName ?: "unknown error"
+    /** Sessions that no longer exist must not keep a counter alive for a name that may come back. */
+    private fun pruneActivity(sessions: List<RemoteSession>) {
+        val live = sessions.mapTo(HashSet()) { it.name }
+        _activity.update { current ->
+            if (current.keys.all { it in live }) current else current.filterKeys { it in live }
+        }
+    }
 
     private const val LINGER_MS = 5_000L
-    private const val RETRY_DELAY_MS = 2_000L
+
+    /** Generous: the host sends its first list within a tick, so this only ever expires on a
+     * host that is never going to send one. */
+    private const val HOST_SILENCE_TIMEOUT_MS = 8_000L
+
+    private const val HOST_TOO_OLD =
+        "The PC answered but never sent its session list. Its HomeAttach scripts are older than " +
+            "this app - run server/install.sh there."
 }
+
+/** One `tsess-list` TSV block, in the order the screens show it. */
+internal fun parseSessionList(tsv: String): List<RemoteSession> =
+    tsv.lineSequence()
+        .mapNotNull { parseSessionLine(it) }
+        .toList()
+        .sortedForDisplay()
 
 /** Groups sessions by working directory, then by the process running in that directory. */
 internal fun List<RemoteSession>.sortedForDisplay(): List<RemoteSession> = sortedWith(

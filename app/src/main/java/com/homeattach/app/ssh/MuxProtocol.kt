@@ -26,6 +26,12 @@ internal object MuxProtocol {
     const val ENDED = 0x83
     const val ERROR = 0x84
 
+    // host -> phone, on the connection slot: the host's own state rather than any one session's.
+    // The session list and the activity ticks ride here instead of on a channel of their own,
+    // which is what makes every lamp read from one clock.
+    const val SESSIONS = 0x85
+    const val ACTIVITY = 0x86
+
     const val CONNECTION_SLOT = 0
     const val HEADER_BYTES = 6
 
@@ -82,6 +88,8 @@ internal class MuxFrame(val type: Int, val sid: Int, val payload: ByteArray) {
             MuxProtocol.OUTPUT -> "OUTPUT"
             MuxProtocol.ENDED -> "ENDED"
             MuxProtocol.ERROR -> "ERROR"
+            MuxProtocol.SESSIONS -> "SESSIONS"
+            MuxProtocol.ACTIVITY -> "ACTIVITY"
             else -> "0x%02x".format(type)
         }
         return "MuxFrame($kind, sid=$sid, ${payload.size}B)"

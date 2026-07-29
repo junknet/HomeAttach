@@ -5,11 +5,12 @@ The suite never runs the real binary and never touches a real session: the
 sessions on this machine belong to the user, and a test that floods, resizes or
 kills one of them is not a test, it is an accident.
 
-Only the three verbs `tsess-mux` depends on are implemented:
+Only the verbs `tsess-mux` depends on are implemented:
 
     attach --mirror <name>   stream output, accept input
     claim <name> <cols> <rows>
     release <name>
+    stat                     bulk status, read verbatim from $FAKE_ZMX_STAT
 
 `claim` and `release` append one line to $FAKE_ZMX_LOG so a test can assert
 what the mux asked the host to do, and how many times.
@@ -130,6 +131,15 @@ def main(argv: list[str]) -> int:
 
     if verb in ("claim", "release"):
         log_call(verb, args)
+        return 0
+
+    if verb == "stat":
+        # Bulk form only: one process answering for every session is the whole
+        # reason the mux may poll this several times a second.
+        path = os.environ.get("FAKE_ZMX_STAT")
+        if path and os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as handle:
+                sys.stdout.write(handle.read())
         return 0
 
     print(f"fake_zmx: unsupported verb {verb}", file=sys.stderr)

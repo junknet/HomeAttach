@@ -26,6 +26,7 @@ SERVER_DIR = Path(__file__).resolve().parent.parent
 # installing it, and so the harness itself can be exercised against a stub.
 MUX = Path(os.environ.get("TSESS_MUX") or SERVER_DIR / "tsess-mux").resolve()
 FAKE_ZMX = Path(__file__).resolve().parent / "fake_zmx.py"
+FAKE_LIST = Path(__file__).resolve().parent / "fake_list.py"
 
 DEFAULT_TIMEOUT_S = 5.0
 
@@ -58,6 +59,66 @@ def zmx_log(tmp_path: Path) -> Path:
     return path
 
 
+class FakeHost:
+    """The host's session state, as the mux is able to observe it.
+
+    Two files, because the mux reads them through two different commands: what
+    `zmx stat` answers (names and output sequences) and what `tsess-list`
+    prints (the full TSV). A test moves the host by writing them.
+    """
+
+    def __init__(self, tmp_path: Path):
+        self.stat_file = tmp_path / "zmx-stat.txt"
+        self.list_file = tmp_path / "tsess-list.tsv"
+        self.stat_file.touch()
+        self.list_file.touch()
+        self.fail_list = False
+        self.set_sessions({})
+
+    def set_sessions(self, sequences: dict[str, int]) -> None:
+        """Declare which sessions exist and how much output each has emitted."""
+        self._write(
+            self.stat_file,
+            "".join(
+                f"name={name} pid=1 cols=80 rows=24 owners=1 mirrors=0 "
+                f"bound=1 output_seq={seq}\n"
+                for name, seq in sequences.items()
+            ),
+        )
+        self._write(
+            self.list_file,
+            "".join(
+                f"{name}\tbash\t~/work\tpc\t80\t24\tidle\t1700000000\t{seq}\n"
+                for name, seq in sequences.items()
+            ),
+        )
+
+    @staticmethod
+    def _write(path: Path, content: str) -> None:
+        """Atomically, because the mux polls these files several times a second.
+        A plain write truncates first, and a poll landing in that window reads an
+        empty host — which is a state the real `zmx stat` can never be caught in,
+        since its answer arrives whole down a pipe."""
+        scratch = path.with_suffix(path.suffix + ".new")
+        scratch.write_text(content)
+        os.replace(scratch, path)
+
+    def env(self) -> dict[str, str]:
+        environment = {
+            "FAKE_ZMX_STAT": str(self.stat_file),
+            "FAKE_LIST_FILE": str(self.list_file),
+            "HOMEATTACH_TSESS_LIST": f"{sys.executable} {FAKE_LIST}",
+        }
+        if self.fail_list:
+            environment["FAKE_LIST_FAIL"] = "1"
+        return environment
+
+
+@pytest.fixture
+def host(tmp_path: Path) -> FakeHost:
+    return FakeHost(tmp_path)
+
+
 def read_calls(zmx_log: Path) -> list[str]:
     return [line for line in zmx_log.read_text().splitlines() if line.strip()]
 
@@ -84,7 +145,8 @@ class MuxClient:
     """Drives one `tsess-mux` process the way the Android app would."""
 
     def __init__(self, zmx_log: Path, tmp_path: Path,
-                 read_chunk: int = 65536, read_pause_s: float = 0.0):
+                 read_chunk: int = 65536, read_pause_s: float = 0.0,
+                 extra_env: dict[str, str] | None = None):
         # A throttled reader is not an artificial handicap: the phone parses VT100
         # on its main thread under a per-frame byte budget, so it consumes far
         # slower than the host produces. Starvation only becomes observable once
@@ -102,6 +164,7 @@ class MuxClient:
             # one I named" — so the mux would silently drive the wrong terminal. Every test runs
             # with it set so the stripping cannot quietly regress.
             "ZMX_SESSION": "leaked-outer-session",
+            **(extra_env or {}),
         }
         self.proc = subprocess.Popen(
             [str(MUX)],
@@ -226,8 +289,8 @@ class MuxClient:
 
 
 @pytest.fixture
-def mux(require_mux, zmx_log: Path, tmp_path: Path):
-    client = MuxClient(zmx_log, tmp_path)
+def mux(require_mux, zmx_log: Path, tmp_path: Path, host: FakeHost):
+    client = MuxClient(zmx_log, tmp_path, extra_env=host.env())
     try:
         yield client
     finally:
@@ -235,10 +298,11 @@ def mux(require_mux, zmx_log: Path, tmp_path: Path):
 
 
 @pytest.fixture
-def slow_mux(require_mux, zmx_log: Path, tmp_path: Path):
+def slow_mux(require_mux, zmx_log: Path, tmp_path: Path, host: FakeHost):
     """A mux read at roughly phone speed — 8KB per 20ms, ~400KB/s — so its
     stdout backs up the way it does over a real cellular link."""
-    client = MuxClient(zmx_log, tmp_path, read_chunk=8192, read_pause_s=0.02)
+    client = MuxClient(zmx_log, tmp_path, read_chunk=8192, read_pause_s=0.02,
+                       extra_env=host.env())
     try:
         yield client
     finally:

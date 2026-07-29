@@ -485,8 +485,9 @@ pub fn main() !void {
         }
         return controlMessage(alloc, &cfg, session_name, .Release, "");
     } else if (std.mem.eql(u8, cmd, "stat")) {
-        // zmx stat <session>: one "key=value ..." line for shell scripts.
-        const session_name = args.next() orelse return error.SessionNameRequired;
+        // zmx stat [session]: one "key=value ..." line for shell scripts, or
+        // one line per live session when no name is given.
+        const session_name = args.next() orelse return statAll(alloc, &cfg);
         if (std.mem.eql(u8, session_name, "--help") or std.mem.eql(u8, session_name, "-h")) {
             return help();
         }
@@ -522,17 +523,12 @@ fn controlMessage(
     };
 }
 
-/// Query a session daemon for its status line and print it to stdout.
-fn stat(alloc: std.mem.Allocator, cfg: *Cfg, session_name: []const u8) !void {
-    const socket_path = socket.getSocketPath(alloc, cfg.socket_dir, session_name) catch |err| switch (err) {
-        error.NameTooLong => return socket.printSessionNameTooLong(session_name, cfg.socket_dir),
-        error.OutOfMemory => return err,
-    };
+/// One session daemon's status line, owned by the caller. Silent on failure:
+/// [statAll] walks sessions that may die between listing and asking.
+fn statLine(alloc: std.mem.Allocator, cfg: *Cfg, session_name: []const u8) ![]u8 {
+    const socket_path = try socket.getSocketPath(alloc, cfg.socket_dir, session_name);
     defer alloc.free(socket_path);
-    const fd = ipc.connectSession(socket_path) catch |err| {
-        std.log.err("session unresponsive: {s}", .{@errorName(err)});
-        return err;
-    };
+    const fd = try ipc.connectSession(socket_path);
     defer posix.close(fd);
     try ipc.send(fd, .Stat, "");
 
@@ -544,15 +540,50 @@ fn stat(alloc: std.mem.Allocator, cfg: *Cfg, session_name: []const u8) !void {
     const n = try sb.read(fd);
     if (n == 0) return error.ConnectionClosed;
     while (sb.next()) |msg| {
-        if (msg.header.tag == .Stat) {
-            var buf: [256]u8 = undefined;
-            var stdout = std.fs.File.stdout().writer(&buf);
-            try stdout.interface.print("{s}", .{msg.payload});
-            try stdout.interface.flush();
-            return;
-        }
+        if (msg.header.tag == .Stat) return alloc.dupe(u8, msg.payload);
     }
     return error.Unexpected;
+}
+
+/// Query a session daemon for its status line and print it to stdout.
+fn stat(alloc: std.mem.Allocator, cfg: *Cfg, session_name: []const u8) !void {
+    const line = statLine(alloc, cfg, session_name) catch |err| switch (err) {
+        error.NameTooLong => return socket.printSessionNameTooLong(session_name, cfg.socket_dir),
+        else => {
+            std.log.err("session unresponsive: {s}", .{@errorName(err)});
+            return err;
+        },
+    };
+    defer alloc.free(line);
+    var buf: [256]u8 = undefined;
+    var stdout = std.fs.File.stdout().writer(&buf);
+    try stdout.interface.print("{s}", .{line});
+    try stdout.interface.flush();
+}
+
+/// Every live session's status line, `name=` first.
+///
+/// HomeAttach's phone-side activity feed polls this a few times a second to
+/// tell which sessions are producing output. Spawning `zmx stat` once per
+/// session is what makes that poll cost real money — the session count
+/// multiplies the process count — so the walk happens inside one process, and
+/// a session that dies between the listing and the question is skipped rather
+/// than failing the batch.
+fn statAll(alloc: std.mem.Allocator, cfg: *Cfg) !void {
+    var dir = std.fs.openDirAbsolute(cfg.socket_dir, .{ .iterate = true }) catch return;
+    defer dir.close();
+
+    var buf: [4096]u8 = undefined;
+    var stdout = std.fs.File.stdout().writer(&buf);
+    var iter = dir.iterate();
+    while (try iter.next()) |entry| {
+        const exists = socket.sessionExists(dir, entry.name) catch continue;
+        if (!exists) continue;
+        const line = statLine(alloc, cfg, entry.name) catch continue;
+        defer alloc.free(line);
+        try stdout.interface.print("name={s} {s}", .{ entry.name, line });
+    }
+    try stdout.interface.flush();
 }
 
 /// Client represents each terminal that has connected to a session.
@@ -2217,9 +2248,15 @@ fn attach(daemon: *Daemon, mirror: bool) !void {
         if (stdin_is_tty) {
             _ = cross.c.tcsetattr(posix.STDIN_FILENO, cross.c.TCSAFLUSH, &orig_termios);
         }
-        // Reset terminal modes on detach:
-        const restore_seq = "\x1bc";
-        _ = posix.write(posix.STDOUT_FILENO, restore_seq) catch {};
+        // Reset terminal modes on detach — but never for a mirror. A mirror's
+        // stdout is not a terminal the user owns, it is HomeAttach's byte pipe
+        // to a phone that keeps the session on screen across the detach. RIS
+        // there resets the phone's emulator: scrollback, cursor and modes all
+        // gone, every time the radio drops.
+        if (!mirror) {
+            const restore_seq = "\x1bc";
+            _ = posix.write(posix.STDOUT_FILENO, restore_seq) catch {};
+        }
     }
 
     if (stdin_is_tty) {
@@ -2242,8 +2279,16 @@ fn attach(daemon: *Daemon, mirror: bool) !void {
 
     // Clear screen before attaching. This provides a clean slate before
     // the session restore.
-    const clear_seq = "\x1b[2J\x1b[H";
-    _ = try posix.write(posix.STDOUT_FILENO, clear_seq);
+    //
+    // Not for a mirror: the state snapshot that follows repaints the screen by
+    // itself, so the clear buys a local terminal a clean slate and costs a
+    // remote one everything above the fold. On the phone it is what turns every
+    // re-attach — and every reconnect after a radio gap — into a wiped
+    // scrollback and a full repaint instead of the session simply resuming.
+    if (!mirror) {
+        const clear_seq = "\x1b[2J\x1b[H";
+        _ = try posix.write(posix.STDOUT_FILENO, clear_seq);
+    }
 
     const looper = try clientLoop(client_sock, mirror);
     switch (looper.kind) {

@@ -1,7 +1,6 @@
 package com.homeattach.app.terminal
 
 import android.content.Context
-import android.os.SystemClock
 import android.util.Log
 import com.homeattach.app.BuildConfig
 import com.homeattach.app.data.HostConfig
@@ -82,10 +81,6 @@ class TerminalAttachment(
      */
     private val _hasOutput = MutableStateFlow(false)
     val hasOutput: StateFlow<Boolean> = _hasOutput.asStateFlow()
-
-    /** Monotonic time of the latest remote bytes, used by the session drawer's activity lamp. */
-    private val _lastRemoteOutputElapsedMs = MutableStateFlow(0L)
-    val lastRemoteOutputElapsedMs: StateFlow<Long> = _lastRemoteOutputElapsedMs.asStateFlow()
 
     private val released = AtomicBoolean(false)
 
@@ -181,6 +176,7 @@ class TerminalAttachment(
         slot.getAndSet(null)?.let(TerminalMux::unregister)
         terminal.onScreenUpdated = {}
         terminal.onFirstOutput = {}
+        terminal.onUserInput = {}
         terminal.finish()
     }
 
@@ -196,7 +192,6 @@ class TerminalAttachment(
 
     private fun handleOutput(data: ByteArray) {
         if (released.get()) return
-        _lastRemoteOutputElapsedMs.value = SystemClock.elapsedRealtime()
         terminal.appendRemoteOutput(data, 0, data.size)
     }
 
@@ -255,11 +250,3 @@ class TerminalAttachment(
         const val NO_FREE_SLOT = "too many terminals open"
     }
 }
-
-/** True while the drawer's activity lamp should flash after receiving remote terminal output. */
-internal fun isRemoteOutputActive(lastOutputElapsedMs: Long, nowElapsedMs: Long): Boolean =
-    lastOutputElapsedMs > 0L &&
-        nowElapsedMs >= lastOutputElapsedMs &&
-        nowElapsedMs - lastOutputElapsedMs < REMOTE_OUTPUT_ACTIVITY_WINDOW_MS
-
-internal const val REMOTE_OUTPUT_ACTIVITY_WINDOW_MS = 600L
