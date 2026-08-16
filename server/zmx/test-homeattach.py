@@ -176,6 +176,30 @@ def main():
     zmx("kill", "t2")
     wait_for(lambda: not session_exists("t2"), 5.0)
 
+    print("== mirror mouse reports reach the pty without claiming size ==")
+    mouse_program = (
+        "import os, time, tty; tty.setraw(0); "
+        "os.write(1, os.read(0, 11).hex().encode() + b'\\n'); time.sleep(2)"
+    )
+    mouse_owner = PtyClient(
+        ["attach", "--bind", "t6", "python3", "-u", "-c", mouse_program],
+        cols=80,
+        rows=24,
+    )
+    wait_for(lambda: stat("t6").get("owners") == "1")
+    mouse_mirror = PtyClient(["attach", "--mirror", "t6"], cols=60, rows=20)
+    wait_for(lambda: stat("t6").get("mirrors") == "1")
+    mouse_mirror.send(b"\x1b[<64;1;1M")
+    out = mouse_owner.drain(1.2)
+    check("mirror mouse report reaches the pty", b"1b5b3c36343b313b314d" in out,
+          out[-200:].decode(errors="replace"))
+    s = stat("t6")
+    check("pty size still owner's after mirror mouse report",
+          s.get("cols") == "80" and s.get("rows") == "24", str(s))
+    mouse_owner.close()
+    mouse_mirror.close()
+    wait_for(lambda: not session_exists("t6"), 5.0)
+
     print("== a mirror never clears or resets the caller's terminal ==")
     # The mirror's stdout is HomeAttach's pipe to a phone that keeps the session
     # on screen across detaches: a clear costs it the scrollback, an RIS costs it

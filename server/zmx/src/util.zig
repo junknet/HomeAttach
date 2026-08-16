@@ -515,12 +515,12 @@ pub fn isUserInput(payload: []const u8) bool {
 
 /// True when `payload` consists purely of terminal auto-replies/reports:
 /// cursor position reports (CSI..R), DSR (CSI..n), device attributes
-/// (CSI..c), window reports (CSI..t), focus events (CSI I/O), mouse
-/// reports (CSI..M/m/<), and OSC/DCS/APC responses. Mirror clients' input
-/// is dropped when this returns true: the focused client's terminal
-/// already answers the child's queries, and a second reply would corrupt
-/// the child's input stream. Real keystrokes (printables, control chars,
-/// ESC-prefixed keys, arrow/function keys) always return false.
+/// (CSI..c), window reports (CSI..t), focus events (CSI I/O), and
+/// OSC/DCS/APC responses. Mirror clients' input is dropped when this returns
+/// true: the focused client's terminal already answers the child's queries,
+/// and a second reply would corrupt the child's input stream. Mouse reports
+/// are deliberate mirror-client input, so they always return false even
+/// though they share the CSI transport with automatic terminal replies.
 pub fn isTerminalReply(payload: []const u8) bool {
     var parser = ghostty_vt.Parser.init();
     var saw_reply = false;
@@ -533,7 +533,8 @@ pub fn isTerminalReply(payload: []const u8) bool {
                 .execute => return false,
                 .esc_dispatch => return false,
                 .csi_dispatch => |csi| switch (csi.final) {
-                    'R', 'n', 'c', 't', 'I', 'O', 'M', 'm', '<' => saw_reply = true,
+                    'R', 'n', 'c', 't', 'I', 'O' => saw_reply = true,
+                    'M', 'm', '<' => return false,
                     else => return false,
                 },
                 .osc_dispatch => saw_reply = true,
@@ -1490,6 +1491,12 @@ test "isUserInput: mouse events SGR mode CSI < excluded" {
     // Mouse events should NOT trigger leader switch
     try testing.expect(!isUserInput("\x1b[<0;1;1M")); // button release
     try testing.expect(!isUserInput("\x1b[<64;1;1M")); // button press
+}
+
+test "isTerminalReply: mirror mouse events are user input" {
+    // Mouse reports must reach a mirror session without claiming desktop leadership.
+    try testing.expect(!isTerminalReply("\x1b[<64;1;1M")); // wheel up
+    try testing.expect(!isTerminalReply("\x1b[<65;1;1M")); // wheel down
 }
 
 test "isUserInput: focus events excluded" {
