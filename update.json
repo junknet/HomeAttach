@@ -2,7 +2,7 @@
   "versionCode": 16,
   "versionName": "1.4.1",
   "apkUrl": "https://github.com/junknet/HomeAttach/releases/download/v1.4.1/app-release.apk",
-  "sha256": "567626cfd8739a6337048d22562cef32fbc09d3325f2b8a08c21e239ed597e8a",
+  "sha256": "0f222b2f7990af2385e7c30506e05b1dec5c46ee8a618a9727e4961c8af4f2f5",
   "sizeBytes": 28974508,
-  "notes": "Forward touch scroll reports from HomeAttach mirror terminals. Update the PC first by running server/install.sh."
+  "notes": "HomeAttach 1.4.1"
 }
