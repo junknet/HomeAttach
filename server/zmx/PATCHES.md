@@ -88,3 +88,37 @@ few hundred bytes it missed".
 
 Upstream wire-compat: all additions are new IPC tags; old daemons ignore
 unknown tags by design (`Tag` is non-exhaustive).
+
+
+8. **Anchored history pagination** (`--history-pages`, IPC tags
+   `InitPagedResume=20`, `PagedResumeInfo=21`, `HistoryPage=22`).
+   Probe the running daemon's `stat` for `history_pages=1` before enabling the
+   flag. Existing resume messages retain their original binary layouts.
+   A paged snapshot adds `history=<decimal-token> more=<0|1> columns=<width>`
+   to its stderr resume line. The boundary is captured in the same event-loop
+   turn as snapshot serialization, immediately before its oldest transmitted
+   history row. Snapshot defaults to 200 history rows when this flag is used.
+
+   `zmx history-page <name> <anchor> <before> <limit>` returns one JSON object:
+   `status`, string `anchor`, integer `before`, integer `next`, integer
+   `columns`, boolean `more`, and `rows` containing `{text, wrapped}` objects.
+   Start with `before=0`; each response's `next` is the next request's `before`.
+   Rows are ordered oldest to newest within a page. Each text is independently
+   reset styled VT for exactly one physical terminal row; blank rows, wide
+   characters and soft-wrap flags survive. Pages contain at most 128 rows and
+   512 KiB of JSON; reaching the byte budget shortens the page without skipping
+   rows. An individual row exceeding the serialization budget returns
+   `unsupported` instead of truncating terminal state.
+
+   Eight daemon-owned anchors retain tracked Ghostty pins, without copying
+   scrollback. New output and mirror disconnects do not move a cursor's
+   meaning. Continued attaches return `history=0`; callers retain their prior
+   anchor. A ninth snapshot evicts the oldest anchor. Resize, cleared or
+   pruned history, missing anchors and daemon restart return `expired`.
+   Alternate-screen snapshots do not create history anchors. The primary
+   screen's tracked pins are released before terminal destruction.
+
+   Validation: `zig build test -j2` and
+   `python3 test-history-pages.py zig-out/bin/zmx`. The latter uses a unique
+   temporary socket directory and a view-bound fixture; it never touches
+   existing sessions.

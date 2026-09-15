@@ -1,3 +1,4 @@
+const history_pages = @import("history_pages.zig");
 const std = @import("std");
 const posix = std.posix;
 const build_options = @import("build_options");
@@ -133,6 +134,16 @@ pub fn main() !void {
         const sesh = try socket.getSeshName(alloc, session_name orelse sesh_env);
         defer alloc.free(sesh);
         return history(&cfg, sesh, format);
+    } else if (std.mem.eql(u8, cmd, "history-page")) {
+        const session = args.next() orelse return error.SessionRequired;
+        const anchor = args.next() orelse return error.AnchorRequired;
+        const before = args.next() orelse return error.CursorRequired;
+        const limit = args.next() orelse return error.LimitRequired;
+        return historyPage(&cfg, session, .{
+            .anchor = try std.fmt.parseInt(u64, anchor, 10),
+            .before = try std.fmt.parseInt(u64, before, 10),
+            .limit = try std.fmt.parseInt(u32, limit, 10),
+        });
     } else if (std.mem.eql(u8, cmd, "attach") or std.mem.eql(u8, cmd, "a")) {
         // Flags must precede the session name; everything after the name is
         // the command to run inside a newly created session.
@@ -149,6 +160,7 @@ pub fn main() !void {
         //             mirror only: cap the scrollback a snapshot carries.
         var bind_lifetime = false;
         var mirror = false;
+        var history_enabled = false;
         var resume_req: ?ipc.ResumeInit = null;
         var tail_rows: u32 = 0;
         var session_name: []const u8 = "";
@@ -159,6 +171,8 @@ pub fn main() !void {
                 bind_lifetime = true;
             } else if (std.mem.eql(u8, arg, "--mirror")) {
                 mirror = true;
+            } else if (std.mem.eql(u8, arg, "--history-pages")) {
+                history_enabled = true;
             } else if (std.mem.eql(u8, arg, "--resume")) {
                 const spec = args.next() orelse return error.ResumeSpecRequired;
                 const sep = std.mem.indexOfScalar(u8, spec, ':') orelse return error.ResumeSpecRequired;
@@ -177,10 +191,10 @@ pub fn main() !void {
             }
         }
         // A cold mirror still wants the cap; carry it on an empty resume request.
-        if (mirror and tail_rows > 0 and resume_req == null) {
+        if (mirror and (tail_rows > 0 or history_enabled) and resume_req == null) {
             resume_req = .{ .rows = 0, .cols = 0 };
         }
-        if (resume_req) |*req| req.tail_rows = tail_rows;
+        if (resume_req) |*req| req.tail_rows = if (history_enabled and tail_rows == 0) 200 else tail_rows;
 
         var command_args: std.ArrayList([]const u8) = .empty;
         defer command_args.deinit(alloc);
@@ -218,7 +232,7 @@ pub fn main() !void {
             error.OutOfMemory => return err,
         };
         std.log.info("socket path={s}", .{daemon.socket_path});
-        return attach(&daemon, mirror, if (mirror) resume_req else null);
+        return attach(&daemon, mirror, if (mirror) resume_req else null, history_enabled);
     } else if (std.mem.eql(u8, cmd, "run") or std.mem.eql(u8, cmd, "r")) {
         const session_name = args.next() orelse "";
         if (std.mem.eql(u8, session_name, "--help") or std.mem.eql(u8, session_name, "-h")) {
@@ -788,6 +802,7 @@ const Daemon = struct {
     /// behind it is a different terminal entirely. Set once the daemon starts
     /// serving; a client holding epoch 0 has nothing to resume.
     epoch: u64 = 0,
+    history_store: history_pages.Store = .{},
 
     /// How much raw output stays resumable. Two minutes of a chatty build at
     /// 20KB/s, or a whole day of an idle shell - past that a client is better
@@ -1274,6 +1289,7 @@ const Daemon = struct {
         client: *Client,
         term: *ghostty_vt.Terminal,
         payload: []const u8,
+        history_enabled: bool,
     ) !void {
         if (payload.len != @sizeOf(ipc.ResumeInit)) return;
         const req = std.mem.bytesToValue(ipc.ResumeInit, payload);
@@ -1314,7 +1330,16 @@ const Daemon = struct {
             .offset = self.output_bytes,
             .replay_bytes = replay_bytes,
         };
-        try ipc.appendMessage(self.alloc, &client.write_buf, .ResumeInfo, std.mem.asBytes(&status));
+        if (history_enabled) {
+            const metadata = if (!continued and snapshot != null)
+                try self.history_store.capture(term, req.tail_rows)
+            else
+                history_pages.Metadata{ .columns = term.cols };
+            const paged_status = ipc.PagedResumeStatus{ .status = status, .history = metadata };
+            try ipc.appendMessage(self.alloc, &client.write_buf, .PagedResumeInfo, std.mem.asBytes(&paged_status));
+        } else {
+            try ipc.appendMessage(self.alloc, &client.write_buf, .ResumeInfo, std.mem.asBytes(&status));
+        }
         client.has_pending_output = true;
 
         if (continued) {
@@ -1376,6 +1401,7 @@ const Daemon = struct {
             const saved_prompt_redraw = term.flags.shell_redraws_prompt;
             term.flags.shell_redraws_prompt = .false;
             defer term.flags.shell_redraws_prompt = saved_prompt_redraw;
+            self.history_store.clear();
             try term.resize(self.alloc, resize.cols, resize.rows);
 
             // Mark that we've had a client init, so subsequent clients get terminal state
@@ -1415,6 +1441,7 @@ const Daemon = struct {
         const saved_prompt_redraw = term.flags.shell_redraws_prompt;
         term.flags.shell_redraws_prompt = .false;
         defer term.flags.shell_redraws_prompt = saved_prompt_redraw;
+        self.history_store.clear();
         try term.resize(self.alloc, resize.cols, resize.rows);
         std.log.debug("resize rows={d} cols={d}", .{ resize.rows, resize.cols });
     }
@@ -1462,6 +1489,7 @@ const Daemon = struct {
         const saved_prompt_redraw = term.flags.shell_redraws_prompt;
         term.flags.shell_redraws_prompt = .false;
         defer term.flags.shell_redraws_prompt = saved_prompt_redraw;
+        self.history_store.clear();
         try term.resize(self.alloc, resize.cols, resize.rows);
         std.log.info("external claim rows={d} cols={d}", .{ resize.rows, resize.cols });
     }
@@ -1481,6 +1509,16 @@ const Daemon = struct {
         std.log.info("release: no owner attached to return size to", .{});
     }
 
+    pub fn handleHistoryPage(self: *Daemon, client: *Client, payload: []const u8) !void {
+        if (client.did_init or payload.len != @sizeOf(history_pages.Request)) return;
+        const request = std.mem.bytesToValue(history_pages.Request, payload);
+        client.write_buf.clearRetainingCapacity();
+        const response = try self.history_store.respond(self.alloc, request);
+        defer self.alloc.free(response);
+        try ipc.appendMessage(self.alloc, &client.write_buf, .HistoryPage, response);
+        client.has_pending_output = true;
+    }
+
     /// `zmx stat <session>`: one shell-parseable status line.
     pub fn handleStat(self: *Daemon, client: *Client, pty_fd: i32) !void {
         var owners: usize = 0;
@@ -1494,7 +1532,7 @@ const Daemon = struct {
         const line = try std.fmt.bufPrint(
             &buf,
             "pid={d} cols={d} rows={d} owners={d} mirrors={d} bound={d} output_seq={d}" ++
-                " epoch={d} stream_start={d} stream_end={d}\n",
+                " epoch={d} stream_start={d} stream_end={d} history_pages=1\n",
             .{
                 self.pid,
                 size.cols,
@@ -1726,6 +1764,8 @@ fn help() !void {
         \\                                           Attach to session, creating if needed
         \\                                           --bind: session dies with its last owner client
         \\                                           --mirror: view/type without owning the pty size
+        \\                                           --history-pages: provide history cursor (mirror only)
+        \\  history-page <name> <anchor> <before> <limit>  Fetch older physical rows as JSON
         \\  claim <name> <cols> <rows>               Resize the pty externally (focus grant)
         \\  release <name>                           Return the pty size to the first owner client
         \\  stat <name>                              Print one key=value status line
@@ -2338,6 +2378,32 @@ fn fetchHistory(
     return error.NoHistoryResponse;
 }
 
+fn historyPage(configuration: *Cfg, session: []const u8, request: history_pages.Request) !void {
+    const allocator = std.heap.page_allocator;
+    const socket_path = try socket.getSocketPath(allocator, configuration.socket_dir, session);
+    defer allocator.free(socket_path);
+    const connection = try ipc.connectSession(socket_path);
+    defer posix.close(connection);
+    try ipc.send(connection, .HistoryPage, std.mem.asBytes(&request));
+    var incoming = try ipc.SocketBuffer.init(allocator);
+    defer incoming.deinit();
+    const deadline = std.time.milliTimestamp() + 3000;
+    while (std.time.milliTimestamp() < deadline) {
+        var descriptors = [_]posix.pollfd{.{ .fd = connection, .events = posix.POLL.IN, .revents = 0 }};
+        if (try posix.poll(&descriptors, 100) == 0) continue;
+        if (try incoming.read(connection) == 0) return error.ConnectionClosed;
+        while (incoming.next()) |message| {
+            if (message.header.tag == .HistoryPage) {
+                try std.fs.File.stdout().writeAll(message.payload);
+                return;
+            }
+        }
+    }
+    const response = try history_pages.emptyResponse(allocator, request, "unsupported");
+    defer allocator.free(response);
+    try std.fs.File.stdout().writeAll(response);
+}
+
 fn history(cfg: *Cfg, session_name: []const u8, format: util.HistoryFormat) !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -2431,7 +2497,7 @@ fn switchSesh(daemon: *Daemon, current_sesh: []const u8) !void {
     };
 }
 
-fn attach(daemon: *Daemon, mirror: bool, resume_req: ?ipc.ResumeInit) !void {
+fn attach(daemon: *Daemon, mirror: bool, resume_req: ?ipc.ResumeInit, history_enabled: bool) !void {
     const sesh = socket.getSeshNameFromEnv();
     if (sesh.len > 0) {
         return switchSesh(daemon, sesh);
@@ -2502,7 +2568,7 @@ fn attach(daemon: *Daemon, mirror: bool, resume_req: ?ipc.ResumeInit) !void {
         _ = try posix.write(posix.STDOUT_FILENO, clear_seq);
     }
 
-    const looper = try clientLoop(client_sock, mirror, resume_req);
+    const looper = try clientLoop(client_sock, mirror, resume_req, history_enabled);
     switch (looper.kind) {
         .detach => return,
         .switch_session => {
@@ -2534,7 +2600,7 @@ fn attach(daemon: *Daemon, mirror: bool, resume_req: ?ipc.ResumeInit) !void {
                     .created_at = @intCast(std.time.timestamp()),
                     .leader_client_fd = null,
                 };
-                return attach(&target_daemon, mirror, null);
+                return attach(&target_daemon, mirror, null, history_enabled);
             }
         },
     }
@@ -2794,7 +2860,7 @@ const ClientResult = struct {
 
 /// clientLoop sends ipc commands to its corresponding daemon.  It uses poll() as its non-blocking
 /// mechanism. It will send stdin to the daemon and receive stdout from the daemon.
-fn clientLoop(client_sock_fd: i32, mirror: bool, resume_req: ?ipc.ResumeInit) !ClientResult {
+fn clientLoop(client_sock_fd: i32, mirror: bool, resume_req: ?ipc.ResumeInit, history_enabled: bool) !ClientResult {
     // use c_allocator to avoid "reached unreachable code" panic in DebugAllocator when forking
     const alloc = std.heap.c_allocator;
     defer posix.close(client_sock_fd);
@@ -2823,7 +2889,7 @@ fn clientLoop(client_sock_fd: i32, mirror: bool, resume_req: ?ipc.ResumeInit) !C
         full.cols = size.cols;
         full.xpixel = size.xpixel;
         full.ypixel = size.ypixel;
-        try ipc.appendMessage(alloc, &sock_write_buf, .InitResume, std.mem.asBytes(&full));
+        try ipc.appendMessage(alloc, &sock_write_buf, if (history_enabled) .InitPagedResume else .InitResume, std.mem.asBytes(&full));
     } else {
         const init_tag: ipc.Tag = if (mirror) .InitMirror else .Init;
         try ipc.appendMessage(alloc, &sock_write_buf, init_tag, std.mem.asBytes(&size));
@@ -2945,6 +3011,14 @@ fn clientLoop(client_sock_fd: i32, mirror: bool, resume_req: ?ipc.ResumeInit) !C
                     .Switch => {
                         return ClientResult{ .kind = .switch_session, .session_name = try alloc.dupe(u8, msg.payload) };
                     },
+                    .PagedResumeInfo => {
+                        if (msg.payload.len == @sizeOf(ipc.PagedResumeStatus)) {
+                            const status = std.mem.bytesToValue(ipc.PagedResumeStatus, msg.payload);
+                            var buffer: [256]u8 = undefined;
+                            const message = try std.fmt.bufPrint(&buffer, "zmx-resume mode={s} epoch={d} offset={d} bytes={d} history={d} more={d} columns={d}\n", .{ if (status.status.mode == ipc.RESUME_CONTINUED) "continued" else "snapshot", status.status.epoch, status.status.offset, status.status.replay_bytes, status.history.anchor, status.history.remaining, status.history.columns });
+                            _ = posix.write(posix.STDERR_FILENO, message) catch {};
+                        }
+                    },
                     .ResumeInfo => {
                         if (msg.payload.len == @sizeOf(ipc.ResumeStatus)) {
                             const st = std.mem.bytesToValue(ipc.ResumeStatus, msg.payload);
@@ -3018,6 +3092,7 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
         .max_scrollback = daemon.cfg.max_scrollback,
     });
     defer term.deinit(daemon.alloc);
+    defer daemon.history_store.clear();
     var vt_stream = term.vtStream();
     defer vt_stream.deinit();
 
@@ -3223,9 +3298,11 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
                         .Output => try daemon.handleOutput(msg.payload, &vt_stream),
                         .Init => try daemon.handleInit(client, pty_fd, &term, msg.payload, false),
                         .InitMirror => try daemon.handleInit(client, pty_fd, &term, msg.payload, true),
-                        .InitResume => try daemon.handleInitResume(client, &term, msg.payload),
+                        .InitResume => try daemon.handleInitResume(client, &term, msg.payload, false),
+                        .InitPagedResume => try daemon.handleInitResume(client, &term, msg.payload, true),
+                        .HistoryPage => try daemon.handleHistoryPage(client, msg.payload),
                         // Daemon -> client only; a client sending it is noise.
-                        .ResumeInfo => {},
+                        .ResumeInfo, .PagedResumeInfo => {},
                         .Claim => try daemon.handleClaim(pty_fd, &term, msg.payload),
                         .Release => try daemon.handleRelease(),
                         .Stat => try daemon.handleStat(client, pty_fd),

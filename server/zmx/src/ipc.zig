@@ -35,6 +35,9 @@ pub const Tag = enum(u8) {
     Stat = 17,
     InitResume = 18,
     ResumeInfo = 19,
+    InitPagedResume = 20,
+    PagedResumeInfo = 21,
+    HistoryPage = 22,
     // Non-exhaustive: this enum comes off the wire via bytesToValue and
     // @enumFromInt, so out-of-range values (18-255) are representable
     // rather than UB. Switches must handle `_` (unknown tag).
@@ -110,6 +113,11 @@ pub const ResumeStatus = extern struct {
     /// the stream, and a cursor ahead of the stream can never be resumed from
     /// again - the session silently falls back to a full reload forever.
     replay_bytes: u64,
+};
+
+pub const PagedResumeStatus = extern struct {
+    status: ResumeStatus,
+    history: @import("history_pages.zig").Metadata,
 };
 
 pub const MAX_CMD_LEN = 256;
