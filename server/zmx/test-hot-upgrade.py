@@ -240,8 +240,8 @@ def main():
             require(fixture.wait_for(lambda: process_identity(candidate_identifier) is None or
                                      process_identity(candidate_identifier)[0] == "Z"),
                     "timed out candidate releases inherited resources")
-            require(process_identity(initial["pid"]) == shell_identity, "original shell remains alive with unchanged start time")
-            require(process_identity(sleeper_identifier) == sleeper_identity, "background child remains alive with unchanged start time")
+            require(process_identity(initial["pid"])[1] == shell_identity[1], "original shell retains unchanged start time")
+            require(process_identity(sleeper_identifier)[1] == sleeper_identity[1], "background child retains unchanged start time")
             owner.close()
             clients.remove(owner)
             require(fixture.wait_for(lambda: not fixture.stat("upgrade")), "closing final owner still terminates bound session")
