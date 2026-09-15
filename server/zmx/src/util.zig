@@ -602,17 +602,9 @@ pub fn serializeTerminalState(
             else
                 screen_top;
 
-            var scroll_fmt = ghostty_vt.formatter.TerminalFormatter.init(term, .vt);
-            scroll_fmt.content = .{
-                .selection = ghostty_vt.Selection.init(
-                    sb_top,
-                    sb_bottom,
-                    false,
-                ),
-            };
-            scroll_fmt.extra = .none; // no modes, cursor, keyboard — just content
-            scroll_fmt.format(&builder.writer) catch |err| {
-                std.log.warn("failed to format scrollback err={s}", .{@errorName(err)});
+            serializeTranscriptRows(&builder.writer, sb_top, sb_bottom, pages.rows) catch |failure| {
+                std.log.warn("failed to format scrollback error={s}", .{@errorName(failure)});
+                return null;
             };
         }
 
@@ -672,6 +664,41 @@ pub fn serializeTerminalState(
         std.log.warn("failed to allocate terminal state err={s}", .{@errorName(err)});
         return null;
     };
+}
+
+fn serializeTranscriptRows(
+    writer: *std.Io.Writer,
+    firstRow: ghostty_vt.PageList.Pin,
+    finalRow: ghostty_vt.PageList.Pin,
+    visibleRows: usize,
+) std.Io.Writer.Error!void {
+    var trailing: ghostty_vt.formatter.PageFormatter.TrailingState = .empty;
+    var chunks = firstRow.pageIterator(.right_down, finalRow);
+    while (chunks.next()) |chunk| {
+        var formatter = ghostty_vt.formatter.PageFormatter.init(&chunk.node.data, .{
+            .emit = .vt,
+            .unwrap = true,
+            .trim = false,
+        });
+        formatter.start_y = chunk.start;
+        formatter.end_y = chunk.end - 1;
+        formatter.end_x = chunk.node.data.size.cols - 1;
+        formatter.rectangle = true;
+        formatter.trailing_state = trailing;
+        trailing = try formatter.formatWithState(writer);
+    }
+
+    // 格式器延迟输出尾部空行；它们仍属于真实历史，不能随清屏丢弃。
+    // 软换行通过下一字符触发自动折行，保留最后一行与后续内容的连接标记。
+    if (trailing.rows == 0) {
+        try writer.splatByteAll(' ', trailing.cells);
+        if (finalRow.rowAndCell().cell.wide == .spacer_head) try writer.writeByte(' ');
+        try writer.writeByte(' ');
+    } else {
+        for (0..trailing.rows) |_| try writer.writeAll("\r\n");
+    }
+    // 此时光标位于历史之后第一行；继续推进窗口高度减一行才可安全清屏。
+    for (0..visibleRows - 1) |_| try writer.writeAll("\r\n");
 }
 
 pub const HistoryFormat = enum(u8) {
@@ -1127,6 +1154,84 @@ fn serializeRoundtrip(alloc: std.mem.Allocator, source: *ghostty_vt.Terminal) !g
     defer stream.deinit();
     stream.nextSlice(serialized);
     return dest;
+}
+
+fn expectHistoryReplay(allocator: std.mem.Allocator, source: *ghostty_vt.Terminal, tailRows: u32) !void {
+    const serialized = serializeTerminalState(allocator, source, tailRows) orelse return error.SerializationFailed;
+    defer allocator.free(serialized);
+    var restored = try testCreateTerminal(allocator, source.cols, source.rows, serialized);
+    defer restored.deinit(allocator);
+    const sourcePages = &source.screens.active.pages;
+    const restoredPages = &restored.screens.active.pages;
+    const sourceHistory = sourcePages.pointFromPin(.screen, sourcePages.getTopLeft(.active)).?.screen.y;
+    const expectedHistory = if (tailRows == 0) sourceHistory else @min(sourceHistory, tailRows);
+    const actualHistory = restoredPages.pointFromPin(.screen, restoredPages.getTopLeft(.active)).?.screen.y;
+    try testing.expectEqual(expectedHistory, actualHistory);
+    var expectedRow = sourcePages.getTopLeft(.active).up(expectedHistory).?;
+    var actualRow = restoredPages.getTopLeft(.screen);
+    for (0..expectedHistory) |_| {
+        var expectedWriter: std.Io.Writer.Allocating = .init(allocator);
+        defer expectedWriter.deinit();
+        var actualWriter: std.Io.Writer.Allocating = .init(allocator);
+        defer actualWriter.deinit();
+        var expectedFormatter = ghostty_vt.formatter.PageFormatter.init(&expectedRow.node.data, .vt);
+        expectedFormatter.start_y = expectedRow.y;
+        expectedFormatter.end_y = expectedRow.y;
+        try expectedFormatter.format(&expectedWriter.writer);
+        var actualFormatter = ghostty_vt.formatter.PageFormatter.init(&actualRow.node.data, .vt);
+        actualFormatter.start_y = actualRow.y;
+        actualFormatter.end_y = actualRow.y;
+        try actualFormatter.format(&actualWriter.writer);
+        try testing.expectEqualStrings(expectedWriter.writer.buffered(), actualWriter.writer.buffered());
+        try testing.expectEqual(expectedRow.rowAndCell().row.wrap, actualRow.rowAndCell().row.wrap);
+        expectedRow = expectedRow.down(1).?;
+        actualRow = actualRow.down(1).?;
+    }
+    try expectScreensMatch(allocator, source, &restored);
+    try expectCursorAt(&restored, source.screens.active.cursor.y, source.screens.active.cursor.x);
+    try testing.expectEqual(source.modes.get(.wraparound), restored.modes.get(.wraparound));
+    try testing.expectEqual(source.modes.get(.bracketed_paste), restored.modes.get(.bracketed_paste));
+}
+
+test "serializeTerminalState retains every numbered history row across snapshot boundary" {
+    const allocator = testing.allocator;
+    var source = try testCreateTerminal(allocator, 40, 5, "");
+    defer source.deinit(allocator);
+    var stream = source.vtStream();
+    defer stream.deinit();
+    var numbered: [32]u8 = undefined;
+    for (1..401) |number| {
+        stream.nextSlice(try std.fmt.bufPrint(&numbered, "ROW{d:0>4}\r\n", .{number}));
+    }
+    for ([_]u32{ 1, 4, 5, 6, 20, 0 }) |tailRows| try expectHistoryReplay(allocator, &source, tailRows);
+}
+
+test "serializeTerminalState retains trailing and entirely blank history without extra rows" {
+    const allocator = testing.allocator;
+    for ([_][]const u8{
+        "begin\r\n\r\nmarked\r\n\r\n\r\n\r\n\r\n\r\n\r\n\r\n\r\n\r\n",
+        "\r\n\r\n\r\n\r\n\r\n\r\n\r\n\r\n\r\n\r\n\r\n\r\n",
+        "first\r\nsecond",
+        "",
+    }) |content| {
+        var source = try testCreateTerminal(allocator, 20, 5, content);
+        defer source.deinit(allocator);
+        for ([_]u32{ 1, 4, 5, 6, 20, 0 }) |tailRows| try expectHistoryReplay(allocator, &source, tailRows);
+    }
+}
+
+test "serializeTerminalState retains styled soft wraps and wide characters in history" {
+    const allocator = testing.allocator;
+    for ([_]u16{ 8, 9, 40 }) |columns| {
+        var source = try testCreateTerminal(allocator, columns, 5, "");
+        defer source.deinit(allocator);
+        var stream = source.vtStream();
+        defer stream.deinit();
+        for (0..80) |_| stream.nextSlice("\x1b[31mabc中\x1b[0mEF🚀");
+        source.modes.set(.wraparound, false);
+        source.modes.set(.bracketed_paste, true);
+        for ([_]u32{ 1, 4, 5, 6, 20, 0 }) |tailRows| try expectHistoryReplay(allocator, &source, tailRows);
+    }
 }
 
 fn expectMarkerAtRow(alloc: std.mem.Allocator, term: *ghostty_vt.Terminal, marker: []const u8, expected_row: usize) !void {
