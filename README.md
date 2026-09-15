@@ -132,12 +132,12 @@ zmx retains its MIT license; see `server/zmx/PATCHES.md` for protocol extensions
 
 The app uses public GitHub Releases for self-update checks:
 
-- `Settings -> Check update` calls GitHub's latest-release API for the
-  repository baked into the build.
-- If the latest tag is newer than `BuildConfig.VERSION_NAME`, the app
-  downloads the release APK into its private cache and opens Android's system
-  installer. Android still requires user confirmation; there is no silent
-  update path for a normal sideloaded app.
+- `Settings -> Check update` reads the static `update.json` asset from
+  GitHub's latest release. Automatic checks run on startup and foregrounding,
+  with a four-hour interval; the manual check bypasses that interval.
+- A manifest with a greater `versionCode` offers an update. The app downloads
+  the release APK into its private cache, verifies its SHA256 and opens
+  Android's system installer. Android still requires user confirmation.
 - Host, port, username and SSH key are saved by the Android app in encrypted
   app storage. They survive normal APK upgrades as long as the package name
   stays `com.homeattach.app` and every upgrade is signed with the same

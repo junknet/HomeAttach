@@ -1,8 +1,8 @@
 {
-  "versionCode": 16,
-  "versionName": "1.4.1",
-  "apkUrl": "https://github.com/junknet/HomeAttach/releases/download/v1.4.1/app-release.apk",
-  "sha256": "0f222b2f7990af2385e7c30506e05b1dec5c46ee8a618a9727e4961c8af4f2f5",
-  "sizeBytes": 28974508,
-  "notes": "HomeAttach 1.4.1"
+  "versionCode": 17,
+  "versionName": "1.5.0",
+  "apkUrl": "https://github.com/junknet/HomeAttach/releases/download/v1.5.0/app-release.apk",
+  "sha256": "f92993c5333cff35db5b95b10ae9a087f3137ee9bf716b6921db9f5ea302f7aa",
+  "sizeBytes": 28993072,
+  "notes": "大对话首屏按需加载、上翻预取历史、渲染修复及 Tab 键；电脑端支持新会话后续热升级。"
 }
