@@ -8,6 +8,10 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
+import signal
+import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -50,6 +54,15 @@ for command in sys.stdin.buffer:
         os.write(1, b"\xad\xe6\x96\x87\r\n")
     elif command == b"WRAP":
         os.write(1, b"W" * 137 + b"\r\n\r\nBLANK_FINISHED\r\n")
+    elif command == b"BURST":
+        os.write(1, b"BURST_BEGIN\r\n")
+        for number in range(1024):
+            os.write(1, f"BURST{number:06d}:".encode() + b"B" * 1008 + b"\r\n")
+        os.write(1, b"BURST_FINISHED\r\n")
+    elif command == b"JOURNAL":
+        for number in range(256):
+            os.write(1, b"\x1b[0m" * 16384)
+        os.write(1, b"JOURNAL_FINISHED\r\n")
     elif command == b"STATUS":
         os.write(1, b"INPUT_STILL_WORKS\r\n")
 '''
@@ -74,14 +87,184 @@ def command(arguments, timeout=15):
                           capture_output=True, timeout=timeout)
 
 
+def drain_client(client):
+    for descriptor, attribute in ((client.master, "out"), (client.err_r, "err")):
+        chunks = []
+        while True:
+            try:
+                payload = os.read(descriptor, 65536)
+                if not payload:
+                    break
+                chunks.append(payload)
+            except (BlockingIOError, OSError):
+                break
+        if chunks:
+            setattr(client, attribute, getattr(client, attribute) + b"".join(chunks))
+
+
 def pump_until(clients, predicate, timeout=8):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         for client in clients:
-            client.pump(0.03)
+            drain_client(client)
         if predicate():
             return True
+        time.sleep(0.005)
     return predicate()
+
+
+
+class RawMirror:
+    """Direct protocol connection permits controlled socket backpressure."""
+
+    def __init__(self, session, initialize=True):
+        self.connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.connection.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+        self.connection.connect(str(Path(fixture.ENV["ZMX_DIR"], session)))
+        self.connection.setblocking(False)
+        self.pending = bytearray()
+        self.output = bytearray()
+        self.messages = []
+        if initialize:
+            current = fixture.stat(session)
+            payload = struct.pack("<HHHHQQII", 7, 43, 0, 0, int(current["epoch"]),
+                                  int(current["stream_end"]), 4, 0)
+            self.connection.sendall(self.frame(18, payload))
+            require(fixture.wait_for(lambda: self.receive() and any(tag == 19 for tag, _ in self.messages)),
+                    "raw mirror receives resume metadata")
+
+    @staticmethod
+    def frame(message_type, payload):
+        return struct.pack("<BI3x", message_type, len(payload)) + payload
+
+    def receive(self):
+        while True:
+            try:
+                payload = self.connection.recv(65536)
+                if not payload:
+                    raise AssertionError("raw protocol connection closed unexpectedly")
+                self.pending.extend(payload)
+            except BlockingIOError:
+                break
+        while len(self.pending) >= 8:
+            message_type, length = struct.unpack("<BI3x", self.pending[:8])
+            if len(self.pending) < 8 + length:
+                break
+            payload = bytes(self.pending[8:8 + length])
+            del self.pending[:8 + length]
+            if message_type == 1:
+                self.output.extend(payload)
+            else:
+                self.messages.append((message_type, payload))
+        return True
+
+    def close(self):
+        self.connection.close()
+
+
+def verify_buffered_protocol(candidate, clients):
+    slow_mirror = RawMirror("upgrade")
+    try:
+        for client in clients:
+            client.out = b""
+        clients[0].send(b"BURST\n")
+        require(pump_until(clients, lambda: b"BURST_FINISHED" in clients[1].out),
+                "one mebibyte output completes while raw mirror does not read")
+        replace_daemon("upgrade", candidate, clients)
+        require(pump_until(clients, lambda: slow_mirror.receive() and b"BURST_FINISHED" in slow_mirror.output),
+                "slow mirror drains inherited pending output after replacement")
+        require(bytes(slow_mirror.output) == clients[1].out,
+                "pending socket output survives replacement without byte loss or duplication")
+        clients[0].out = b""
+        pending_input = slow_mirror.frame(0, b"STATUS\n")
+        slow_mirror.connection.sendall(pending_input[:11])
+        clients[0].pump(0.15)
+        replace_daemon("upgrade", candidate, clients)
+        slow_mirror.connection.sendall(pending_input[11:])
+        require(pump_until(clients, lambda: b"INPUT_STILL_WORKS" in clients[0].out),
+                "partial incoming protocol frame completes across replacement")
+    finally:
+        slow_mirror.close()
+    control = RawMirror("upgrade", initialize=False)
+    try:
+        previous = fixture.stat("upgrade")
+        clients[0].out = b""
+        control.connection.sendall(control.frame(23, os.fsencode(candidate)) +
+                                   control.frame(1, b"BUFFERED_OUTPUT\r\n"))
+        require(pump_until(clients, lambda: control.receive() and b"BUFFERED_OUTPUT" in clients[0].out),
+                "complete messages buffered behind upgrade execute after restoration")
+        require((23, b"ok\n") in control.messages, "buffered upgrade receives successful acknowledgement")
+        require(fixture.stat("upgrade")["daemon_pid"] != previous["daemon_pid"],
+                "buffered messages execute in replacement daemon")
+    finally:
+        control.close()
+    control = RawMirror("upgrade", initialize=False)
+    try:
+        previous = fixture.stat("upgrade")
+        clients[0].out = b""
+        control.connection.sendall(control.frame(23, os.fsencode(candidate)) +
+                                   control.frame(1, b"IPC_AFTER_SHUTDOWN\r\n"))
+        control.connection.shutdown(socket.SHUT_WR)
+        require(pump_until(clients, lambda: b"IPC_AFTER_SHUTDOWN" in clients[0].out),
+                "buffered complete frame precedes peer shutdown after replacement")
+        require(fixture.stat("upgrade")["daemon_pid"] != previous["daemon_pid"],
+                "half closed control connection completes replacement")
+    finally:
+        control.close()
+
+
+def verify_candidate_cancellation(candidate, clients, directory):
+    clients[0].send(b"JOURNAL\n")
+    deadline = time.monotonic() + 20
+    completed = False
+    while time.monotonic() < deadline and not completed:
+        for client in clients:
+            drain_client(client)
+        completed = b"JOURNAL_FINISHED" in clients[1].out
+        for client in clients:
+            client.out = client.out[-4096:]
+        time.sleep(0.002)
+    require(completed, "sixteen mebibyte journal fixture completes")
+    previous = fixture.stat("upgrade")
+    launcher = Path(directory, "cancel-candidate")
+    launcher.write_text("#!/bin/sh\nprintf '%s\\n' \"$$\" > \"$ZMX_DIR/cancel.identifier\"\nsleep 0.5\nexec " +
+                        shlex.quote(candidate) + " \"$@\"\n")
+    launcher.chmod(0o700)
+    upgrade = subprocess.Popen([fixture.ZMX, "upgrade", "upgrade", str(launcher)], env=fixture.ENV,
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    signaled = False
+    try:
+        deadline = time.monotonic() + 12
+        while time.monotonic() < deadline and upgrade.poll() is None:
+            try:
+                identifier = Path(directory, "cancel.identifier").read_text().strip()
+                executable = Path(f"/proc/{identifier}/exe").resolve(strict=True)
+                counters = dict(line.split(":", 1) for line in Path(f"/proc/{identifier}/io").read_text().splitlines())
+                status = dict(line.split(":", 1) for line in Path(f"/proc/{identifier}/status").read_text().splitlines())
+                if (executable == Path(candidate).resolve() and int(counters["rchar"]) > 12 * 1024 * 1024 and
+                        int(status["SigCgt"].strip(), 16) & (1 << (signal.SIGTERM - 1))):
+                    os.kill(int(identifier), signal.SIGTERM)
+                    signaled = True
+                    break
+            except FileNotFoundError:
+                pass
+            time.sleep(0.001)
+        require(signaled, "termination targets actual candidate during journal replay with handler installed")
+        require(pump_until(clients, lambda: upgrade.poll() is not None, timeout=12),
+                "cancelled candidate transaction completes")
+        output, diagnostics = upgrade.communicate(timeout=1)
+        require(upgrade.returncode != 0, "candidate termination cancels replacement: " + diagnostics.decode(errors="replace"))
+        current = fixture.stat("upgrade")
+        require(current["daemon_pid"] == previous["daemon_pid"] and current["pid"] == previous["pid"],
+                "candidate cancellation preserves original daemon and shell")
+        clients[0].out = b""
+        clients[0].send(b"STATUS\n")
+        require(pump_until(clients, lambda: b"INPUT_STILL_WORKS" in clients[0].out),
+                "candidate cancellation leaves original terminal input functional")
+    finally:
+        if upgrade.poll() is None:
+            upgrade.kill()
+            upgrade.wait(timeout=2)
 
 
 def replace_daemon(session, candidate, clients, succeeds=True):
@@ -228,6 +411,25 @@ def main():
                 require(history_numbers == list(range(180)), "replacement retains every original historical row")
             finally:
                 fresh.close()
+
+            verify_buffered_protocol(candidate, clients)
+            verify_candidate_cancellation(candidate, clients, directory)
+
+            incompatible_candidate = Path(directory, "incompatible-candidate")
+            incompatible_candidate.write_text(
+                "#!/usr/bin/env python3\nimport json, os, sys\n"
+                "descriptor = int(sys.argv[2])\n"
+                "checkpoint = json.loads(os.pread(descriptor, os.fstat(descriptor).st_size, 0))\n"
+                "checkpoint['terminal_version'] = []\n"
+                "encoded = json.dumps(checkpoint).encode()\n"
+                "os.ftruncate(descriptor, len(encoded))\nos.pwrite(descriptor, encoded, 0)\n"
+                f"os.execv({candidate!r}, [{candidate!r}, *sys.argv[1:]])\n")
+            incompatible_candidate.chmod(0o700)
+            replace_daemon("upgrade", str(incompatible_candidate), clients, succeeds=False)
+            owner.out = b""
+            owner.send(b"STATUS\n")
+            require(pump_until(clients, lambda: b"INPUT_STILL_WORKS" in owner.out),
+                    "incompatible terminal checkpoint leaves original session usable")
 
             timeout_candidate = Path(directory, "timeout-candidate")
             timeout_candidate.write_text("#!/bin/sh\nprintf '%s\\n' \"$$\" > \"$ZMX_DIR/candidate.identifier\"\nexec sleep 30\n")
