@@ -173,6 +173,12 @@ def main():
             replace_daemon("upgrade", candidate, clients)
             require(snapshot("upgrade") == wrapped_snapshot, "wrapped and blank physical rows survive replacement")
 
+            resized = command(["claim", "upgrade", "43", "7"])
+            require(resized.returncode == 0, "terminal resize succeeds before replacement")
+            resized_snapshot = snapshot("upgrade")
+            replace_daemon("upgrade", candidate, clients)
+            require(snapshot("upgrade") == resized_snapshot, "journal restores terminal geometry and resize effects")
+
             for client in clients:
                 client.pump(0.1)
                 client.out = b""
@@ -223,13 +229,17 @@ def main():
                 fresh.close()
 
             timeout_candidate = Path(directory, "timeout-candidate")
-            timeout_candidate.write_text("#!/bin/sh\nexec sleep 30\n")
+            timeout_candidate.write_text("#!/bin/sh\nprintf '%s\\n' \"$$\" > \"$ZMX_DIR/candidate.identifier\"\nexec sleep 30\n")
             timeout_candidate.chmod(0o700)
             for rejected in (str(Path(directory, "missing-binary")), "/bin/false", str(timeout_candidate)):
                 replace_daemon("upgrade", rejected, clients, succeeds=False)
                 owner.out = b""
                 owner.send(b"STATUS\n")
                 require(pump_until(clients, lambda: b"INPUT_STILL_WORKS" in owner.out), "failed replacement leaves input usable")
+            candidate_identifier = Path(directory, "candidate.identifier").read_text().strip()
+            require(fixture.wait_for(lambda: process_identity(candidate_identifier) is None or
+                                     process_identity(candidate_identifier)[0] == "Z"),
+                    "timed out candidate releases inherited resources")
             require(process_identity(initial["pid"]) == shell_identity, "original shell remains alive with unchanged start time")
             require(process_identity(sleeper_identifier) == sleeper_identity, "background child remains alive with unchanged start time")
             owner.close()
