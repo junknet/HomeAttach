@@ -126,6 +126,7 @@ def main():
     candidate = os.path.abspath(sys.argv[2]) if len(sys.argv) > 2 else fixture.ZMX
     with tempfile.TemporaryDirectory(prefix="zmx-hot-upgrade-") as directory:
         fixture.ENV["ZMX_DIR"] = directory
+        fixture.ENV["XDG_CACHE_HOME"] = str(Path(directory, "cache"))
         producer_path = Path(directory, "producer.py")
         producer_path.write_text(PRODUCER)
         sleeper_path = Path(directory, "sleeper.identifier")
