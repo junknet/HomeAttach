@@ -65,4 +65,8 @@
     <string name="paste_text">Paste</string>
     <string name="copy_text">Copy</string>
     <string name="text_selection_more">More…</string>
+    <string name="terminal_history_loading">Loading earlier history…</string>
+    <string name="terminal_history_expired">Earlier history is no longer available</string>
+    <string name="terminal_history_unavailable">Earlier history is unavailable</string>
+    <string name="terminal_history_complete">Beginning of available history</string>
 </resources>

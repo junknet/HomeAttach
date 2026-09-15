@@ -570,6 +570,7 @@ pub fn serializeTerminalState(
     if (had_synchronized_output) {
         term.modes.set(.synchronized_output, false);
     }
+    defer if (had_synchronized_output) term.modes.set(.synchronized_output, true);
 
     const pages = &term.screens.active.pages;
     const screen_top = pages.getTopLeft(.screen);
@@ -654,11 +655,6 @@ pub fn serializeTerminalState(
 
     const output = builder.writer.buffered();
     if (output.len == 0) return null;
-
-    // Restore the original synchronized_output mode before returning
-    if (had_synchronized_output) {
-        term.modes.set(.synchronized_output, true);
-    }
 
     return alloc.dupe(u8, output) catch |err| {
         std.log.warn("failed to allocate terminal state err={s}", .{@errorName(err)});

@@ -1,130 +1,91 @@
 # HomeAttach
 
-Android app that SSHes into a home Linux PC, shows a live list of shared
-terminal sessions running there, and lets you tap one to open a real
-interactive VT100 terminal into it — attach to whatever's running at home,
-from anywhere, with a real terminal (vim/htop/codex render correctly).
+Android app for attaching over SSH to shared terminal sessions on a Linux PC.
+The app uses a vendored Termux terminal engine; the PC runs the vendored zmx
+supervisor with Ghostty terminal state tracking. Sessions are explicitly created
+through `tsess`.
 
-The PC side is `sharepty` (`server/sharepty/`, a small fork of dtach): a
-transparent shared-pty supervisor. It is a pure byte pipe — it never
-interprets escape sequences, never opens the alternate screen, never touches
-the mouse — so a locally attached terminal behaves byte-for-byte like a bare
-shell. On top of that it adds what sharing actually needs:
+## Terminal history and input
 
-- an in-memory **ring buffer** of session output (default 8 MB) with
-  monotonically increasing byte offsets;
-- **replay on attach** (`-T <bytes>` tail / `-F <offset>` resume), so a phone
-  attaching mid-session gets recent history and can resume gap-free after a
-  network drop;
-- **passive clients** (`-P`): remote clients never drive the pty window size;
-- **focus grants** (`-W <cols> <rows>`): the focused client's size is applied
-  and the child gets SIGWINCH, so full-screen TUIs repaint at the new size.
+- Opening a terminal requests the current screen and at most 200 nearby
+  scrollback rows. Android prepares that snapshot in a separate emulator and
+  displays it when complete, avoiding visible history replay.
+- Scrolling within two screens of the oldest loaded content requests up to 128
+  earlier physical rows. Pages preserve styles, blank rows and wrapping flags;
+  inserting a page keeps the existing viewport and live screen in place.
+- New output follows the viewport at the bottom. While reading history, output
+  continues below without pulling the viewport down. Typing returns to the live
+  edge.
+- Sessions retained by the running app resume with their existing byte cursor.
+  A cold opening uses a bounded server snapshot instead of parsing an old raw
+  stream from disk.
+- Terminal parsing yields between bounded passes. If queued output exceeds
+  2 MiB, that mirror requests a fresh current-screen snapshot; other sessions
+  retain their connections.
+- The extra-key row includes Tab (byte `0x09`) and scrolls horizontally on narrow
+  screens.
 
-Sharing is **opt-in only**. Local terminal tabs are never wrapped in
-anything; a session exists only when you explicitly start one.
+History cursors reference server terminal rows, separately from byte offsets used
+for reconnecting. They survive mirror disconnects while the daemon retains the
+anchor. Resizing, clearing history, server scrollback eviction, or eviction from
+the eight-anchor cache can expire a cursor. The app reports that boundary instead
+of inserting mismatched history. Applications using the alternate screen keep
+their own history navigation; terminal scrollback paging applies to the primary
+screen.
 
-## main
+## Build and install the PC helpers
 
-- `tsess` — interactive picker for the PC: list sessions, pick a number to
-  attach, or type a new name to create one (this is the opt-in entry point).
-- `tsess-attach <name> [tail|from=<offset>]` — passive attach with replay;
-  what the app runs over SSH.
-- `tsess-list` — machine-readable TSV
-  (`name\tcmd\tcwd\towner\tcols\trows\tstatus`) that the app polls.
-- `tsess-focus <name> <owner> <cols> <rows>` — grant focus: resize + WINCH.
-- `tsess-release <name> <owner>` — hand size ownership back to the PC client.
-- `tsess-kill <name>` — end a session outright (app's swipe action).
-- `tsess-state` — shared helpers + the focus/release implementation.
+Build `server/zmx` with **Zig 0.15.2** (system Zig 0.16 is incompatible):
 
-Session lifecycle is owned by the supervisor process: when the command inside
-exits (or is killed), the socket and the ring buffer disappear with it.
-
-## main
-
-1. **Build sharepty**:
-   ```
-   cd server/sharepty && make
-   ```
-
-2. **Install**: copy the scripts and the binary somewhere on `$PATH`, e.g.:
-   ```
-   cp server/tsess server/tsess-* server/sharepty/sharepty ~/.local/bin/
-   chmod +x ~/.local/bin/tsess ~/.local/bin/tsess-* ~/.local/bin/sharepty
-   ```
-   The app execs `tsess-mux` (which carries every attached terminal and the
-   session list) plus `tsess-list`/`tsess-kill`/`tsess-new` from
-   `$HOME/.local/bin`. Non-login SSH exec
-   shells do not source `.zshrc`, so relying on `PATH` is intentionally
-   avoided.
-
-3. **Optional shell alias** for quick opt-in from any tab:
-   ```sh
-   s() { ~/.local/bin/tsess; }
-   ```
-   Run `s codex`-style workflows by picking/typing a name, then start your
-   TUI inside. Everything else on the PC stays a completely bare shell.
-
-4. **Quick SSH Setup (QR Code Scan)**:
-   We provide a helper script to automatically configure SSH keys and display a configuration QR code. Simply run:
-   ```sh
-   ./server/tsess-qr-config
-   ```
-   This script generates a dedicated keypair, authorizes it, and prints a QR code in your terminal containing the full connection payload. On your phone, open the app's Settings, tap **Scan QR Code**, and scan the terminal screen. The host, port, username, and private key will auto-fill instantly!
-
-   *(Alternative manual setup)*:
-   If you prefer configuring manually, generate a keypair:
-   ```sh
-   ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519_homeattach -N "" -C "homeattach-android-app"
-   cat ~/.ssh/id_ed25519_homeattach.pub >> ~/.ssh/authorized_keys
-   ```
-   Then paste the private key's contents into the app's Settings screen (stored in `EncryptedSharedPreferences`).
-
-5. sshd needs to be reachable from wherever the phone actually is. On the
-   phone, set the app's host to the PC's real external address, IPv4 or
-   IPv6 (note: SLAAC/privacy-extension IPv6 addresses can change — a
-   dynamic-DNS setup or a stable local ULA/WireGuard address is more
-   durable than hardcoding an address that rotates).
-
-## main
-
-- A pty has exactly one window size ("mirror" semantics): the focused
-  client's size wins, and every size change broadcasts a screen clear to all
-  clients so the WINCH repaint lands on a clean slate instead of layering
-  over frames drawn for the old size. A client narrower than the current
-  size still sees wrapped lines until it takes focus
-  (`tsess-attach <name> 256k focus`); per-client re-rendering would require
-  a server-side terminal state machine, which this design deliberately
-  avoids.
-- Replay is raw bytes. For inline-output programs (shells, Claude Code) it
-  reconstructs scrollback on the phone; for alternate-screen TUIs (codex,
-  vim) the WINCH redraw paints the current frame and the app's own
-  scrollback/transcript keys cover the rest.
-- The ring is memory owned by the supervisor: nothing is written to disk,
-  and history dies with the session (`0600` socket in
-  `$XDG_RUNTIME_DIR/homeattach-<uid>/`).
-
-## main
-
+```sh
+cd server/zmx
+~/.local/toolchains/zig-x86_64-linux-0.15.2/zig build -Doptimize=ReleaseSafe -j2
+cd ../..
+install -d ~/.local/bin
+install -m 755 server/zmx/zig-out/bin/zmx ~/.local/bin/zmx
+install -m 755 server/tsess server/tsess-* ~/.local/bin/
 ```
-cd server/sharepty && make test
-```
-covers replay, offset resume, ring overflow clamping, passive/active size
-arbitration, focus WINCH redraw, input push, and socket lifecycle.
 
-## main
+The Android app runs `$HOME/.local/bin/tsess-mux` over SSH. Keep that helper and
+the zmx binary updated together. A new daemon advertises `history_pages=1` in
+`zmx stat`. Replacing the binary does **not** upgrade already running daemons:
+existing older sessions retain their compatibility behavior; create a new
+session after updating to use history paging. Updating never terminates existing
+sessions automatically.
 
-Kotlin + Jetpack Compose, `com.homeattach.app`. Build/run the usual way:
-```
-./gradlew :app:assembleDebug
+Run `tsess` on the PC to create or pick a shared session. Session lifetime belongs
+to the supervisor and its attached owner. The app lists sessions and attaches as
+a mirror; granting focus claims the terminal dimensions for the phone.
+
+For SSH configuration, run `./server/tsess-qr-config` and scan its QR code from the
+app settings, or enter the reachable host, username and SSH key manually.
+Credentials stay in Android encrypted storage. Keep private keys, host settings,
+`local.properties`, keystores and generated outputs out of version control.
+
+## Build and verify Android
+
+```sh
+./gradlew :app:testDebugUnitTest :app:assembleDebug :app:lintDebug
+./gradlew :app:connectedDebugAndroidTest
 adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
-Key libraries: `com.github.mwiede:jsch` (SSH; note the BouncyCastle
-dependency it needs for ed25519 keys on Android — see the comment in
-`SshClient.kt`) plus the vendored Termux terminal engine (`terminal-emulator` +
-`terminal-view`) under `app/src/main/java/com/termux/{terminal,view}/`, adapted
-with a remote-stream mode so it renders 24-bit truecolor and modern TUIs over
-SSH. Because that engine is GPLv3, **the app as a whole is distributed under the
-GPLv3** (see `LICENSE`); each vendored file keeps its original Termux header.
+
+The instrumentation suite uses an isolated terminal fixture without connecting
+to a host. It covers snapshot publication, UI-thread responsiveness, history
+insertion and Tab transport, and saves terminal images in the test app's external
+files directory.
+
+Host-side checks:
+
+```sh
+python3 -m pytest -q server/tests
+cd server/zmx
+~/.local/toolchains/zig-x86_64-linux-0.15.2/zig build test -j2
+python3 test-history-pages.py zig-out/bin/zmx
+```
+
+The app is GPLv3 because it incorporates the Termux terminal engine. Vendored
+zmx retains its MIT license; see `server/zmx/PATCHES.md` for protocol extensions.
 
 ## Public release updates
 

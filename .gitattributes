@@ -1,0 +1,2 @@
+# Terminal recordings contain significant carriage returns and control bytes.
+app/src/androidTest/assets/history/**/*.vt binary

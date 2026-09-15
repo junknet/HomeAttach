@@ -1,11 +1,19 @@
 package com.homeattach.app.terminal
 
+import android.annotation.SuppressLint
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
+import android.os.Trace
 import android.util.Log
+import com.homeattach.app.ssh.MuxHistoryPage
+import com.termux.terminal.TerminalEmulator
+import com.termux.terminal.TerminalOutput
+import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
 import com.termux.terminal.TerminalSession
 import com.termux.terminal.TerminalSessionClient
 
@@ -41,16 +49,19 @@ class RemoteTerminalSession(
 
     private val mainHandler = Handler(Looper.getMainLooper())
 
-    /**
-     * Remote bytes waiting to be parsed. Written by the SSH reader thread, read by the main thread,
-     * so [pending] is its own lock — and [drainScheduled] and [pendingBytes] are guarded by that
-     * same lock rather than being separate atomics. The flag and the queue have to move together:
-     * "the queue is non-empty and nobody is draining it" is the state that must never be observable,
-     * and splitting the two lets a lost update strand the queue with no drain ever scheduled.
-     */
-    private val pending = ArrayDeque<ByteArray>()
+    var onBacklogExceeded: () -> Unit = {}
+    var onSnapshotStarted: () -> Unit = {}
+    var onSnapshotRendered: () -> Unit = {}
+
+    private val renderQueue = TerminalRenderQueue()
+    private val schedulingLock = Any()
     private var drainScheduled = false
-    private var pendingBytes = 0
+    private val finished = AtomicBoolean(false)
+    private var snapshotEmulator: TerminalEmulator? = null
+    private var snapshotRemaining = 0L
+    private val historyWorker = Executors.newSingleThreadExecutor { operation ->
+        Thread(operation, "TerminalHistory").apply { isDaemon = true }
+    }
 
     private val sessionClient = object : TerminalSessionClient {
         override fun onTextChanged(changedSession: TerminalSession) = onScreenUpdated()
@@ -97,110 +108,151 @@ class RemoteTerminalSession(
         },
     )
 
-    // Keeps re-posting until the view has laid out and the emulator exists, then parses pending
-    // output in bounded passes. TerminalEmulator is not thread-safe, so this runs only on the main
-    // thread — which is also why a pass is capped: re-attaching after a long absence hands us the
-    // whole restored screen at once, and parsing it in one uninterrupted loop holds the main thread
-    // for as long as that takes, which is exactly the freeze it looks like. A pass therefore stops
-    // at [MAX_BYTES_PER_DRAIN] and re-posts *delayed*, so the frame it just produced actually gets
-    // drawn before the next pass starts. Posting undelayed would not do it: with an otherwise idle
-    // queue the continuation runs straight back and the whole backlog still lands inside one frame.
-    private val drainRunnable = object : Runnable {
-        private var firstOutputFired = false
+    private val drainRunnable = Runnable { drainOutput() }
 
-        override fun run() {
-            val emulator = session.emulator
-            if (emulator == null) {
-                // Still holding the scheduled flag: this pass has not run, so nothing else may post.
-                mainHandler.postDelayed(this, FIRST_LAYOUT_RETRY_MS)
-                return
+    private fun scheduleDrain() {
+        synchronized(schedulingLock) {
+            if (!drainScheduled && !finished.get()) {
+                drainScheduled = true
+                mainHandler.post(drainRunnable)
             }
-            var appended = false
-            var bytesProcessed = 0
+        }
+    }
 
-            while (bytesProcessed < MAX_BYTES_PER_DRAIN) {
-                val chunk = synchronized(pending) {
-                    pending.removeFirstOrNull()?.also { pendingBytes -= it.size }
-                } ?: break
-                emulator.append(chunk, chunk.size)
-                bytesProcessed += chunk.size
-                appended = true
-            }
-
-            // Yielding costs throughput, so it is spent only while the backlog is small enough for
-            // the user to be watching it arrive. Past the high-water mark a producer is outrunning
-            // us and the queue would grow without bound, so catch up at full speed instead.
-            val nextDelayMs = synchronized(pending) {
-                when {
-                    pending.isEmpty() -> {
-                        drainScheduled = false
-                        null
+    // Finally guarantees balanced tracing through exceptions.
+    @SuppressLint("UnclosedTrace")
+    private fun drainOutput() {
+        if (finished.get()) return
+        var screenChanged = false
+        val started = SystemClock.elapsedRealtimeNanos()
+        Trace.beginSection("HomeAttach.terminalParse")
+        try {
+            if (session.emulator != null) {
+                var parsedBytes = 0
+                while (parsedBytes < MAX_BYTES_PER_DRAIN &&
+                    SystemClock.elapsedRealtimeNanos() - started < PARSE_BUDGET_NANOS) {
+                    val chunkLimit = if (snapshotEmulator != null && snapshotRemaining > 0)
+                        minOf(PARSE_CHUNK_BYTES.toLong(), snapshotRemaining).toInt()
+                    else PARSE_CHUNK_BYTES
+                    when (val operation = renderQueue.take(chunkLimit) ?: break) {
+                        is TerminalRenderOperation.Snapshot -> {
+                            onSnapshotStarted()
+                            snapshotEmulator = session.createRemoteSnapshotEmulator()
+                            snapshotRemaining = operation.replayBytes
+                            if (snapshotRemaining == 0L) {
+                                publishSnapshot()
+                                screenChanged = true
+                            }
+                        }
+                        is TerminalRenderOperation.Output -> {
+                            val destination = snapshotEmulator ?: session.emulator
+                            destination.append(operation.bytes, operation.bytes.size)
+                            parsedBytes += operation.bytes.size
+                            if (snapshotEmulator != null) {
+                                snapshotRemaining -= operation.bytes.size
+                                if (snapshotRemaining == 0L) {
+                                    publishSnapshot()
+                                    screenChanged = true
+                                }
+                            } else {
+                                screenChanged = true
+                            }
+                        }
+                        is TerminalRenderOperation.Control -> operation.action()
                     }
-                    pendingBytes > CATCH_UP_THRESHOLD_BYTES -> 0L
-                    else -> DRAIN_YIELD_MS
                 }
             }
-            if (nextDelayMs != null) mainHandler.postDelayed(this, nextDelayMs)
-
-            if (appended) {
-                onScreenUpdated()
-                if (!firstOutputFired) {
-                    firstOutputFired = true
-                    onFirstOutput()
+        } finally {
+            Trace.endSection()
+            synchronized(schedulingLock) {
+                drainScheduled = false
+                if (!finished.get() && renderQueue.hasPending()) {
+                    drainScheduled = true
+                    mainHandler.postDelayed(drainRunnable, DRAIN_YIELD_MS)
                 }
             }
         }
+        if (screenChanged) {
+            onScreenUpdated()
+            onFirstOutput()
+        }
     }
 
-    /** Called from the SSH reader thread; marshals output onto the main thread for the emulator. */
+    private fun publishSnapshot() {
+        val restored = snapshotEmulator ?: return
+        session.replaceRemoteEmulator(restored)
+        snapshotEmulator = null
+        snapshotRemaining = 0
+        onSnapshotRendered()
+    }
+
+    internal fun beginSnapshot(replayBytes: Long) {
+        renderQueue.beginSnapshot(replayBytes.coerceAtLeast(0))
+        scheduleDrain()
+    }
+
+    internal fun enqueueControl(action: () -> Unit) {
+        renderQueue.enqueueControl(action)
+        scheduleDrain()
+    }
+
     fun appendRemoteOutput(buffer: ByteArray, offset: Int = 0, count: Int = buffer.size) {
-        if (count <= 0) return
-        val chunk = buffer.copyOfRange(offset, offset + count)
-        // Claim the right to schedule under the same lock that takes the chunk, so a drain pass
-        // finishing concurrently either sees this chunk or leaves the flag for us to claim.
-        val startDrain = synchronized(pending) {
-            pending.addLast(chunk)
-            pendingBytes += chunk.size
-            if (drainScheduled) false else true.also { drainScheduled = true }
+        if (count <= 0 || finished.get()) return
+        if (!renderQueue.append(buffer, offset, count)) {
+            renderQueue.clear()
+            onBacklogExceeded()
+            return
         }
-        if (startDrain) mainHandler.post(drainRunnable)
+        scheduleDrain()
     }
 
-    /**
-     * Rebuilds the screen from bytes this phone saved earlier, before anything is on display.
-     *
-     * Deliberately not the drain path: that one parses in capped passes and yields a frame between
-     * them, which is right for output arriving live and wrong here. This is one known-size buffer
-     * with no viewer yet, so parsing it in a single pass costs one frame at open instead of
-     * repainting progressively for a quarter of a second - which is precisely the "it reloads
-     * everything every time" the saved stream exists to remove.
-     *
-     * Returns false when the emulator does not exist yet, i.e. before first layout; the caller
-     * retries. Must run on the main thread, like every other emulator access.
-     */
-    fun replaySaved(data: ByteArray): Boolean {
-        val emulator = session.emulator ?: return false
-        if (data.isEmpty()) return true
-        emulator.append(data, data.size)
-        onScreenUpdated()
-        onFirstOutput()
-        return true
+    internal fun prependHistory(page: MuxHistoryPage, canApply: () -> Boolean, completed: (Int) -> Unit) {
+        val expectedEmulator = session.emulator ?: return completed(0)
+        if (page.columns != expectedEmulator.mColumns || expectedEmulator.isAlternateBufferActive) {
+            completed(0)
+            return
+        }
+        historyWorker.execute {
+            val historyRows = runCatching {
+                val decoder = TerminalEmulator(
+                    historyOutput, page.columns, 2, 0, 0, 128, sessionClient,
+                )
+                page.rows.map { historyRow ->
+                    val content = ("\u001bc" + historyRow.text).toByteArray(Charsets.UTF_8)
+                    decoder.append(content, content.size)
+                    if (historyRow.wrapped) decoder.screen.setLineWrap(0)
+                    else decoder.screen.clearLineWrap(0)
+                    decoder.screen.copyRow(0)
+                }.toTypedArray()
+            }
+            mainHandler.post {
+                if (finished.get()) return@post
+                if (!canApply() || expectedEmulator !== session.emulator ||
+                    page.columns != expectedEmulator.mColumns ||
+                    expectedEmulator.isAlternateBufferActive) {
+                    completed(0)
+                    return@post
+                }
+                val inserted = historyRows.fold(
+                    onSuccess = { expectedEmulator.screen.prependTranscriptRows(it) },
+                    onFailure = { failure ->
+                        Log.w(TAG, "History decoding failed", failure)
+                        0
+                    },
+                )
+                completed(inserted)
+                if (inserted > 0) onScreenUpdated()
+            }
+        }
     }
 
-    /**
-     * Throws away everything on screen and in scrollback.
-     *
-     * Called when the host says it is starting this session's picture over: what was restored from
-     * disk describes a screen that no longer exists, and the fresh picture would otherwise be
-     * painted underneath it.
-     */
-    fun resetScreen() {
-        val emulator = session.emulator ?: return
-        // RIS, through the emulator's own path: it resets modes, clears the transcript, blanks the
-        // screen and homes the cursor in the order a terminal defines. Reaching into the buffer to
-        // do that by hand would be a second, less tested definition of "start over".
-        emulator.append(RESET_TO_INITIAL_STATE, RESET_TO_INITIAL_STATE.size)
-        onScreenUpdated()
+    private val historyOutput = object : TerminalOutput() {
+        override fun write(bytes: ByteArray, offset: Int, count: Int) {}
+        override fun titleChanged(previous: String?, current: String?) {}
+        override fun onCopyTextToClipboard(content: String?) {}
+        override fun onPasteTextFromClipboard() {}
+        override fun onBell() {}
+        override fun onColorsChanged() {}
     }
 
     /** User input from the ExtraKeys row (Esc, Ctrl-C/D, arrows). Routed out to SSH via the session. */
@@ -210,6 +262,10 @@ class RemoteTerminalSession(
     }
 
     fun finish() {
+        if (!finished.compareAndSet(false, true)) return
+        renderQueue.clear()
+        mainHandler.removeCallbacksAndMessages(null)
+        historyWorker.shutdownNow()
         runCatching { session.finishIfRunning() }
     }
 
@@ -249,24 +305,12 @@ class RemoteTerminalSession(
     private companion object {
         const val TAG = "RemoteTerminalSession"
 
-        /** ESC c - RIS, "forget everything and start over". */
-        val RESET_TO_INITIAL_STATE = byteArrayOf(0x1b, 'c'.code.toByte())
-
-        /** Most remote bytes one main-thread parse pass may consume before yielding for a frame. */
         const val MAX_BYTES_PER_DRAIN = 16384
-
-        /** Half a 60Hz frame: long enough for the draw this pass dirtied to actually happen. */
+        const val PARSE_CHUNK_BYTES = 2048
+        const val PARSE_BUDGET_NANOS = 4_000_000L
         const val DRAIN_YIELD_MS = 8L
-
-        /**
-         * Backlog past which yielding is dropped. The budget caps a pass, not the producer, so a
-         * remote writing faster than [MAX_BYTES_PER_DRAIN] per [DRAIN_YIELD_MS] would otherwise grow
-         * [pending] without bound. Smoothness is worth nothing once the terminal is this far behind.
-         */
-        const val CATCH_UP_THRESHOLD_BYTES = 512 * 1024
         // Deep scrollback: the buffer is a lazily-allocated row-pointer array, so a big cap
         // costs ~80KB of references up front and real memory only as history fills.
         const val TRANSCRIPT_ROWS = 10000
-        const val FIRST_LAYOUT_RETRY_MS = 16L
     }
 }

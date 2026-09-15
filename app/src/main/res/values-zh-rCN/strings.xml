@@ -55,4 +55,15 @@
     <string name="update_banner_available">有新版本 %1$s（%2$s）</string>
     <string name="update_banner_install">安装</string>
     <string name="update_banner_download">下载</string>
+    <string name="terminal_history_loading">正在加载更早的内容…</string>
+    <string name="terminal_history_expired">更早的历史已失效</string>
+    <string name="terminal_history_unavailable">暂时无法加载更早的历史</string>
+    <string name="terminal_history_complete">已到最早的历史</string>
+    <string name="settings_scan_qr">扫描二维码</string>
+    <string name="settings_scan_success">配置导入成功</string>
+    <string name="settings_scan_error">无法解析二维码内容</string>
+    <string name="settings_scan_failed">扫描二维码失败：%1$s</string>
+    <string name="paste_text">粘贴</string>
+    <string name="copy_text">复制</string>
+    <string name="text_selection_more">更多…</string>
 </resources>

@@ -75,6 +75,8 @@ public final class TerminalSession extends TerminalOutput {
     private final String[] mArgs;
     private final String[] mEnv;
     private final Integer mTranscriptRows;
+    private int currentCellWidthPixels;
+    private int currentCellHeightPixels;
 
     /**
      * Remote mode: drive the emulator from an external byte stream (e.g. an SSH channel) instead of
@@ -129,6 +131,8 @@ public final class TerminalSession extends TerminalOutput {
 
     /** Inform the attached pty of the new size and reflow or initialize the emulator. */
     public void updateSize(int columns, int rows, int cellWidthPixels, int cellHeightPixels) {
+        currentCellWidthPixels = cellWidthPixels;
+        currentCellHeightPixels = cellHeightPixels;
         if (mEmulator == null) {
             initializeEmulator(columns, rows, cellWidthPixels, cellHeightPixels);
         } else {
@@ -249,6 +253,20 @@ public final class TerminalSession extends TerminalOutput {
             mUtf8InputBuffer[bufferPosition++] = (byte) (0b10000000 | (codePoint & 0b111111));
         }
         write(mUtf8InputBuffer, 0, bufferPosition);
+    }
+
+    public TerminalEmulator createRemoteSnapshotEmulator() {
+        if (!mRemote || mEmulator == null) throw new IllegalStateException("Remote emulator unavailable");
+        return new TerminalEmulator(this, mEmulator.mColumns, mEmulator.mRows,
+            currentCellWidthPixels, currentCellHeightPixels, mTranscriptRows, mClient);
+    }
+
+    public void replaceRemoteEmulator(TerminalEmulator replacement) {
+        if (!mRemote || mEmulator == null) throw new IllegalStateException("Remote emulator unavailable");
+        replacement.resize(mEmulator.mColumns, mEmulator.mRows,
+            currentCellWidthPixels, currentCellHeightPixels);
+        replacement.clearScrollCounter();
+        mEmulator = replacement;
     }
 
     public TerminalEmulator getEmulator() {

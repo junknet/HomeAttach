@@ -89,6 +89,7 @@ import com.homeattach.app.ssh.SessionsSnapshot
 import com.homeattach.app.terminal.AttachStatus
 import com.homeattach.app.terminal.FailureCause
 import com.homeattach.app.terminal.AttachedTerminal
+import com.homeattach.app.terminal.HistoryLoadState
 import com.homeattach.app.terminal.RemoteTerminalSession
 import android.view.KeyEvent
 import android.view.MotionEvent
@@ -147,6 +148,7 @@ fun TerminalScreen(
     val remoteTerminalSession = attachment.terminal
     val status by attachment.status.collectAsState()
     val hasOutput by attachment.hasOutput.collectAsState()
+    val historyState by attachment.historyState.collectAsState()
 
     // Live IME composing text (voice dictation stream). A pty can't express rewrites, so the
     // preedit renders locally in an overlay strip; only the finalized text goes down the wire.
@@ -156,7 +158,11 @@ fun TerminalScreen(
     // dropped on the way out - otherwise the attachment pins a dead TerminalView, and the
     // Activity behind it, for as long as it stays attached.
     DisposableEffect(attachment) {
-        onDispose { attachment.terminal.onScreenUpdated = {} }
+        onDispose {
+            attachment.terminal.onScreenUpdated = {}
+            attachment.terminal.onUserInput = {}
+            terminalView?.setHistoryScrollListener(null)
+        }
     }
 
     // Immersive fullscreen for the entire life of this screen, entered BEFORE the first layout.
@@ -454,6 +460,9 @@ fun TerminalScreen(
                                     }
                                     remoteTerminalSession.onScreenUpdated = { view.onScreenUpdated() }
                                     remoteTerminalSession.onUserInput = { view.scrollToBottom() }
+                                    view.setHistoryScrollListener { topRow, historyRows, visibleRows ->
+                                        attachment.onHistoryScroll(topRow, historyRows, visibleRows)
+                                    }
                                     terminalView = view
                                 }
                             },
@@ -461,8 +470,28 @@ fun TerminalScreen(
                                 view.attachSession(remoteTerminalSession.session)
                                 remoteTerminalSession.onScreenUpdated = { view.onScreenUpdated() }
                                 remoteTerminalSession.onUserInput = { view.scrollToBottom() }
+                                view.setHistoryScrollListener { topRow, historyRows, visibleRows ->
+                                    attachment.onHistoryScroll(topRow, historyRows, visibleRows)
+                                }
                             },
                         )
+                        val historyMessage = when (historyState) {
+                            HistoryLoadState.IDLE -> null
+                            HistoryLoadState.LOADING -> R.string.terminal_history_loading
+                            HistoryLoadState.EXPIRED -> R.string.terminal_history_expired
+                            HistoryLoadState.UNAVAILABLE -> R.string.terminal_history_unavailable
+                            HistoryLoadState.COMPLETE -> R.string.terminal_history_complete
+                        }
+                        if (historyMessage != null) {
+                            Text(
+                                text = stringResource(historyMessage),
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                style = MaterialTheme.typography.labelSmall,
+                                modifier = Modifier.align(Alignment.TopCenter)
+                                    .background(MaterialTheme.colorScheme.surface.copy(alpha = 0.92f))
+                                    .padding(horizontal = 12.dp, vertical = 4.dp),
+                            )
+                        }
                         // Left-edge swipe zone: only this thin strip opens the drawer, so the
                         // terminal body keeps all its horizontal touches (selection, scroll).
                         Box(
@@ -737,7 +766,7 @@ private fun ConnectionProblem(
 }
 
 @Composable
-private fun ExtraKeysRow(
+internal fun ExtraKeysRow(
     remoteTerminalSession: RemoteTerminalSession,
     modifier: Modifier = Modifier,
 ) {

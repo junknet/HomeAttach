@@ -10,6 +10,7 @@ import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import com.homeattach.app.ssh.MuxHistoryPage
 import com.homeattach.app.ssh.MuxHistoryRow
+import com.homeattach.app.ssh.MuxProtocol
 import com.termux.terminal.TerminalSession
 import com.termux.terminal.TextStyle
 import com.termux.view.TerminalView
@@ -151,7 +152,7 @@ class RemoteTerminalRenderingTest {
             cursorColumnBefore.set(emulator.cursorCol)
             terminal.prependHistory(
                 MuxHistoryPage(
-                    status = "ok", anchor = "1", before = 3, next = 0,
+                    status = "ok", anchor = "1", before = 0, next = 3,
                     columns = emulator.mColumns, more = false,
                     rows = listOf(
                         MuxHistoryRow("", false),
@@ -179,6 +180,7 @@ class RemoteTerminalRenderingTest {
             val oldest = -emulator.screen.activeTranscriptRows
             assertEquals("", emulator.screen.getSelectedText(0, oldest, emulator.mColumns - 1, oldest))
             assertTrue(emulator.screen.getLineWrap(oldest + 1))
+            assertFalse(emulator.screen.getLineWrap(oldest + 2))
             assertEquals(1, TextStyle.decodeForeColor(emulator.screen.getStyleAt(oldest + 1, 0)))
             assertEquals(2, historyCallbacks.get())
             saveTerminalScreenshot("history-anchored.png")
@@ -193,6 +195,81 @@ class RemoteTerminalRenderingTest {
         assertEquals(1, inputEvents.get())
         assertEquals(1, receivedInput.size)
         assertArrayEquals(byteArrayOf(0x09), receivedInput.single())
+    }
+
+    @Test
+    fun cancelledHistoryDecodingCannotModifyTranscript() {
+        val completed = CountDownLatch(1)
+        val beforeRows = AtomicInteger()
+        onMain {
+            val emulator = terminal.session.emulator
+            beforeRows.set(emulator.screen.activeTranscriptRows)
+            terminal.prependHistory(
+                MuxHistoryPage("ok", "1", 0, 1, emulator.mColumns, false,
+                    listOf(MuxHistoryRow("stale response", false))),
+                canApply = { false },
+                completed = { completed.countDown() },
+            )
+        }
+        awaitEvent(completed, "cancelled history decoding")
+        onMain {
+            assertEquals(beforeRows.get(), terminal.session.emulator.screen.activeTranscriptRows)
+            assertFalse(terminal.session.emulator.screen.transcriptText.contains("stale response"))
+        }
+    }
+
+    @Test
+    fun serverSnapshotAndPagesRetainEveryPhysicalRow() {
+        for (scenario in listOf("numbered", "blank")) {
+            val assets = instrumentation.context.assets
+            val original = assets.open("history/$scenario/original.vt").use { it.readBytes() }
+            val snapshot = assets.open("history/$scenario/snapshot.vt").use { it.readBytes() }
+            val published = CountDownLatch(1)
+            val expected = AtomicReference<com.termux.terminal.TerminalEmulator>()
+            onMain {
+                terminal.session.updateSize(40, 5, 8, 16)
+                expected.set(terminal.session.createRemoteSnapshotEmulator().apply {
+                    append(original, original.size)
+                })
+                terminal.onSnapshotRendered = { published.countDown() }
+                terminal.beginSnapshot(snapshot.size.toLong())
+                terminal.appendRemoteOutput(snapshot)
+            }
+            awaitEvent(published, "$scenario server snapshot")
+            val filenames = assets.list("history/$scenario")!!.filter { it.startsWith("page-") }.sorted()
+            for (filename in filenames) {
+                val page = MuxProtocol.readHistoryPage(
+                    assets.open("history/$scenario/$filename").use { it.readBytes() },
+                )!!
+                val inserted = CountDownLatch(1)
+                val count = AtomicInteger()
+                onMain {
+                    terminal.prependHistory(page, canApply = { true }) {
+                        count.set(it)
+                        inserted.countDown()
+                    }
+                }
+                awaitEvent(inserted, "$scenario $filename")
+                assertEquals(page.rows.size, count.get())
+            }
+            onMain {
+                val restored = terminal.session.emulator
+                val baseline = expected.get()
+                assertEquals(baseline.screen.activeTranscriptRows, restored.screen.activeTranscriptRows)
+                assertEquals(baseline.cursorRow, restored.cursorRow)
+                assertEquals(baseline.cursorCol, restored.cursorCol)
+                for (rowIndex in -baseline.screen.activeTranscriptRows until baseline.mRows) {
+                    assertEquals("$scenario row $rowIndex",
+                        baseline.screen.getSelectedText(0, rowIndex, 39, rowIndex),
+                        restored.screen.getSelectedText(0, rowIndex, 39, rowIndex))
+                    assertEquals(baseline.screen.getLineWrap(rowIndex), restored.screen.getLineWrap(rowIndex))
+                    for (columnIndex in 0 until baseline.mColumns) {
+                        assertEquals(baseline.screen.getStyleAt(rowIndex, columnIndex),
+                            restored.screen.getStyleAt(rowIndex, columnIndex))
+                    }
+                }
+            }
+        }
     }
 
     private fun awaitEvent(event: CountDownLatch, description: String) {
