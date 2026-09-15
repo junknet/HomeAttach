@@ -20,6 +20,27 @@ pub const Journal = struct {
     available: bool = true,
     limit: u64 = default_limit,
 
+    /// Persistent cache storage avoids runtime-directory memory-backed filesystems.
+    pub fn createForSession(allocator: standard.mem.Allocator, columns: u16, rows: u16) !Journal {
+        const cache_home = standard.process.getEnvVarOwned(allocator, "XDG_CACHE_HOME") catch |failure| switch (failure) {
+            error.EnvironmentVariableNotFound => null,
+            else => return failure,
+        };
+        defer if (cache_home) |directory| allocator.free(directory);
+        const directory = directory: {
+            if (cache_home) |configured| {
+                if (standard.fs.path.isAbsolute(configured)) break :directory try standard.fs.path.join(allocator, &.{ configured, "zmx" });
+            }
+            const home_directory = try standard.process.getEnvVarOwned(allocator, "HOME");
+            defer allocator.free(home_directory);
+            if (!standard.fs.path.isAbsolute(home_directory)) return error.InvalidHomeDirectory;
+            break :directory try standard.fs.path.join(allocator, &.{ home_directory, ".cache", "zmx" });
+        };
+        defer allocator.free(directory);
+        try standard.fs.cwd().makePath(directory);
+        return create(directory, columns, rows);
+    }
+
     pub fn create(directory: []const u8, columns: u16, rows: u16) !Journal {
         if (columns == 0 or rows == 0) return error.InvalidGeometry;
         var parent = try standard.fs.cwd().openDir(directory, .{});
@@ -354,4 +375,51 @@ test "journal write failures disable recording without terminating the session" 
     journal.recordOutput("unwritable");
     try standard.testing.expect(!journal.available);
     try standard.testing.expectEqual(@as(u64, header_length), journal.bytes_written);
+}
+
+test "session journals use configured cache storage and HOME fallback" {
+    const allocator = standard.testing.allocator;
+    const system = @import("cross.zig").c;
+    var temporary = standard.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const temporary_path = try temporary.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(temporary_path);
+    const cache_path = try standard.fs.path.joinZ(allocator, &.{ temporary_path, "configured-cache" });
+    defer allocator.free(cache_path);
+    const home_path = try standard.fs.path.joinZ(allocator, &.{ temporary_path, "isolated-home" });
+    defer allocator.free(home_path);
+    const previous_cache = if (standard.posix.getenv("XDG_CACHE_HOME")) |value| try allocator.dupeZ(u8, value) else null;
+    defer if (previous_cache) |value| allocator.free(value);
+    const previous_home = if (standard.posix.getenv("HOME")) |value| try allocator.dupeZ(u8, value) else null;
+    defer if (previous_home) |value| allocator.free(value);
+    defer {
+        if (previous_cache) |value| {
+            _ = system.setenv("XDG_CACHE_HOME", value, 1);
+        } else {
+            _ = system.unsetenv("XDG_CACHE_HOME");
+        }
+        if (previous_home) |value| {
+            _ = system.setenv("HOME", value, 1);
+        } else {
+            _ = system.unsetenv("HOME");
+        }
+    }
+    try standard.testing.expectEqual(@as(c_int, 0), system.setenv("XDG_CACHE_HOME", cache_path, 1));
+    try standard.testing.expectEqual(@as(c_int, 0), system.setenv("HOME", home_path, 1));
+    var configured = try Journal.createForSession(allocator, 80, 24);
+    defer configured.deinit();
+    var cache_directory = try temporary.dir.openDir("configured-cache/zmx", .{ .iterate = true });
+    defer cache_directory.close();
+    var cache_iterator = cache_directory.iterate();
+    try standard.testing.expectEqual(null, try cache_iterator.next());
+    try standard.testing.expectEqualStrings(cache_path, standard.posix.getenv("XDG_CACHE_HOME").?);
+    try standard.testing.expectEqual(@as(c_int, 0), system.unsetenv("XDG_CACHE_HOME"));
+    var fallback = try Journal.createForSession(allocator, 80, 24);
+    defer fallback.deinit();
+    var fallback_directory = try temporary.dir.openDir("isolated-home/.cache/zmx", .{ .iterate = true });
+    defer fallback_directory.close();
+    var fallback_iterator = fallback_directory.iterate();
+    try standard.testing.expectEqual(null, try fallback_iterator.next());
+    try standard.testing.expectEqual(null, standard.posix.getenv("XDG_CACHE_HOME"));
+    try standard.testing.expectEqualStrings(home_path, standard.posix.getenv("HOME").?);
 }
