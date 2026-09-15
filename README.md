@@ -38,20 +38,19 @@ screen.
 Build `server/zmx` with **Zig 0.15.2** (system Zig 0.16 is incompatible):
 
 ```sh
-cd server/zmx
-~/.local/toolchains/zig-x86_64-linux-0.15.2/zig build -Doptimize=ReleaseSafe -j2
-cd ../..
-install -d ~/.local/bin
-install -m 755 server/zmx/zig-out/bin/zmx ~/.local/bin/zmx
-install -m 755 server/tsess server/tsess-* ~/.local/bin/
+./server/install.sh --build
 ```
 
 The Android app runs `$HOME/.local/bin/tsess-mux` over SSH. Keep that helper and
-the zmx binary updated together. A new daemon advertises `history_pages=1` in
-`zmx stat`. Replacing the binary does **not** upgrade already running daemons:
-existing older sessions retain their compatibility behavior; create a new
-session after updating to use history paging. Updating never terminates existing
-sessions automatically.
+the zmx binary updated together. The installer publishes each executable through
+a temporary file and atomic rename in the destination directory. This preserves
+the executable inode of running processes and avoids `Text file busy` errors.
+Installation never upgrades or terminates existing sessions automatically.
+
+A new daemon advertises `history_pages=1` in `zmx stat`. New Yakuake tabs using
+the HomeAttach profile (`tsess-auto`) launch the installed version immediately;
+Yakuake itself does not need restarting. Existing tabs retain their daemon until
+an explicit supported upgrade.
 
 Run `tsess` on the PC to create or pick a shared session. Session lifetime belongs
 to the supervisor and its attached owner. The app lists sessions and attaches as
@@ -61,6 +60,39 @@ For SSH configuration, run `./server/tsess-qr-config` and scan its QR code from 
 app settings, or enter the reachable host, username and SSH key manually.
 Credentials stay in Android encrypted storage. Keep private keys, host settings,
 `local.properties`, keystores and generated outputs out of version control.
+
+## Upgrade a running session
+
+Sessions created by this version support later compatible daemon upgrades while
+preserving the PTY, shell, child processes and connected owner. Install the next
+version, inspect the session, then upgrade that named session explicitly:
+
+```sh
+./server/install.sh --build
+~/.local/bin/zmx stat my-session
+~/.local/bin/tsess-upgrade my-session
+```
+
+`tsess-upgrade` invokes the installed executable from its own directory as
+`zmx upgrade <session> <absolute-new-binary>`. For a separately built candidate,
+use that command directly with its absolute executable path. There is no default
+batch upgrade. `stat` reports `hot_upgrade=1` when the daemon supports handoff;
+`daemon_pid` identifies the supervisor and `pid` continues to identify the shell.
+Old daemons without handoff support report an unsupported upgrade; preserve those
+tabs and create new sessions to obtain the capability. Installing a file cannot
+add handoff support to an already running old daemon.
+
+To reconstruct terminal state, each capable session records raw terminal output
+and resize events in an anonymous disk journal, bounded at 256 MiB. Reaching that
+limit or losing the journal makes hot upgrade unavailable for that session while
+normal terminal operation continues. Candidate reconstruction briefly pauses
+terminal forwarding; child processes remain attached to the same PTY and can
+experience output backpressure during the pause. Failure before handoff leaves
+the original session running. This supports compatible handoff formats, not
+arbitrary zmx versions or recovery after a host reboot.
+
+An upgrade can expire history page cursors; reopen the phone's terminal to obtain
+a fresh current-screen snapshot when it reports an expired history boundary.
 
 ## Build and verify Android
 

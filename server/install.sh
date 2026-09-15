@@ -50,10 +50,19 @@ if $need_build; then
 fi
 
 mkdir -p "$bin_dir"
-install -m 755 "$zmx_out" "$bin_dir/zmx"
+install_executable() (
+    local source_path=$1 destination_path=$2 temporary_path
+    temporary_path=$(mktemp "$bin_dir/.homeattach-install.XXXXXXXX")
+    trap 'rm -f -- "$temporary_path"' EXIT
+    trap 'exit 1' HUP INT TERM
+    install -m 755 -- "$source_path" "$temporary_path"
+    mv -fT -- "$temporary_path" "$destination_path"
+)
+
+install_executable "$zmx_out" "$bin_dir/zmx"
 for script in tsess tsess-attach tsess-auto tsess-focus tsess-kill tsess-list tsess-mux \
-    tsess-new tsess-release tsess-state; do
-    install -m 755 "$script_dir/$script" "$bin_dir/$script"
+    tsess-new tsess-qr-config tsess-release tsess-state tsess-upgrade; do
+    install_executable "$script_dir/$script" "$bin_dir/$script"
 done
 
 # Konsole/yakuake profile: every tab started with it becomes a session. The
@@ -120,10 +129,13 @@ fi
 
 echo "installed to $bin_dir:"
 echo "  zmx $("$bin_dir/zmx" version | head -1 | awk '{print $NF}')"
-echo "  tsess tsess-attach tsess-auto tsess-focus tsess-kill tsess-list tsess-mux tsess-release tsess-state"
+echo "  tsess tsess-attach tsess-auto tsess-focus tsess-kill tsess-list tsess-mux"
+echo "  tsess-new tsess-qr-config tsess-release tsess-state tsess-upgrade"
 echo
 echo "PC usage:   tsess <name>              named session in this tab"
 echo "            tsess-auto                auto-named session (yakuake profile command)"
+echo "            tsess-upgrade <name>      upgrade one compatible running session"
+echo "Existing sessions continue running; installation never upgrades them automatically."
 echo "Yakuake:    point a Konsole profile's Command at $bin_dir/tsess-auto"
 echo "            and make it yakuake's default - every tab becomes a session"
 echo "Phone:      install the HomeAttach app and point it at this machine"

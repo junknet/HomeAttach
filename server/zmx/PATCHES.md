@@ -122,3 +122,23 @@ unknown tags by design (`Tag` is non-exhaustive).
    `python3 test-history-pages.py zig-out/bin/zmx`. The latter uses a unique
    temporary socket directory and a view-bound fixture; it never touches
    existing sessions.
+
+9. **Explicit daemon hot upgrade** (`zmx upgrade <session> <absolute-new-binary>`).
+   A supporting daemon advertises `hot_upgrade=1` and `daemon_pid` in `stat`;
+   the existing `pid` field remains the shell process identifier. The installed
+   `tsess-upgrade <session>` selects its sibling zmx executable and upgrades only
+   that named session. Older daemons without the handoff capability are rejected
+   as unsupported. Installing updated files never upgrades sessions implicitly.
+
+   A compatible candidate reconstructs terminal state from an anonymous disk
+   journal of raw output and resize events, bounded at 256 MiB. Journal capacity
+   or recording failures disable hot upgrade while terminal operation continues.
+   Reconstruction briefly pauses forwarding and may backpressure PTY output.
+   Handoff preserves the PTY, shell, child processes and attached owner. Candidate
+   failure before handoff leaves the original session running. History anchors
+   can expire across upgrade; mirrors can obtain a fresh paged snapshot.
+
+   The installer writes each executable to a same-directory temporary file,
+   sets executable permissions and atomically renames it over the destination.
+   Running binaries retain their previous inode. This avoids overwriting a
+   mapped executable and does not require terminating existing daemons.
