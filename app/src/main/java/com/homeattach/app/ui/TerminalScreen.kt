@@ -12,6 +12,8 @@ import androidx.core.view.WindowInsetsControllerCompat
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -744,58 +746,65 @@ private fun ExtraKeysRow(
             .fillMaxWidth()
             .height(TERMINAL_EXTRA_KEYS_ROW_HEIGHT)
             .background(Color.Black)
+            .horizontalScroll(rememberScrollState())
             .padding(horizontal = 8.dp, vertical = 4.dp),
         horizontalArrangement = Arrangement.spacedBy(5.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         KeyCap(
             label = stringResource(R.string.terminal_key_esc),
-            modifier = Modifier.weight(0.9f),
+            modifier = Modifier.widthIn(min = 48.dp),
         ) {
             remoteTerminalSession.write(byteArrayOf(0x1b), 0, 1)
         }
         KeyCap(
+            label = "Tab",
+            modifier = Modifier.widthIn(min = 48.dp),
+        ) {
+            remoteTerminalSession.write(byteArrayOf(0x09), 0, 1)
+        }
+        KeyCap(
             label = "Ctrl+C",
-            modifier = Modifier.weight(1.2f),
+            modifier = Modifier.widthIn(min = 48.dp),
         ) {
             remoteTerminalSession.write(byteArrayOf(0x03), 0, 1)
         }
         KeyCap(
             label = "Ctrl+D",
-            modifier = Modifier.weight(1.2f),
+            modifier = Modifier.widthIn(min = 48.dp),
         ) {
             remoteTerminalSession.write(byteArrayOf(0x04), 0, 1)
         }
         KeyCap(
             label = stringResource(R.string.terminal_key_paste),
-            modifier = Modifier.weight(1.1f),
+            modifier = Modifier.widthIn(min = 48.dp),
         ) {
             remoteTerminalSession.pasteTextFromClipboard()
         }
         KeyCap(
             label = "←",
-            modifier = Modifier.weight(0.72f),
+            modifier = Modifier.widthIn(min = 48.dp),
             repeating = true
         ) {
             remoteTerminalSession.write(ANSI_ARROW_LEFT, 0, ANSI_ARROW_LEFT.size)
         }
         KeyCap(
             label = "↑",
-            modifier = Modifier.weight(0.72f),
+            modifier = Modifier.widthIn(min = 48.dp),
             repeating = true
         ) {
             remoteTerminalSession.write(ANSI_ARROW_UP, 0, ANSI_ARROW_UP.size)
         }
         KeyCap(
             label = "↓",
-            modifier = Modifier.weight(0.72f),
+            modifier = Modifier.widthIn(min = 48.dp),
             repeating = true
         ) {
             remoteTerminalSession.write(ANSI_ARROW_DOWN, 0, ANSI_ARROW_DOWN.size)
         }
         KeyCap(
             label = "→",
-            modifier = Modifier.weight(0.72f),
+            modifier = Modifier.widthIn(min = 48.dp),
             repeating = true
         ) {
             remoteTerminalSession.write(ANSI_ARROW_RIGHT, 0, ANSI_ARROW_RIGHT.size)
