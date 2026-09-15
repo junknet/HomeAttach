@@ -38,6 +38,7 @@ pub const Tag = enum(u8) {
     InitPagedResume = 20,
     PagedResumeInfo = 21,
     HistoryPage = 22,
+    Upgrade = 23,
     // Non-exhaustive: this enum comes off the wire via bytesToValue and
     // @enumFromInt, so out-of-range values (18-255) are representable
     // rather than UB. Switches must handle `_` (unknown tag).
@@ -217,6 +218,12 @@ pub const SocketBuffer = struct {
 
     pub fn deinit(self: *SocketBuffer) void {
         self.buf.deinit(self.alloc);
+    }
+
+    pub fn hasMessage(self: *const SocketBuffer) bool {
+        const available = self.buf.items[self.head..];
+        const total = expectedLength(available) orelse return false;
+        return available.len >= total;
     }
 
     /// Reads from fd into buffer.

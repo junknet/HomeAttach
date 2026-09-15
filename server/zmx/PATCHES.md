@@ -124,7 +124,9 @@ unknown tags by design (`Tag` is non-exhaustive).
    existing sessions.
 
 9. **Explicit daemon hot upgrade** (`zmx upgrade <session> <absolute-new-binary>`).
-   A supporting daemon advertises `hot_upgrade=1` and `daemon_pid` in `stat`;
+   IPC tag `Upgrade=23` carries the candidate executable path and returns `ok`
+   or a rejection reason. A supporting daemon advertises `hot_upgrade=1`,
+   `upgrade_ready` and `daemon_pid` in `stat`;
    the existing `pid` field remains the shell process identifier. The installed
    `tsess-upgrade <session>` selects its sibling zmx executable and upgrades only
    that named session. Older daemons without the handoff capability are rejected
@@ -137,6 +139,14 @@ unknown tags by design (`Tag` is non-exhaustive).
    Handoff preserves the PTY, shell, child processes and attached owner. Candidate
    failure before handoff leaves the original session running. History anchors
    can expire across upgrade; mirrors can obtain a fresh paged snapshot.
+
+   Checkpoint format version 1 requires an identical Ghostty dependency revision.
+   The candidate inherits client descriptors and pending buffers, reconstructs
+   state without consuming live input, then waits for the original daemon's
+   control pipe to close. Rollback kills and reaps the candidate before closing
+   that pipe. Preparation-time termination cancels handoff; signals arriving
+   after the commit barrier apply to the replacement. Journal files live under
+   the user's cache directory, have mode 0600, and are unlinked immediately.
 
    The installer writes each executable to a same-directory temporary file,
    sets executable permissions and atomically renames it over the destination.

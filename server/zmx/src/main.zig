@@ -1,4 +1,7 @@
 const history_pages = @import("history_pages.zig");
+const upgrade_handoff = @import("upgrade_handoff.zig");
+const upgrade_journal = @import("upgrade_journal.zig");
+const upgrades = @import("upgrade_session.zig").Controller(Daemon, Cfg, Client, daemonLoop, ghostty_version);
 const std = @import("std");
 const posix = std.posix;
 const build_options = @import("build_options");
@@ -82,6 +85,18 @@ pub fn main() !void {
     defer args.deinit();
     _ = args.skip(); // skip program name
 
+    const requested_command = args.next();
+    if (requested_command != null and std.mem.eql(u8, requested_command.?, "__restore-upgrade-v1")) {
+        const checkpoint = try std.fmt.parseInt(i32, args.next() orelse return error.CheckpointRequired, 10);
+        const incoming = try std.fmt.parseInt(i32, args.next() orelse return error.HandshakeRequired, 10);
+        const outgoing = try std.fmt.parseInt(i32, args.next() orelse return error.HandshakeRequired, 10);
+        upgrades.restore(checkpoint, incoming, outgoing) catch |failure| {
+            std.log.err("upgrade candidate rejected: {s}", .{@errorName(failure)});
+            posix.exit(1);
+        };
+        return;
+    }
+
     var cfg = try Cfg.init(alloc);
     defer cfg.deinit(alloc);
 
@@ -90,7 +105,7 @@ pub fn main() !void {
     try log_system.init(alloc, log_path, cfg.log_mode);
     defer log_system.deinit();
 
-    const cmd = args.next() orelse {
+    const cmd = requested_command orelse {
         return list(&cfg, false);
     };
 
@@ -144,6 +159,11 @@ pub fn main() !void {
             .before = try std.fmt.parseInt(u64, before, 10),
             .limit = try std.fmt.parseInt(u32, limit, 10),
         });
+    } else if (std.mem.eql(u8, cmd, "upgrade")) {
+        const session = args.next() orelse return error.SessionRequired;
+        const executable = args.next() orelse return error.ExecutableRequired;
+        if (args.next() != null) return error.UnexpectedArgument;
+        return requestUpgrade(&cfg, session, executable);
     } else if (std.mem.eql(u8, cmd, "attach") or std.mem.eql(u8, cmd, "a")) {
         // Flags must precede the session name; everything after the name is
         // the command to run inside a newly created session.
@@ -803,11 +823,12 @@ const Daemon = struct {
     /// serving; a client holding epoch 0 has nothing to resume.
     epoch: u64 = 0,
     history_store: history_pages.Store = .{},
+    upgrade_journal: ?upgrade_journal.Journal = null,
 
     /// How much raw output stays resumable. Two minutes of a chatty build at
     /// 20KB/s, or a whole day of an idle shell - past that a client is better
     /// served by a fresh picture than by replaying history it cannot use.
-    const RESUME_RING_BYTES: usize = 2 * 1024 * 1024;
+    pub const RESUME_RING_BYTES: usize = 2 * 1024 * 1024;
 
     /// Chunked so one resume cannot hand the client a single multi-megabyte
     /// message to buffer whole.
@@ -1144,10 +1165,17 @@ const Daemon = struct {
                     };
                 }
 
-                try daemonLoop(self, server_sock_fd, pty_fd);
+                try daemonLoop(self, server_sock_fd, pty_fd, null);
                 return .{ .created = true, .is_daemon = true };
             }
             posix.close(server_sock_fd);
+            // The attaching process does not wait for session daemons.
+            const reap_children: posix.Sigaction = .{
+                .handler = .{ .handler = posix.SIG.IGN },
+                .mask = posix.sigemptyset(),
+                .flags = 0,
+            };
+            posix.sigaction(posix.SIG.CHLD, &reap_children, null);
             std.Thread.sleep(10 * std.time.ns_per_ms);
             return .{ .created = true, .is_daemon = false };
         }
@@ -1403,6 +1431,7 @@ const Daemon = struct {
             defer term.flags.shell_redraws_prompt = saved_prompt_redraw;
             self.history_store.clear();
             try term.resize(self.alloc, resize.cols, resize.rows);
+            if (self.upgrade_journal) |*journal| journal.recordResize(resize.cols, resize.rows);
 
             // Mark that we've had a client init, so subsequent clients get terminal state
             self.has_had_client = true;
@@ -1443,6 +1472,7 @@ const Daemon = struct {
         defer term.flags.shell_redraws_prompt = saved_prompt_redraw;
         self.history_store.clear();
         try term.resize(self.alloc, resize.cols, resize.rows);
+        if (self.upgrade_journal) |*journal| journal.recordResize(resize.cols, resize.rows);
         std.log.debug("resize rows={d} cols={d}", .{ resize.rows, resize.cols });
     }
 
@@ -1491,6 +1521,7 @@ const Daemon = struct {
         defer term.flags.shell_redraws_prompt = saved_prompt_redraw;
         self.history_store.clear();
         try term.resize(self.alloc, resize.cols, resize.rows);
+        if (self.upgrade_journal) |*journal| journal.recordResize(resize.cols, resize.rows);
         std.log.info("external claim rows={d} cols={d}", .{ resize.rows, resize.cols });
     }
 
@@ -1528,11 +1559,11 @@ const Daemon = struct {
             if (q.is_mirror) mirrors += 1 else owners += 1;
         }
         const size = ipc.getTerminalSize(pty_fd);
-        var buf: [256]u8 = undefined;
+        var buf: [512]u8 = undefined;
         const line = try std.fmt.bufPrint(
             &buf,
             "pid={d} cols={d} rows={d} owners={d} mirrors={d} bound={d} output_seq={d}" ++
-                " epoch={d} stream_start={d} stream_end={d} history_pages=1\n",
+                " epoch={d} stream_start={d} stream_end={d} history_pages=1 hot_upgrade=1 daemon_pid={d} upgrade_ready={d}\n",
             .{
                 self.pid,
                 size.cols,
@@ -1546,6 +1577,8 @@ const Daemon = struct {
                 self.epoch,
                 self.resumeStart(),
                 self.output_bytes,
+                cross.c.getpid(),
+                @intFromBool(self.upgrade_journal != null and self.upgrade_journal.?.available),
             },
         );
         try ipc.appendMessage(self.alloc, &client.write_buf, .Stat, line);
@@ -1671,6 +1704,7 @@ const Daemon = struct {
     }
 
     pub fn handleOutput(self: *Daemon, payload: []const u8, vt_stream: anytype) !void {
+        if (self.upgrade_journal) |*journal| journal.recordOutput(payload);
         vt_stream.nextSlice(payload);
         self.has_pty_output = true;
         for (self.clients.items) |client| {
@@ -1766,6 +1800,7 @@ fn help() !void {
         \\                                           --mirror: view/type without owning the pty size
         \\                                           --history-pages: provide history cursor (mirror only)
         \\  history-page <name> <anchor> <before> <limit>  Fetch older physical rows as JSON
+        \\  upgrade <name> <absolute-binary>         Replace daemon while preserving session processes
         \\  claim <name> <cols> <rows>               Resize the pty externally (focus grant)
         \\  release <name>                           Return the pty size to the first owner client
         \\  stat <name>                              Print one key=value status line
@@ -2376,6 +2411,38 @@ fn fetchHistory(
     }
 
     return error.NoHistoryResponse;
+}
+
+fn requestUpgrade(configuration: *Cfg, session: []const u8, executable: []const u8) !void {
+    if (!std.fs.path.isAbsolute(executable)) return error.AbsoluteExecutableRequired;
+    const allocator = std.heap.c_allocator;
+    const status = try statLine(allocator, configuration, session);
+    defer allocator.free(status);
+    if (std.mem.indexOf(u8, status, " hot_upgrade=1 ") == null) return error.UpgradeUnsupported;
+    const location = try socket.getSocketPath(allocator, configuration.socket_dir, session);
+    defer allocator.free(location);
+    const connection = try ipc.connectSession(location);
+    defer posix.close(connection);
+    try ipc.send(connection, .Upgrade, executable);
+    var incoming = try ipc.SocketBuffer.init(allocator);
+    defer incoming.deinit();
+    const deadline = std.time.milliTimestamp() + 25_000;
+    while (std.time.milliTimestamp() < deadline) {
+        var watching = [_]posix.pollfd{.{ .fd = connection, .events = posix.POLL.IN, .revents = 0 }};
+        if (try posix.poll(&watching, 100) == 0) continue;
+        if (try incoming.read(connection) == 0) return error.ConnectionClosed;
+        while (incoming.next()) |message| {
+            if (message.header.tag != .Upgrade) continue;
+            if (!std.mem.eql(u8, message.payload, "ok\n")) {
+                try std.fs.File.stderr().writeAll(message.payload);
+                try std.fs.File.stderr().writeAll("\n");
+                return error.UpgradeRejected;
+            }
+            try std.fs.File.stdout().writeAll("upgraded; session processes and connections preserved\n");
+            return;
+        }
+    }
+    return error.UpgradeTimeout;
 }
 
 fn historyPage(configuration: *Cfg, session: []const u8, request: history_pages.Request) !void {
@@ -3075,26 +3142,60 @@ fn clientLoop(client_sock_fd: i32, mirror: bool, resume_req: ?ipc.ResumeInit, hi
 
 /// dameonLoop is what the daemon runs to send and receive ipc commands from its corresponding
 /// clients.  It uses poll() as its non-blocking mechanism.
-fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
+fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32, activation: ?upgrade_handoff.Activation) anyerror!void {
+    if (activation != null) {
+        const log_path = try std.fmt.allocPrint(daemon.alloc, "{s}/{s}.log", .{ daemon.cfg.log_dir, daemon.session_name });
+        defer daemon.alloc.free(log_path);
+        try log_system.init(daemon.alloc, log_path, daemon.cfg.log_mode);
+    }
     std.log.info("daemon started session={s} pty_fd={d}", .{ daemon.session_name, pty_fd });
     daemon.pty_fd = pty_fd;
     // The identity a client's saved byte offset is only valid against.
-    daemon.epoch = std.crypto.random.int(u64);
+    if (activation == null) daemon.epoch = std.crypto.random.int(u64);
     try openSignalPipe();
     installWakeHandler(posix.SIG.TERM);
     var poll_fds = try std.ArrayList(posix.pollfd).initCapacity(daemon.alloc, 8);
     defer poll_fds.deinit(daemon.alloc);
 
     const init_size = ipc.getTerminalSize(pty_fd);
+    if (activation == null) {
+        daemon.upgrade_journal = upgrade_journal.Journal.createForSession(daemon.alloc, init_size.cols, init_size.rows) catch null;
+    }
+    defer if (daemon.upgrade_journal) |*journal| journal.deinit();
+    const initial_geometry = if (activation != null)
+        try upgrade_journal.Journal.inspect(daemon.upgrade_journal.?.descriptor, daemon.upgrade_journal.?.bytes_written)
+    else
+        upgrade_journal.Geometry{ .columns = init_size.cols, .rows = init_size.rows };
     var term = try ghostty_vt.Terminal.init(daemon.alloc, .{
-        .cols = init_size.cols,
-        .rows = init_size.rows,
+        .cols = initial_geometry.columns,
+        .rows = initial_geometry.rows,
         .max_scrollback = daemon.cfg.max_scrollback,
     });
     defer term.deinit(daemon.alloc);
     defer daemon.history_store.clear();
     var vt_stream = term.vtStream();
     defer vt_stream.deinit();
+
+    if (activation) |handover| {
+        try daemon.upgrade_journal.?.replay(daemon.alloc, &term, &vt_stream);
+        if (term.cols != init_size.cols or term.rows != init_size.rows) return error.RestoredGeometryMismatch;
+        // Prepare the acknowledgement before commitment, while failure remains reversible.
+        for (daemon.clients.items) |client| {
+            if (client.socket_fd == handover.requester) {
+                try ipc.appendMessage(daemon.alloc, &client.write_buf, .Upgrade, "ok\n");
+                client.has_pending_output = true;
+            }
+        }
+        try upgrade_handoff.sendByte(handover.outgoing, 'R');
+        try upgrade_handoff.waitByte(handover.incoming, 'C', upgrade_handoff.timeout_milliseconds);
+        const previous_mask = try upgrade_handoff.prepareCommit(sig_pipe[0]);
+        defer posix.sigprocmask(posix.SIG.SETMASK, &previous_mask, null);
+        try upgrade_handoff.sendByte(handover.outgoing, 'A');
+        try upgrade_handoff.waitForCommit(handover.incoming);
+        handover.active.* = true;
+        posix.close(handover.incoming);
+        posix.close(handover.outgoing);
+    }
 
     daemon_loop: while (daemon.running) {
         poll_fds.clearRetainingCapacity();
@@ -3129,7 +3230,10 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
             });
         }
 
-        _ = try posix.poll(poll_fds.items, -1);
+        const buffered_messages = for (daemon.clients.items) |client| {
+            if (client.read_buf.hasMessage()) break true;
+        } else false;
+        _ = try posix.poll(poll_fds.items, if (buffered_messages) 0 else -1);
 
         if (poll_fds.items[2].revents & posix.POLL.IN != 0) {
             drainSignalPipe();
@@ -3188,6 +3292,7 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
                     break :daemon_loop;
                 } else {
                     // Feed PTY output to terminal emulator for state tracking
+                    if (daemon.upgrade_journal) |*journal| journal.recordOutput(buf[0..n]);
                     vt_stream.nextSlice(buf[0..n]);
                     daemon.has_pty_output = true;
                     daemon.output_sequence +%= 1;
@@ -3273,7 +3378,7 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
             const client = daemon.clients.items[i];
             const revents = poll_fds.items[i + 3].revents;
 
-            if (revents & posix.POLL.IN != 0) {
+            if (revents & posix.POLL.IN != 0 and !client.read_buf.hasMessage()) {
                 const n = client.read_buf.read(client.socket_fd) catch |err| {
                     if (err == error.WouldBlock) continue;
                     std.log.debug(
@@ -3291,7 +3396,9 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
                     if (last) break :daemon_loop;
                     continue;
                 }
+            }
 
+            {
                 while (client.read_buf.next()) |msg| {
                     switch (msg.header.tag) {
                         .Input => try daemon.handleInput(client, msg.payload),
@@ -3301,6 +3408,13 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
                         .InitResume => try daemon.handleInitResume(client, &term, msg.payload, false),
                         .InitPagedResume => try daemon.handleInitResume(client, &term, msg.payload, true),
                         .HistoryPage => try daemon.handleHistoryPage(client, msg.payload),
+                        .Upgrade => {
+                            if (client.did_init) continue;
+                            upgrades.begin(daemon, server_sock_fd, client.socket_fd, msg.payload, sig_pipe[0]) catch |failure| {
+                                try ipc.appendMessage(daemon.alloc, &client.write_buf, .Upgrade, @errorName(failure));
+                                client.has_pending_output = true;
+                            };
+                        },
                         // Daemon -> client only; a client sending it is noise.
                         .ResumeInfo, .PagedResumeInfo => {},
                         .Claim => try daemon.handleClaim(pty_fd, &term, msg.payload),
@@ -3351,7 +3465,9 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
                 }
             }
 
-            if (revents & (posix.POLL.HUP | posix.POLL.ERR | posix.POLL.NVAL) != 0) {
+            if (revents & (posix.POLL.ERR | posix.POLL.NVAL) != 0 or
+                (revents & posix.POLL.HUP != 0 and revents & posix.POLL.IN == 0))
+            {
                 const last = daemon.closeClient(client, i, false);
                 if (last) break :daemon_loop;
             }

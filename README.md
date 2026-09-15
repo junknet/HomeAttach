@@ -76,20 +76,28 @@ version, inspect the session, then upgrade that named session explicitly:
 `tsess-upgrade` invokes the installed executable from its own directory as
 `zmx upgrade <session> <absolute-new-binary>`. For a separately built candidate,
 use that command directly with its absolute executable path. There is no default
-batch upgrade. `stat` reports `hot_upgrade=1` when the daemon supports handoff;
+batch upgrade. `stat` reports `hot_upgrade=1` when the daemon supports handoff
+and `upgrade_ready=1` while its reconstruction journal remains usable;
 `daemon_pid` identifies the supervisor and `pid` continues to identify the shell.
 Old daemons without handoff support report an unsupported upgrade; preserve those
 tabs and create new sessions to obtain the capability. Installing a file cannot
 add handoff support to an already running old daemon.
 
 To reconstruct terminal state, each capable session records raw terminal output
-and resize events in an anonymous disk journal, bounded at 256 MiB. Reaching that
+and resize events in an anonymous file under `$XDG_CACHE_HOME/zmx` (or
+`$HOME/.cache/zmx`), bounded at 256 MiB. Reaching that
 limit or losing the journal makes hot upgrade unavailable for that session while
 normal terminal operation continues. Candidate reconstruction briefly pauses
 terminal forwarding; child processes remain attached to the same PTY and can
 experience output backpressure during the pause. Failure before handoff leaves
-the original session running. This supports compatible handoff formats, not
-arbitrary zmx versions or recovery after a host reboot.
+the original session running. Candidates must support handoff format version 1
+and the exact same Ghostty dependency revision. A terminal-engine revision change
+is explicitly rejected until a compatible migration exists. This does not provide
+recovery after a host reboot or protect against killing the active daemon.
+
+The candidate waits for the old daemon's control pipe to close before consuming
+any terminal or client bytes. A termination signal during preparation cancels the
+upgrade; after the commit barrier it is applied to the replacement normally.
 
 An upgrade can expire history page cursors; reopen the phone's terminal to obtain
 a fresh current-screen snapshot when it reports an expired history boundary.
@@ -114,6 +122,7 @@ python3 -m pytest -q server/tests
 cd server/zmx
 ~/.local/toolchains/zig-x86_64-linux-0.15.2/zig build test -j2
 python3 test-history-pages.py zig-out/bin/zmx
+python3 test-hot-upgrade.py zig-out/bin/zmx
 ```
 
 The app is GPLv3 because it incorporates the Termux terminal engine. Vendored
