@@ -75,6 +75,35 @@ public final class TerminalView extends View {
      * extra bottom row; non-zero only while mTopRow < 0, so the extra row is always in range.
      */
     float mTopRowOffsetPx;
+    /** 实时输出移动历史行后，惯性动画仍以原来的内容位置为锚点。 */
+    private float mScrollAnimationShiftPx;
+    private HistoryScrollListener mHistoryScrollListener;
+    private int mNotifiedHistoryTop = Integer.MIN_VALUE;
+    private int mNotifiedHistoryCount = Integer.MIN_VALUE;
+    private int mNotifiedVisibleCount = Integer.MIN_VALUE;
+
+    public interface HistoryScrollListener {
+        void onHistoryScroll(int topRow, int historyRows, int visibleRows);
+    }
+
+    public void setHistoryScrollListener(HistoryScrollListener listener) {
+        mHistoryScrollListener = listener;
+        mNotifiedHistoryTop = Integer.MIN_VALUE;
+        mNotifiedHistoryCount = Integer.MIN_VALUE;
+        mNotifiedVisibleCount = Integer.MIN_VALUE;
+    }
+
+    private void notifyHistoryScroll() {
+        if (mHistoryScrollListener == null || mEmulator == null || mEmulator.isAlternateBufferActive()) return;
+        int historyRows = mEmulator.getScreen().getActiveTranscriptRows();
+        int visibleRows = mEmulator.mRows;
+        if (mTopRow == mNotifiedHistoryTop && historyRows == mNotifiedHistoryCount
+            && visibleRows == mNotifiedVisibleCount) return;
+        mNotifiedHistoryTop = mTopRow;
+        mNotifiedHistoryCount = historyRows;
+        mNotifiedVisibleCount = visibleRows;
+        mHistoryScrollListener.onHistoryScroll(mTopRow, historyRows, visibleRows);
+    }
     int[] mDefaultSelectors = new int[]{-1,-1,-1,-1};
 
     float mScaleFactor = 1.f;
@@ -250,6 +279,7 @@ public final class TerminalView extends View {
                 int ls = mRenderer.mFontLineSpacing;
                 int minPx = -mEmulator.getScreen().getActiveTranscriptRows() * ls;
                 int startPx = Math.round(mTopRow * ls + mTopRowOffsetPx);
+                mScrollAnimationShiftPx = 0f;
                 mScroller.fling(0, startPx, 0, Math.round(-velocityY), 0, 0, minPx, 0);
                 postScrollAnimation();
                 return true;
@@ -329,6 +359,9 @@ public final class TerminalView extends View {
         if (session == mTermSession) return false;
         mTopRow = 0;
         mTopRowOffsetPx = 0f;
+        mNotifiedHistoryTop = Integer.MIN_VALUE;
+        mScrollAnimationShiftPx = 0f;
+        mScroller.forceFinished(true);
 
         mTermSession = session;
         mEmulator = null;
@@ -564,14 +597,31 @@ public final class TerminalView extends View {
         mTopRow = 0;
         mTopRowOffsetPx = 0f;
         mScroller.forceFinished(true);
+        notifyHistoryScroll();
         invalidate();
     }
 
     public void onScreenUpdated(boolean skipScrolling) {
+        if (mTermSession != null && mTermSession.getEmulator() != null
+            && mTermSession.getEmulator() != mEmulator) {
+            stopTextSelectionMode();
+            mEmulator = mTermSession.getEmulator();
+            mTopRow = 0;
+            mTopRowOffsetPx = 0f;
+            mScrollAnimationShiftPx = 0f;
+            mScroller.forceFinished(true);
+            mEmulator.clearScrollCounter();
+            mNotifiedHistoryTop = Integer.MIN_VALUE;
+            if (mTerminalCursorBlinkerRunnable != null) {
+                mTerminalCursorBlinkerRunnable.setEmulator(mEmulator);
+            }
+        }
         if (mEmulator == null) return;
+        int previousTopRow = mTopRow;
 
         int rowsInHistory = mEmulator.getScreen().getActiveTranscriptRows();
         if (mTopRow < -rowsInHistory) mTopRow = -rowsInHistory;
+        if (mTopRow == 0) mTopRowOffsetPx = 0f;
 
         // Sticky bottom (HomeAttach): output follows the viewport only while the viewport is at the
         // bottom. Scrolled up, the reader keeps the lines they are looking at and new output piles
@@ -617,6 +667,11 @@ public final class TerminalView extends View {
         }
 
         mEmulator.clearScrollCounter();
+
+        if (!mScroller.isFinished() && previousTopRow != mTopRow) {
+            mScrollAnimationShiftPx += (mTopRow - previousTopRow) * (float) mRenderer.mFontLineSpacing;
+        }
+        if (mTopRow < 0) notifyHistoryScroll();
 
         invalidate();
         if (mAccessibilityEnabled) setContentDescription(getText());
@@ -722,6 +777,7 @@ public final class TerminalView extends View {
         }
         mTopRow = newTopRow;
         mTopRowOffsetPx = offset;
+        notifyHistoryScroll();
         if (!awakenScrollBars()) invalidate();
     }
 
@@ -731,6 +787,7 @@ public final class TerminalView extends View {
         int current = Math.round(mTopRow * ls + mTopRowOffsetPx);
         int target = Math.round(current / (float) ls) * ls;
         if (target == current) return;
+        mScrollAnimationShiftPx = 0f;
         mScroller.startScroll(0, current, 0, target - current, 120);
         postScrollAnimation();
     }
@@ -749,14 +806,14 @@ public final class TerminalView extends View {
         @Override
         public void run() {
             mScrollAnimationPosted = false;
-            if (mEmulator == null) return;
+            if (mEmulator == null || mScroller.isFinished()) return;
             if (mEmulator.isMouseTrackingActive() || mEmulator.isAlternateBufferActive()) {
                 mScroller.forceFinished(true);
                 return;
             }
             boolean more = mScroller.computeScrollOffset();
-            setScrollPixelPosition(mScroller.getCurrY());
-            if (more) {
+            setScrollPixelPosition(mScroller.getCurrY() + mScrollAnimationShiftPx);
+            if (more && !mScroller.isFinished()) {
                 postScrollAnimation();
             } else if (mTopRowOffsetPx != 0f) {
                 startSnapToRowGrid();
@@ -777,9 +834,11 @@ public final class TerminalView extends View {
                 handleKeyCode(up ? KeyEvent.KEYCODE_DPAD_UP : KeyEvent.KEYCODE_DPAD_DOWN, 0);
             } else {
                 mTopRow = Math.min(0, Math.max(-(mEmulator.getScreen().getActiveTranscriptRows()), mTopRow + (up ? -1 : 1)));
+                if (mTopRow == 0) mTopRowOffsetPx = 0f;
                 if (!awakenScrollBars()) invalidate();
             }
         }
+        if (!mEmulator.isMouseTrackingActive()) notifyHistoryScroll();
     }
 
     /** Overriding {@link View#onGenericMotionEvent(MotionEvent)}. */
@@ -1253,8 +1312,10 @@ public final class TerminalView extends View {
         return mTopRow;
     }
 
-    public void setTopRow(int mTopRow) {
-        this.mTopRow = mTopRow;
+    public void setTopRow(int topRow) {
+        mTopRow = topRow;
+        if (mTopRow == 0) mTopRowOffsetPx = 0f;
+        notifyHistoryScroll();
     }
 
 

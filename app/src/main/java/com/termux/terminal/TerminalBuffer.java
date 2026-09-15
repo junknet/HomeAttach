@@ -148,6 +148,43 @@ public final class TerminalBuffer {
         return mActiveTranscriptRows;
     }
 
+    /** Prepend chronological history within unused capacity, preserving existing coordinates. */
+    public int prependTranscriptRows(TerminalRow[] historyRows) {
+        int availableRows = mTotalRows - mScreenRows - mActiveTranscriptRows;
+        int insertedRows = Math.min(availableRows, historyRows.length);
+        TerminalRow[] copiedRows = new TerminalRow[insertedRows];
+        int sourceOffset = historyRows.length - insertedRows;
+        for (int historyIndex = 0; historyIndex < insertedRows; historyIndex++) {
+            copiedRows[historyIndex] = copyTranscriptRow(historyRows[sourceOffset + historyIndex]);
+        }
+        for (int historyIndex = 0; historyIndex < insertedRows; historyIndex++) {
+            int externalRow = -mActiveTranscriptRows - insertedRows + historyIndex;
+            int internalRow = (mScreenFirstRow + externalRow + mTotalRows) % mTotalRows;
+            mLines[internalRow] = copiedRows[historyIndex];
+        }
+        mActiveTranscriptRows += insertedRows;
+        return insertedRows;
+    }
+
+    /** Return independently mutable transcript/screen contents, including wrapping metadata. */
+    public TerminalRow copyRow(int externalRow) {
+        if (externalRow < -mActiveTranscriptRows || externalRow >= mScreenRows) {
+            throw new IllegalArgumentException("Cannot copy terminal row: externalRow=" + externalRow);
+        }
+        return copyTranscriptRow(mLines[externalToInternalRow(externalRow)]);
+    }
+
+    private TerminalRow copyTranscriptRow(TerminalRow sourceRow) {
+        if (sourceRow == null || sourceRow.mStyle.length != mColumns) {
+            throw new IllegalArgumentException("History row must contain " + mColumns + " columns");
+        }
+        TerminalRow copiedRow = new TerminalRow(mColumns, TextStyle.NORMAL);
+        copiedRow.copyInterval(sourceRow, 0, mColumns, 0);
+        System.arraycopy(sourceRow.mStyle, 0, copiedRow.mStyle, 0, mColumns);
+        copiedRow.mLineWrap = sourceRow.mLineWrap;
+        return copiedRow;
+    }
+
     public int getActiveRows() {
         return mActiveTranscriptRows + mScreenRows;
     }
