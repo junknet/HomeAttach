@@ -37,6 +37,7 @@ flood and another for silence without a second fixture:
 from __future__ import annotations
 
 import os
+import json
 import signal
 import sys
 import time
@@ -85,9 +86,16 @@ def report_resume(args: list[str]) -> None:
         # A zmx too old to know about resuming: attaches, says nothing.
         return
     replay = max(live_offset - asked_offset, 0) if continued else 0
-    sys.stderr.write(
-        f"zmx-resume mode={mode} epoch={live_epoch} offset={live_offset} bytes={replay}\n"
-    )
+    report = f"zmx-resume mode={mode} epoch={live_epoch} offset={live_offset} bytes={replay}"
+    if "--history-pages" in args:
+        log_call("history-pages", [name_of(args)], "FAKE_ZMX_ATTACH_LOG")
+        if os.environ.get("FAKE_HISTORY_SPLIT_REPORT"):
+            sys.stderr.write(report)
+            sys.stderr.flush()
+            time.sleep(0.1)
+            report = ""
+        report += " history=18446744073709551615 more=1 columns=80"
+    sys.stderr.write(report + "\n")
     sys.stderr.flush()
 
 
@@ -186,6 +194,32 @@ def main(argv: list[str]) -> int:
         log_call(verb, args)
         return 0
 
+    if verb == "history-page":
+        log_call(verb, args)
+        log_call("history-process", [str(os.getpid())])
+        time.sleep(float(os.environ.get("FAKE_HISTORY_DELAY", "0")))
+        if os.environ.get("FAKE_HISTORY_OVERSIZED"):
+            sys.stdout.write("X" * (512 * 1024 + 1))
+            return 0
+        if os.environ.get("FAKE_HISTORY_MALFORMED"):
+            sys.stdout.write('{"status":"ok"}')
+            return 0
+        name, anchor, before, limit = args
+        before, limit = int(before), int(limit)
+        ending = max(0, 500 - before)
+        beginning = max(0, ending - limit)
+        history_rows = [
+            {"text": "" if position == 498 else f"\x1b[31m历史 {position}\x1b[0m",
+             "wrapped": position % 2 == 0}
+            for position in range(beginning, ending)
+        ]
+        sys.stdout.write(json.dumps({
+            "status": "ok", "anchor": anchor, "before": before,
+            "next": before + len(history_rows), "columns": 80,
+            "more": beginning > 0, "rows": history_rows,
+        }))
+        return 0
+
     if verb == "stat":
         if args:
             # Single-session form: the mux asks this before attaching, to find
@@ -198,7 +232,9 @@ def main(argv: list[str]) -> int:
             end = os.environ.get("FAKE_ZMX_OFFSET", "0")
             sys.stdout.write(
                 f"pid=1 cols=80 rows=24 owners=1 mirrors=0 bound=1 output_seq=1"
-                f" epoch={epoch} stream_start=0 stream_end={end}\n"
+                f" epoch={epoch} stream_start=0 stream_end={end}"
+                + (" history_pages=1" if os.environ.get("FAKE_HISTORY_ENABLED") else "")
+                + "\n"
             )
             return 0
         # Bulk form: one process answering for every session is the whole reason

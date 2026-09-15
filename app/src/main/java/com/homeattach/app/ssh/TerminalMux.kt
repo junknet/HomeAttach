@@ -43,6 +43,7 @@ internal interface MuxSessionListener {
      */
     fun onReady(ready: MuxReady)
     fun onOutput(data: ByteArray)
+    fun onHistoryPage(page: MuxHistoryPage) {}
 
     /** The session is gone on the host — its tab was closed or it was killed. Terminal. */
     fun onEnded(reason: String)
@@ -170,6 +171,23 @@ internal object TerminalMux {
 
     fun sendInput(slot: Slot, data: ByteArray) {
         connection.get()?.takeIf { !it.closed }?.send(MuxProtocol.input(slot.sid, data))
+    }
+
+    fun requestHistory(slot: Slot, anchor: String, before: Long, limit: Int = 128) {
+        synchronized(lock) {
+            if (slots[slot.sid] !== slot || !slot.ready) return
+            connection.get()?.takeIf { !it.closed }
+                ?.send(MuxProtocol.history(slot.sid, anchor, before, limit))
+        }
+    }
+
+    fun requestSnapshot(slot: Slot): Boolean = synchronized(lock) {
+        if (slots[slot.sid] !== slot) return@synchronized false
+        slot.resume = slot.resume.copy(epoch = 0, offset = 0)
+        slot.ready = false
+        val channel = connection.get()?.takeIf { !it.closed } ?: return@synchronized false
+        channel.send(openFrame(slot))
+        true
     }
 
     /**
@@ -337,9 +355,15 @@ internal object TerminalMux {
         }
         when (frame.type) {
             MuxProtocol.OUTPUT -> slot.listener.onOutput(frame.payload)
+            MuxProtocol.HISTORY_PAGE -> {
+                if (!slot.ready) return
+                val page = MuxProtocol.readHistoryPage(frame.payload)
+                if (page == null) slot.listener.onError("malformed history page")
+                else slot.listener.onHistoryPage(page)
+            }
             MuxProtocol.READY -> {
                 val ready = MuxProtocol.readReady(frame.payload)
-                if (ready == null) {
+                if (ready == null || ready.sessionName != slot.sessionName) {
                     if (BuildConfig.DEBUG) Log.w(TAG, "malformed READY: $frame")
                     return
                 }

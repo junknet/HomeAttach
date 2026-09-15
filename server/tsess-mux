@@ -40,6 +40,7 @@ in an OUTPUT frame.
 from __future__ import annotations
 
 import errno
+import json
 import os
 import pty
 import re
@@ -59,6 +60,7 @@ OPEN = 0x01
 CLOSE = 0x02
 INPUT = 0x03
 FOCUS = 0x04
+HISTORY = 0x05
 
 # mux -> client
 READY = 0x81
@@ -69,6 +71,7 @@ ERROR = 0x84
 # mux -> client, slot 0: the host's state rather than any one session's.
 SESSIONS = 0x85
 ACTIVITY = 0x86
+HISTORY_PAGE = 0x87
 
 CONTROL_SLOT = 0
 
@@ -92,6 +95,10 @@ SNAPSHOT_TAIL_ROWS = 200
 
 HEADER = struct.Struct(">BBI")
 MAX_PAYLOAD = 1 << 20
+HISTORY_PAYLOAD_LIMIT = 512 * 1024
+HISTORY_REQUEST_TIMEOUT_S = 5.0
+HISTORY_PAGE_ROWS = 128
+HISTORY_MAX_ROWS = 256
 
 # One session's turn on the shared stream. Small enough that a flood cannot hold
 # the channel long enough to be felt as a stall in another terminal.
@@ -171,7 +178,8 @@ class BackgroundCommand:
     stall in every attached terminal, several times a minute.
     """
 
-    def __init__(self, argv: list[str], env: dict[str, str]):
+    def __init__(self, argv: list[str], env: dict[str, str],
+                 output_limit: int | None = None):
         self.proc = subprocess.Popen(
             argv,
             stdin=subprocess.DEVNULL,
@@ -182,10 +190,12 @@ class BackgroundCommand:
         self.fd = self.proc.stdout.fileno()
         os.set_blocking(self.fd, False)
         self.out = bytearray()
+        self.output_limit = output_limit
+        self.overflowed = False
 
     def read(self) -> bool:
         """Drains what is ready. True once the command is done and [out] is whole."""
-        while True:
+        for iteration in range(4):
             try:
                 chunk = os.read(self.fd, 65536)
             except BlockingIOError:
@@ -194,7 +204,11 @@ class BackgroundCommand:
                 return True
             if not chunk:
                 return True
+            if self.output_limit is not None and len(self.out) + len(chunk) > self.output_limit:
+                self.overflowed = True
+                return True
             self.out.extend(chunk)
+        return False
 
     def close(self) -> subprocess.Popen:
         try:
@@ -375,6 +389,11 @@ class Session:
         self.ready_deadline = time.monotonic() + RESUME_REPORT_TIMEOUT_S
         # Only a session that claimed the pty size has anything to hand back.
         self.claimed = False
+        self.history_supported = False
+        self.history_columns = 0
+        self.history_job: BackgroundCommand | None = None
+        self.history_request: tuple[str, int, int] | None = None
+        self.history_deadline = 0.0
 
     @property
     def backlogged(self) -> bool:
@@ -382,6 +401,42 @@ class Session:
 
 
 RESUME_LINE = re.compile(rb"zmx-resume mode=(\w+) epoch=(\d+) offset=(\d+) bytes=(\d+)")
+
+
+def valid_history_anchor(anchor: object) -> bool:
+    return (isinstance(anchor, str) and re.fullmatch(r"0|[1-9][0-9]{0,19}", anchor)
+            is not None and int(anchor) <= 0xffffffffffffffff)
+
+
+def valid_history_page(payload: bytes, anchor: str, before: int, limit: int) -> bool:
+    try:
+        response = json.loads(payload.decode("utf-8"))
+        if not isinstance(response, dict):
+            return False
+        rows = response["rows"]
+        following = response["next"]
+        columns = response["columns"]
+        if (response["anchor"] != anchor or type(response["before"]) is not int
+                or response["before"] != before or type(following) is not int
+                or type(columns) is not int or not 0 <= columns <= 65535
+                or type(response["more"]) is not bool or not isinstance(rows, list)
+                or len(rows) > limit or following != before + len(rows)
+                or following > 0x7fffffffffffffff):
+            return False
+        if response["status"] in ("expired", "unsupported"):
+            return not rows and not response["more"]
+        if response["status"] != "ok" or columns == 0:
+            return False
+        if not rows and response["more"]:
+            return False
+        return all(isinstance(history_row, dict)
+                   and isinstance(history_row.get("text"), str)
+                   and type(history_row.get("wrapped")) is bool
+                   and "\n" not in history_row["text"]
+                   and "\r" not in history_row["text"]
+                   for history_row in rows)
+    except (ValueError, KeyError, TypeError, UnicodeError, RecursionError):
+        return False
 
 
 class Mux:
@@ -430,6 +485,8 @@ class Mux:
             self.write_to_session(session, payload)
         elif type_ == FOCUS:
             self.focus_session(session, payload)
+        elif type_ == HISTORY:
+            self.request_history(session, payload)
         elif type_ == CLOSE:
             self.close_session(session)
         else:
@@ -437,8 +494,8 @@ class Mux:
 
     # ---------- sessions ----------
 
-    def daemon_epoch(self, name: str) -> int | None:
-        """The session daemon's resume epoch, or None if it has no such thing.
+    def daemon_capabilities(self, name: str) -> tuple[int | None, bool]:
+        """Discover resume and history capabilities before starting the mirror.
 
         A daemon older than the resume patches ignores the init message that
         asks for one, and a mirror it never registered as a mirror is a client
@@ -453,19 +510,15 @@ class Mux:
                 env=self.zmx_env, timeout=DAEMON_PROBE_TIMEOUT_S,
             ).stdout
         except (OSError, subprocess.SubprocessError):
-            return None
-        for field in out.split():
-            if field.startswith("epoch="):
-                try:
-                    return int(field.split("=", 1)[1])
-                except ValueError:
-                    return None
-        return None
+            return None, False
+        fields = dict(field.split("=", 1) for field in out.split() if "=" in field)
+        try:
+            epoch = int(fields["epoch"])
+            return epoch, fields.get("history_pages") == "1"
+        except (KeyError, ValueError):
+            return None, False
 
     def open_session(self, sid: int, payload: bytes) -> None:
-        if sid in self.sessions:
-            self.queue(ERROR, sid, b"session slot already in use")
-            return
         if sid == 0:
             self.queue(ERROR, sid, b"slot 0 is reserved")
             return
@@ -487,6 +540,13 @@ class Mux:
             self.queue(ERROR, sid, b"session name is not utf-8")
             return
 
+        previous = self.sessions.get(sid)
+        if previous is not None:
+            if previous.name != name or epoch != 0 or offset != 0:
+                self.queue(ERROR, sid, b"session slot already in use")
+                return
+            self.teardown(previous)
+
         master_fd, slave_fd = pty.openpty()
         # Raw, and this is not optional: in canonical mode the pty holds input
         # until a newline, so arrow keys and Ctrl-C never reach the session, and
@@ -506,10 +566,13 @@ class Mux:
             # size a frame later anyway - this only stops it being late.
             self.run_blocking(["claim", name, str(cols), str(rows)])
 
-        resumable = self.daemon_epoch(name) is not None
+        daemon_epoch, history_supported = self.daemon_capabilities(name)
+        resumable = daemon_epoch is not None
         attach_args = ["attach", "--mirror"]
         if resumable:
             attach_args += ["--resume", f"{epoch}:{offset}", "--tail", str(tail_rows)]
+        if history_supported:
+            attach_args.append("--history-pages")
         attach_args.append(name)
 
         err_r, err_w = os.pipe()
@@ -533,11 +596,113 @@ class Mux:
         # then the slot is not in turn_order, so none of its output can precede
         # the answer the client needs in order to interpret it.
         session = Session(sid, name, proc, master_fd, err_r)
+        session.history_supported = history_supported
         self.sessions[sid] = session
         if not resumable:
             # An older daemon: it will send the session's whole picture, the way
             # it always has. Nothing to wait for, and nothing the client can keep.
             self.send_ready(session, RESUME_SNAPSHOT, 0, 0)
+            self.history_response(session, "unsupported", "0", 0)
+
+    def history_response(self, session: Session, status: str, anchor: str,
+                         before: int, more: bool = False) -> None:
+        response = {"status": status, "anchor": anchor, "before": before,
+                    "next": before, "columns": session.history_columns,
+                    "more": more, "rows": []}
+        self.queue(HISTORY_PAGE, session.sid,
+                   json.dumps(response, separators=(",", ":")).encode("utf-8"))
+
+    def send_history_metadata(self, session: Session, report: bytes) -> None:
+        if not session.history_supported:
+            self.history_response(session, "unsupported", "0", 0)
+            return
+        fields = dict(field.split(b"=", 1) for field in bytes(report).split() if b"=" in field)
+        try:
+            anchor = fields[b"history"].decode("ascii")
+            columns = int(fields[b"columns"])
+            more = fields[b"more"]
+            if not valid_history_anchor(anchor) or not 1 <= columns <= 65535:
+                raise ValueError("invalid history metadata")
+            if more not in (b"0", b"1"):
+                raise ValueError("invalid history availability")
+        except (KeyError, ValueError, UnicodeError):
+            session.history_supported = False
+            self.history_response(session, "unsupported", "0", 0)
+            return
+        session.history_columns = columns
+        self.history_response(session, "ok", anchor, 0, more == b"1")
+
+    def request_history(self, session: Session, payload: bytes) -> None:
+        try:
+            if len(payload) > 1024:
+                raise ValueError("history request exceeds limit")
+            request = json.loads(payload.decode("utf-8"))
+            if not isinstance(request, dict):
+                raise ValueError("history request must be object")
+            anchor = request["anchor"]
+            before = request["before"]
+            limit = request.get("limit", HISTORY_PAGE_ROWS)
+            if not valid_history_anchor(anchor):
+                raise ValueError("history anchor must be unsigned decimal string")
+            if type(before) is not int or not 0 <= before <= 0x7fffffffffffffff:
+                raise ValueError("history before must be nonnegative integer")
+            if type(limit) is not int or not 1 <= limit <= HISTORY_MAX_ROWS:
+                raise ValueError("history limit outside supported range")
+        except (ValueError, KeyError, TypeError, UnicodeError) as failure:
+            self.queue(ERROR, session.sid, f"invalid history request: {failure}".encode())
+            return
+        if not session.history_supported:
+            self.history_response(session, "unsupported", anchor, before)
+            return
+        request_identity = (anchor, before, limit)
+        if session.history_job is not None:
+            if session.history_request != request_identity:
+                self.queue(ERROR, session.sid, b"history request already running")
+            return
+        try:
+            session.history_job = BackgroundCommand(
+                self.zmx + ["history-page", session.name, anchor, str(before), str(limit)],
+                self.zmx_env, output_limit=HISTORY_PAYLOAD_LIMIT)
+        except OSError:
+            self.history_response(session, "expired", anchor, before)
+            return
+        session.history_request = request_identity
+        session.history_deadline = time.monotonic() + HISTORY_REQUEST_TIMEOUT_S
+
+    def cancel_history(self, session: Session) -> None:
+        command, session.history_job = session.history_job, None
+        session.history_request = None
+        if command is None:
+            return
+        process = command.close()
+        if process.poll() is None:
+            try:
+                process.kill()
+            except OSError:
+                pass
+        self.reaping.append(process)
+
+    def pump_history(self, readable: list[int]) -> None:
+        current_time = time.monotonic()
+        for session in list(self.sessions.values()):
+            command = session.history_job
+            request = session.history_request
+            if command is None or request is None:
+                continue
+            anchor, before, limit = request
+            expired = current_time >= session.history_deadline
+            completed = command.fd in readable and command.read()
+            if not expired and not completed:
+                continue
+            payload = bytes(command.out)
+            valid = (not expired and not command.overflowed
+                     and valid_history_page(payload, anchor, before, limit))
+            self.cancel_history(session)
+            if valid:
+                self.queue(HISTORY_PAGE, session.sid, payload)
+            else:
+                self.history_response(session, "expired", anchor, before)
+                self.queue(ERROR, session.sid, b"history page unavailable or malformed")
 
     def write_to_session(self, session: Session, data: bytes) -> None:
         try:
@@ -560,6 +725,7 @@ class Mux:
         self.teardown(session)
 
     def teardown(self, session: Session) -> None:
+        self.cancel_history(session)
         self.sessions.pop(session.sid, None)
         if session.sid in self.turn_order:
             self.turn_order.remove(session.sid)
@@ -678,24 +844,26 @@ class Mux:
             self.close_err(session)
             if not session.ready_sent:
                 self.send_ready(session, RESUME_SNAPSHOT, 0, 0)
+                session.history_supported = False
+                self.history_response(session, "unsupported", "0", 0)
             return
 
         session.errbuf.extend(data)
-        match = RESUME_LINE.search(session.errbuf)
-        if match and not session.ready_sent:
-            mode = (RESUME_CONTINUED if match.group(1) == b"continued"
-                    else RESUME_SNAPSHOT)
-            self.send_ready(session, mode, int(match.group(2)), int(match.group(3)),
-                            int(match.group(4)))
-        # Anything else zmx says belongs in our own stderr, not the terminal.
-        # Drained whether or not anyone is listening: an unread pipe fills, and
-        # a zmx blocked writing to it is a terminal that has stopped.
         while b"\n" in session.errbuf:
             line, _, rest = session.errbuf.partition(b"\n")
             session.errbuf = bytearray(rest)
-            if line.strip() and not RESUME_LINE.search(line):
+            match = RESUME_LINE.search(line)
+            if match and not session.ready_sent:
+                mode = (RESUME_CONTINUED if match.group(1) == b"continued"
+                        else RESUME_SNAPSHOT)
+                self.send_ready(session, mode, int(match.group(2)), int(match.group(3)),
+                                int(match.group(4)))
+                self.send_history_metadata(session, line)
+            elif line.strip() and not match:
                 print(f"tsess-mux: {session.name}: {line.decode('utf-8', 'replace')}",
                       file=sys.stderr)
+        if len(session.errbuf) > CHUNK_BYTES:
+            session.errbuf.clear()
 
     def close_err(self, session: Session) -> None:
         if not session.err_open:
@@ -721,6 +889,8 @@ class Mux:
         for session in list(self.sessions.values()):
             if not session.ready_sent and now >= session.ready_deadline:
                 self.send_ready(session, RESUME_SNAPSHOT, 0, 0)
+                session.history_supported = False
+                self.history_response(session, "unsupported", "0", 0)
 
     def read_session(self, session: Session) -> None:
         try:
@@ -755,6 +925,10 @@ class Mux:
                 if self.stdin_open:
                     read_fds.append(0)
                 read_fds.extend(self.status.fds())
+                read_fds.extend(
+                    session.history_job.fd for session in self.sessions.values()
+                    if session.history_job is not None
+                )
                 # A backlogged session is not read: its pty fills up and the
                 # writer blocks, which is the backpressure that keeps one noisy
                 # terminal from being buffered at everyone else's expense.
@@ -801,6 +975,7 @@ class Mux:
                     if session.master_fd in readable:
                         self.read_session(session)
                 self.expire_pending_ready()
+                self.pump_history(readable)
 
                 self.status.on_readable(readable)
                 self.pump_status()

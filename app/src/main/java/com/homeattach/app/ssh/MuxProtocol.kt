@@ -1,5 +1,10 @@
 package com.homeattach.app.ssh
 
+import java.nio.ByteBuffer
+import java.nio.charset.CodingErrorAction
+import org.json.JSONObject
+import org.json.JSONTokener
+
 /**
  * Wire format of the `tsess-mux` channel.
  *
@@ -25,6 +30,7 @@ internal object MuxProtocol {
     const val CLOSE = 0x02
     const val INPUT = 0x03
     const val FOCUS = 0x04
+    const val HISTORY = 0x05
 
     // host -> phone
     const val READY = 0x81
@@ -37,6 +43,10 @@ internal object MuxProtocol {
     // which is what makes every lamp read from one clock.
     const val SESSIONS = 0x85
     const val ACTIVITY = 0x86
+    const val HISTORY_PAGE = 0x87
+
+    const val HISTORY_PAYLOAD_LIMIT = 512 * 1024
+    const val HISTORY_MAX_ROWS = 256
 
     const val CONNECTION_SLOT = 0
     const val HEADER_BYTES = 6
@@ -137,6 +147,62 @@ internal object MuxProtocol {
 
     fun close(sid: Int): ByteArray = encode(CLOSE, sid)
 
+    fun history(slot: Int, anchor: String, before: Long, limit: Int = 128): ByteArray {
+        require(validHistoryAnchor(anchor)) { "invalid history anchor" }
+        require(before >= 0) { "history offset must be nonnegative" }
+        require(limit in 1..HISTORY_MAX_ROWS) { "history page limit outside supported range" }
+        val payload = "{\"anchor\":\"$anchor\",\"before\":$before,\"limit\":$limit}"
+        return encode(HISTORY, slot, payload.toByteArray(Charsets.UTF_8))
+    }
+
+    fun readHistoryPage(payload: ByteArray): MuxHistoryPage? {
+        if (payload.size > HISTORY_PAYLOAD_LIMIT) return null
+        return try {
+            val decoder = Charsets.UTF_8.newDecoder()
+                .onMalformedInput(CodingErrorAction.REPORT)
+                .onUnmappableCharacter(CodingErrorAction.REPORT)
+            val tokens = JSONTokener(decoder.decode(ByteBuffer.wrap(payload)).toString())
+            val record = tokens.nextValue() as? JSONObject ?: return null
+            if (tokens.nextClean() != '\u0000') return null
+            val status = record.opt("status") as? String ?: return null
+            val anchor = record.opt("anchor") as? String ?: return null
+            if (status !in HISTORY_STATUSES || !validHistoryAnchor(anchor)) return null
+            val before = historyInteger(record, "before") ?: return null
+            val following = historyInteger(record, "next") ?: return null
+            val columns = historyInteger(record, "columns") ?: return null
+            val more = record.opt("more") as? Boolean ?: return null
+            val records = record.optJSONArray("rows") ?: return null
+            if (before < 0 || following < before || columns !in 0L..65535L ||
+                records.length() > HISTORY_MAX_ROWS || following - before != records.length().toLong()
+            ) return null
+            if (status != "ok" && (records.length() != 0 || more)) return null
+            if (status == "ok" && columns == 0L) return null
+            val historyRows = List(records.length()) { index ->
+                val history = records.optJSONObject(index) ?: return null
+                val content = history.opt("text") as? String ?: return null
+                val wrapped = history.opt("wrapped") as? Boolean ?: return null
+                if ('\n' in content || '\r' in content) return null
+                MuxHistoryRow(content, wrapped)
+            }
+            MuxHistoryPage(status, anchor, before, following, columns.toInt(), more, historyRows)
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private fun historyInteger(record: JSONObject, field: String): Long? =
+        when (val value = record.opt(field)) {
+            is Int -> value.toLong()
+            is Long -> value
+            else -> null
+        }
+
+    private fun validHistoryAnchor(anchor: String): Boolean =
+        HISTORY_ANCHOR.matches(anchor) && anchor.toULongOrNull() != null
+
+    private val HISTORY_ANCHOR = Regex("0|[1-9][0-9]{0,19}")
+    private val HISTORY_STATUSES = setOf("ok", "expired", "unsupported")
+
     fun input(sid: Int, data: ByteArray): ByteArray = encode(INPUT, sid, data)
 
     fun focus(sid: Int, columns: Int, rows: Int): ByteArray {
@@ -171,6 +237,18 @@ internal data class MuxReady(
     val sessionName: String,
 )
 
+internal data class MuxHistoryRow(val text: String, val wrapped: Boolean)
+
+internal data class MuxHistoryPage(
+    val status: String,
+    val anchor: String,
+    val before: Long,
+    val next: Long,
+    val columns: Int,
+    val more: Boolean,
+    val rows: List<MuxHistoryRow>,
+)
+
 /** One decoded frame. [payload] is owned by the receiver and is never reused by the reader. */
 internal class MuxFrame(val type: Int, val sid: Int, val payload: ByteArray) {
     val text: String get() = String(payload, Charsets.UTF_8)
@@ -181,12 +259,14 @@ internal class MuxFrame(val type: Int, val sid: Int, val payload: ByteArray) {
             MuxProtocol.CLOSE -> "CLOSE"
             MuxProtocol.INPUT -> "INPUT"
             MuxProtocol.FOCUS -> "FOCUS"
+            MuxProtocol.HISTORY -> "HISTORY"
             MuxProtocol.READY -> "READY"
             MuxProtocol.OUTPUT -> "OUTPUT"
             MuxProtocol.ENDED -> "ENDED"
             MuxProtocol.ERROR -> "ERROR"
             MuxProtocol.SESSIONS -> "SESSIONS"
             MuxProtocol.ACTIVITY -> "ACTIVITY"
+            MuxProtocol.HISTORY_PAGE -> "HISTORY_PAGE"
             else -> "0x%02x".format(type)
         }
         return "MuxFrame($kind, sid=$sid, ${payload.size}B)"

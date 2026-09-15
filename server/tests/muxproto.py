@@ -34,6 +34,7 @@ round trip to every open for no gain.
 from __future__ import annotations
 
 import struct
+import json
 from dataclasses import dataclass
 from typing import Iterator
 
@@ -42,6 +43,7 @@ OPEN = 0x01
 CLOSE = 0x02
 INPUT = 0x03
 FOCUS = 0x04
+HISTORY = 0x05
 
 # mux -> client
 READY = 0x81
@@ -53,11 +55,13 @@ ERROR = 0x84
 # belongs to the connection rather than to any one session.
 SESSIONS = 0x85
 ACTIVITY = 0x86
+HISTORY_PAGE = 0x87
 
 NAMES = {
     OPEN: "OPEN", CLOSE: "CLOSE", INPUT: "INPUT", FOCUS: "FOCUS",
     READY: "READY", OUTPUT: "OUTPUT", ENDED: "ENDED", ERROR: "ERROR",
     SESSIONS: "SESSIONS", ACTIVITY: "ACTIVITY",
+    HISTORY: "HISTORY", HISTORY_PAGE: "HISTORY_PAGE",
 }
 
 CONNECTION_SLOT = 0
@@ -189,3 +193,9 @@ class FrameReader:
     @property
     def pending_bytes(self) -> int:
         return len(self._buffer)
+
+
+def history_frame(slot: int, anchor: str, before: int = 0, limit: int = 128) -> bytes:
+    return encode(HISTORY, slot, json.dumps(
+        {"anchor": anchor, "before": before, "limit": limit},
+        separators=(",", ":")).encode("utf-8"))
