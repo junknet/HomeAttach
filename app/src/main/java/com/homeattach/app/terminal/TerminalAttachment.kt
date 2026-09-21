@@ -124,7 +124,14 @@ class TerminalAttachment(
             // IME opening and closing re-measures the grid constantly, and re-claiming on every one
             // would put a frame and a host-side resize behind each keyboard flap.
             if (foreground.get() && previous != size) claimFocus()
-            if (previous != null && previous != size) requestFreshSnapshot()
+            // Only a *width* change invalidates the picture the host sent. A row count change is a
+            // pty resize the emulator absorbs locally, pulling rows out of the transcript or
+            // pushing them back into it, so the screen stays the screen. Asking for a fresh
+            // snapshot there would tear the mirror down on the host and redraw all 200 tail rows —
+            // and the one thing that changes rows and nothing else is the IME, several times a
+            // minute. Re-snapshotting on a keyboard flap is what made every keystroke cost a
+            // re-attach.
+            if (previous != null && previous.columns != size.columns) requestFreshSnapshot()
         },
     ).apply {
         onFirstOutput = { _hasOutput.value = true }
@@ -253,7 +260,11 @@ class TerminalAttachment(
         if (released.get()) return
 
         awaitingSnapshot.set(false)
-        if (!ready.continued && foreground.get() && requestedSnapshotSize.get() != measuredSize.get()) {
+        // The grid can move between asking for a picture and being given one. Only a width that no
+        // longer matches makes the answer unusable — same reason as the resize path above, and
+        // re-requesting on a row count would loop a keyboard flap against the host's round trip.
+        if (!ready.continued && foreground.get() &&
+            requestedSnapshotSize.get()?.columns != measuredSize.get()?.columns) {
             requestFreshSnapshot()
             return
         }
