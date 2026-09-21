@@ -113,6 +113,13 @@ private const val KEY_REPEAT_INTERVAL_MS = 60L
 private const val TERMINAL_SESSION_DRAWER_WIDTH_FRACTION = 0.62f
 private const val TERMINAL_TEXT_SIZE_DP = 14
 private val TERMINAL_EXTRA_KEYS_ROW_HEIGHT = 48.dp
+
+/** The label size the row starts at, and the floor it will not shrink past. See [ExtraKeysRow]. */
+private const val KEY_LABEL_MAX_SP = 13f
+private const val KEY_LABEL_MIN_SP = 8f
+
+/** Floor on a cap's width share, in the same units as a label's character count. */
+private const val KEY_MIN_WEIGHT = 2f
 private val ANSI_ARROW_UP = byteArrayOf(0x1b, '['.code.toByte(), 'A'.code.toByte())
 private val ANSI_ARROW_DOWN = byteArrayOf(0x1b, '['.code.toByte(), 'B'.code.toByte())
 private val ANSI_ARROW_RIGHT = byteArrayOf(0x1b, '['.code.toByte(), 'C'.code.toByte())
@@ -770,80 +777,84 @@ internal fun ExtraKeysRow(
     remoteTerminalSession: RemoteTerminalSession,
     modifier: Modifier = Modifier,
 ) {
+    // Every key is reachable without scrolling, at any width.
+    //
+    // The row used to scroll horizontally, which on a 360dp phone put the arrows off the right
+    // edge - the keys a terminal needs most were the ones behind a swipe. Fitting them by picking
+    // smaller fixed sizes would only move the problem to the next narrower device, so the fit is
+    // derived instead, in two steps that cover different failures.
+    //
+    // Caps divide the row's actual width by weight, and the weight follows the label: an equal
+    // share is what a five-character `Paste` cannot live on while a one-glyph arrow wastes it, and
+    // at 240dp that renders as "Past". Arrows keep a floor so they stay tappable rather than
+    // collapsing to their glyph. The shared font size is then the backstop, stepping down until
+    // nothing overflows - it covers a label longer than any of these, which a weight cannot.
+    //
+    // A scrollable Row would hand its children an infinite width constraint and make `weight`
+    // meaningless, which is why removing the scroll and adding weights are one change.
+    var labelSp by remember { mutableStateOf(KEY_LABEL_MAX_SP) }
+    val shrink = { if (labelSp > KEY_LABEL_MIN_SP) labelSp -= 1f }
+
     Row(
         modifier = modifier
             .fillMaxWidth()
             .height(TERMINAL_EXTRA_KEYS_ROW_HEIGHT)
             .background(Color.Black)
-            .horizontalScroll(rememberScrollState())
-            .padding(horizontal = 8.dp, vertical = 4.dp),
-        horizontalArrangement = Arrangement.spacedBy(5.dp),
+            .padding(horizontal = 6.dp, vertical = 4.dp),
+        horizontalArrangement = Arrangement.spacedBy(4.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        KeyCap(
-            label = stringResource(R.string.terminal_key_esc),
-            modifier = Modifier.widthIn(min = 48.dp),
-        ) {
-            remoteTerminalSession.write(byteArrayOf(0x1b), 0, 1)
+        // Ctrl+C/Ctrl+D are spelled in caret notation: six characters would force the whole row
+        // down to an unreadable size to fit one cap, and `^C` is what a terminal calls it anyway.
+        val keys = listOf<Pair<String, () -> Unit>>(
+            stringResource(R.string.terminal_key_esc) to
+                { remoteTerminalSession.write(byteArrayOf(0x1b), 0, 1) },
+            "Tab" to { remoteTerminalSession.write(byteArrayOf(0x09), 0, 1) },
+            "^C" to { remoteTerminalSession.write(byteArrayOf(0x03), 0, 1) },
+            "^D" to { remoteTerminalSession.write(byteArrayOf(0x04), 0, 1) },
+            stringResource(R.string.terminal_key_paste) to
+                { remoteTerminalSession.pasteTextFromClipboard() },
+        )
+        keys.forEach { (label, action) ->
+            KeyCap(
+                label = label,
+                labelSp = labelSp,
+                onOverflow = shrink,
+                modifier = Modifier.weight(label.capWeight()),
+                onPress = action,
+            )
         }
-        KeyCap(
-            label = "Tab",
-            modifier = Modifier.widthIn(min = 48.dp),
-        ) {
-            remoteTerminalSession.write(byteArrayOf(0x09), 0, 1)
-        }
-        KeyCap(
-            label = "Ctrl+C",
-            modifier = Modifier.widthIn(min = 48.dp),
-        ) {
-            remoteTerminalSession.write(byteArrayOf(0x03), 0, 1)
-        }
-        KeyCap(
-            label = "Ctrl+D",
-            modifier = Modifier.widthIn(min = 48.dp),
-        ) {
-            remoteTerminalSession.write(byteArrayOf(0x04), 0, 1)
-        }
-        KeyCap(
-            label = stringResource(R.string.terminal_key_paste),
-            modifier = Modifier.widthIn(min = 48.dp),
-        ) {
-            remoteTerminalSession.pasteTextFromClipboard()
-        }
-        KeyCap(
-            label = "←",
-            modifier = Modifier.widthIn(min = 48.dp),
-            repeating = true
-        ) {
-            remoteTerminalSession.write(ANSI_ARROW_LEFT, 0, ANSI_ARROW_LEFT.size)
-        }
-        KeyCap(
-            label = "↑",
-            modifier = Modifier.widthIn(min = 48.dp),
-            repeating = true
-        ) {
-            remoteTerminalSession.write(ANSI_ARROW_UP, 0, ANSI_ARROW_UP.size)
-        }
-        KeyCap(
-            label = "↓",
-            modifier = Modifier.widthIn(min = 48.dp),
-            repeating = true
-        ) {
-            remoteTerminalSession.write(ANSI_ARROW_DOWN, 0, ANSI_ARROW_DOWN.size)
-        }
-        KeyCap(
-            label = "→",
-            modifier = Modifier.widthIn(min = 48.dp),
-            repeating = true
-        ) {
-            remoteTerminalSession.write(ANSI_ARROW_RIGHT, 0, ANSI_ARROW_RIGHT.size)
+        // Arrows repeat on hold; everything above is one-shot.
+        listOf(
+            "\u2190" to ANSI_ARROW_LEFT,
+            "\u2191" to ANSI_ARROW_UP,
+            "\u2193" to ANSI_ARROW_DOWN,
+            "\u2192" to ANSI_ARROW_RIGHT,
+        ).forEach { (label, code) ->
+            KeyCap(
+                label = label,
+                labelSp = labelSp,
+                onOverflow = shrink,
+                modifier = Modifier.weight(label.capWeight()),
+                repeating = true,
+            ) {
+                remoteTerminalSession.write(code, 0, code.size)
+            }
         }
     }
 }
 
+/**
+ * A cap's share of the row: its label's length, floored so a single glyph still gets a key worth
+ * aiming a thumb at rather than one sized to the arrow drawn on it.
+ */
+private fun String.capWeight(): Float = maxOf(KEY_MIN_WEIGHT, length.toFloat())
+
 @Composable
 private fun KeyCap(
     label: String,
+    labelSp: Float,
+    onOverflow: () -> Unit,
     modifier: Modifier,
     repeating: Boolean = false,
     onPress: () -> Unit,
@@ -899,17 +910,23 @@ private fun KeyCap(
         Box(
             Modifier
                 .fillMaxHeight()
-                .padding(horizontal = 6.dp),
+                .padding(horizontal = 2.dp),
             contentAlignment = Alignment.Center,
         ) {
             Text(
                 text = label,
                 style = MaterialTheme.typography.labelMedium.copy(
+                    fontSize = labelSp.sp,
+                    lineHeight = (labelSp * 1.2f).sp,
                     fontWeight = FontWeight.SemiBold,
                     letterSpacing = 0.sp
                 ),
                 color = foreground,
                 maxLines = 1,
+                softWrap = false,
+                // Reported up so the whole row settles on one size: a cap that shrank alone would
+                // leave the arrows large and `Paste` tiny, which reads as a rendering bug.
+                onTextLayout = { if (it.didOverflowWidth) onOverflow() },
                 overflow = TextOverflow.Clip,
             )
         }

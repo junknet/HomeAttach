@@ -4,15 +4,23 @@ import android.graphics.Bitmap
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.width
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.asAndroidBitmap
+import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.captureToImage
 import androidx.compose.ui.test.click
+import androidx.compose.ui.test.getUnclippedBoundsInRoot
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.onRoot
 import androidx.compose.ui.test.performTouchInput
+import androidx.compose.ui.semantics.SemanticsActions
+import androidx.compose.ui.text.TextLayoutResult
 import androidx.compose.ui.test.swipeLeft
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.test.platform.app.InstrumentationRegistry
 import com.homeattach.app.terminal.RemoteTerminalSession
@@ -22,40 +30,112 @@ import org.junit.Assert.*
 import org.junit.Rule
 import org.junit.Test
 
+/**
+ * The extra-keys row has one job beyond sending bytes: every key has to be *reachable*.
+ *
+ * It used to scroll horizontally, which on a 360dp phone parked the arrows off the right edge -
+ * the keys a terminal needs most were the ones behind a swipe. Fitting them by choosing smaller
+ * fixed sizes only moves that failure to the next narrower device, so the row derives its fit from
+ * the width it is actually given. These tests are that claim: the same row, rendered at widths
+ * narrower than any phone this ships to, still shows all nine keys inside its own bounds.
+ */
 class TerminalExtraKeysTest {
     @get:Rule
     val composition = createComposeRule()
     private lateinit var terminal: RemoteTerminalSession
+
+    private val allKeys = listOf("Esc", "Tab", "^C", "^D", "Paste", "←", "↑", "↓", "→")
 
     @After
     fun releaseTerminal() {
         if (::terminal.isInitialized) composition.runOnIdle { terminal.finish() }
     }
 
-    @Test
-    fun tabIsReachableAndScrollingKeysDoesNotType() {
-        val received = mutableListOf<ByteArray>()
+    private fun renderRow(width: Dp, onInput: (ByteArray) -> Unit) {
         val context = InstrumentationRegistry.getInstrumentation().targetContext
         composition.runOnIdle {
-            terminal = RemoteTerminalSession(context, { received += it }, { _, _ -> })
+            terminal = RemoteTerminalSession(context, onInput, { _, _ -> })
         }
         composition.setContent {
             MaterialTheme {
-                Box(Modifier.width(320.dp)) { ExtraKeysRow(terminal) }
+                Box(Modifier.width(width)) { ExtraKeysRow(terminal) }
             }
         }
+    }
+
+    @Test
+    fun everyKeyFitsWithoutScrollingAtPhoneWidth() {
+        renderRow(320.dp) {}
+        assertEveryKeyIsInside(320.dp)
+    }
+
+    @Test
+    fun everyKeyStillFitsOnAWidthNarrowerThanAnyPhone() {
+        // 240dp is below the narrowest Android phone in circulation. If the row survives here it
+        // is fitting by construction rather than by having been tuned on one device.
+        renderRow(240.dp) {}
+        captureRow("terminal-extra-keys-240.png")
+        assertEveryKeyIsInside(240.dp)
+    }
+
+    private fun captureRow(name: String) {
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        val image = composition.onRoot().captureToImage().asAndroidBitmap()
+        File(context.getExternalFilesDir(null), name).outputStream().use { out ->
+            assertTrue(image.compress(Bitmap.CompressFormat.PNG, 100, out))
+        }
+    }
+
+    private fun assertEveryKeyIsInside(width: Dp) {
+        allKeys.forEach { label ->
+            val node = composition.onNodeWithText(label)
+            node.assertIsDisplayed()
+            val bounds = node.getUnclippedBoundsInRoot()
+            assertTrue(
+                "key '$label' starts off the left edge at $width (left=${bounds.left})",
+                bounds.left.value >= -0.5f,
+            )
+            assertTrue(
+                "key '$label' runs past the right edge at $width (right=${bounds.right})",
+                bounds.right.value <= width.value + 0.5f,
+            )
+            // A cap inside the row whose *label* is clipped is still a key the user cannot read.
+            // Bounds alone do not catch that: the text is clipped within a correctly placed cap,
+            // which is exactly how a first version of this passed while rendering "Past".
+            val layouts = mutableListOf<TextLayoutResult>()
+            node.fetchSemanticsNode().config[SemanticsActions.GetTextLayoutResult]
+                .action?.invoke(layouts)
+            assertTrue("no text layout reported for '$label'", layouts.isNotEmpty())
+            assertFalse(
+                "label '$label' is truncated at $width",
+                layouts.first().didOverflowWidth,
+            )
+        }
+    }
+
+    @Test
+    fun tabTypesAndAStraySwipeDoesNot() {
+        val received = mutableListOf<ByteArray>()
+        renderRow(320.dp) { received += it }
+
         composition.onNodeWithText("Tab").performTouchInput { click() }
         composition.runOnIdle {
             assertEquals(1, received.size)
             assertArrayEquals(byteArrayOf(0x09), received.single())
             received.clear()
         }
+
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
         val image = composition.onRoot().captureToImage().asAndroidBitmap()
-        File(context.getExternalFilesDir(null), "terminal-extra-keys.png").outputStream().use { output ->
-            assertTrue(image.compress(Bitmap.CompressFormat.PNG, 100, output))
+        File(context.getExternalFilesDir(null), "terminal-extra-keys.png").outputStream().use { out ->
+            assertTrue(image.compress(Bitmap.CompressFormat.PNG, 100, out))
         }
+
+        // A finger dragged across the row - reaching past it, or a habitual swipe left over from
+        // when the row scrolled - must send nothing at all.
         composition.onRoot().performTouchInput { swipeLeft() }
-        composition.runOnIdle { assertTrue("Scrolling must not type terminal keys", received.isEmpty()) }
+        composition.runOnIdle { assertTrue("A swipe across the row must not type", received.isEmpty()) }
+
         composition.onNodeWithText("→").performTouchInput { click() }
         composition.runOnIdle {
             assertArrayEquals(byteArrayOf(0x1b, 0x5b, 0x43), received.single())
