@@ -119,6 +119,12 @@ TERMINATE_GRACE_S = 1.0
 # no matter how many sessions exist.
 ACTIVITY_POLL_S = 0.25
 
+# How long a poll's answer may be reused to open a session without re-asking the
+# daemon. Comfortably more than [ACTIVITY_POLL_S], so the normal case is always a
+# hit, and short enough that a poll which has stopped running cannot keep
+# answering for daemons it can no longer see.
+STAT_CACHE_MAX_AGE_S = 2.0
+
 # The full list walks /proc per session in a shell script. It only has to be as
 # fresh as the running command and cwd, which change on human timescales; a
 # session appearing or disappearing does not wait for it (see [SessionStatus]).
@@ -230,9 +236,14 @@ class BackgroundCommand:
         return bytes(self.out).decode("utf-8", "replace")
 
 
-def parse_stat(text: str) -> dict[str, int]:
-    """`zmx stat` bulk output -> {session name: output sequence}."""
-    sequences: dict[str, int] = {}
+def parse_stat(text: str) -> dict[str, dict[str, str]]:
+    """`zmx stat` bulk output -> {session name: its `key=value` fields}.
+
+    The bulk form prints the same fields the single-session form does, which is
+    what lets [SessionStatus.capabilities] answer from the poll a question an
+    attach would otherwise spend a whole process on.
+    """
+    sessions: dict[str, dict[str, str]] = {}
     for line in text.splitlines():
         fields = dict(
             field.split("=", 1) for field in line.split() if "=" in field
@@ -240,11 +251,15 @@ def parse_stat(text: str) -> dict[str, int]:
         name = fields.get("name")
         if not name:
             continue
-        try:
-            sequences[name] = int(fields.get("output_seq", "0"))
-        except ValueError:
-            sequences[name] = 0
-    return sequences
+        sessions[name] = fields
+    return sessions
+
+
+def stat_sequence(fields: dict[str, str]) -> int:
+    try:
+        return int(fields.get("output_seq", "0"))
+    except ValueError:
+        return 0
 
 
 class SessionStatus:
@@ -267,6 +282,10 @@ class SessionStatus:
         self.list_command = session_list_command()
         self.active: set[str] = set()
         self.sequences: dict[str, int] = {}
+        # The last poll's raw fields, and when it landed. Opening a session reads
+        # them instead of probing the daemon itself; see [capabilities].
+        self.stats: dict[str, dict[str, str]] = {}
+        self.stats_at = 0.0
         self.stat_job: BackgroundCommand | None = None
         self.list_job: BackgroundCommand | None = None
         self.reaping: list[subprocess.Popen] = []
@@ -279,6 +298,28 @@ class SessionStatus:
     def note_output(self, name: str) -> None:
         """An attached session just produced bytes — no poll can beat this."""
         self.active.add(name)
+
+    def capabilities(self, name: str) -> tuple[bool, bool] | None:
+        """What the last poll saw of [name]'s daemon: (resumable, history pages).
+
+        None means "go ask it yourself". Only a line that actually carried an
+        `epoch` proves anything: the field arrived with the resume patches, so a
+        line without it is either a daemon that predates them or a session this
+        poll has not seen yet, and those two have to be told apart by the probe.
+        A line that has it came from the same daemon the probe would have asked,
+        so believing it is not a weaker check - only a cheaper one.
+
+        Bounded by age rather than trusted forever: if the poll stops running
+        (its binary went missing) these fields stay behind silently, and a stale
+        yes is exactly the answer that attaches a non-mirror client to a daemon
+        that cannot take one.
+        """
+        if time.monotonic() - self.stats_at > STAT_CACHE_MAX_AGE_S:
+            return None
+        fields = self.stats.get(name)
+        if fields is None or "epoch" not in fields:
+            return None
+        return True, fields.get("history_pages") == "1"
 
     def fds(self) -> list[int]:
         return [job.fd for job in (self.stat_job, self.list_job) if job is not None]
@@ -296,7 +337,10 @@ class SessionStatus:
         if job is None:
             return
         self.reaping.append(job.close())
-        sequences = parse_stat(job.text)
+        sessions = parse_stat(job.text)
+        self.stats = sessions
+        self.stats_at = time.monotonic()
+        sequences = {name: stat_sequence(f) for name, f in sessions.items()}
         for name, sequence in sequences.items():
             previous = self.sequences.get(name)
             if previous is not None and sequence != previous:
@@ -494,29 +538,37 @@ class Mux:
 
     # ---------- sessions ----------
 
-    def daemon_capabilities(self, name: str) -> tuple[int | None, bool]:
-        """Discover resume and history capabilities before starting the mirror.
+    def daemon_capabilities(self, name: str) -> tuple[bool, bool]:
+        """Whether this daemon can resume, and whether it serves history pages.
 
         A daemon older than the resume patches ignores the init message that
         asks for one, and a mirror it never registered as a mirror is a client
         that can take the pty size - i.e. resize the terminal someone is working
         in. So capability is checked before attaching, not assumed and repaired
-        afterwards. One short-lived process per session open, which is already
-        the most expensive thing that happens there.
+        afterwards.
+
+        The activity poll already asks every daemon the same question four times
+        a second, and its answer carries the same fields, so an open normally
+        costs no process at all here. The probe below is what covers the cases
+        the poll cannot speak for - a session younger than the last poll, or a
+        daemon too old to have printed the fields that settle it.
         """
+        cached = self.status.capabilities(name)
+        if cached is not None:
+            return cached
         try:
             out = subprocess.run(
                 self.zmx + ["stat", name], capture_output=True, text=True,
                 env=self.zmx_env, timeout=DAEMON_PROBE_TIMEOUT_S,
             ).stdout
         except (OSError, subprocess.SubprocessError):
-            return None, False
+            return False, False
         fields = dict(field.split("=", 1) for field in out.split() if "=" in field)
         try:
-            epoch = int(fields["epoch"])
-            return epoch, fields.get("history_pages") == "1"
+            int(fields["epoch"])
         except (KeyError, ValueError):
-            return None, False
+            return False, False
+        return True, fields.get("history_pages") == "1"
 
     def open_session(self, sid: int, payload: bytes) -> None:
         if sid == 0:
@@ -566,8 +618,7 @@ class Mux:
             # size a frame later anyway - this only stops it being late.
             self.run_blocking(["claim", name, str(cols), str(rows)])
 
-        daemon_epoch, history_supported = self.daemon_capabilities(name)
-        resumable = daemon_epoch is not None
+        resumable, history_supported = self.daemon_capabilities(name)
         attach_args = ["attach", "--mirror"]
         if resumable:
             attach_args += ["--resume", f"{epoch}:{offset}", "--tail", str(tail_rows)]

@@ -472,3 +472,73 @@ def test_closing_the_channel_leaves_no_orphan_host_processes(mux):
     while time.monotonic() < deadline and pgid_process_count(mux.pgid) > 0:
         time.sleep(0.05)
     assert pgid_process_count(mux.pgid) == 0, "mux exited but left zmx children behind"
+
+
+# ---------- opening a session must not re-ask what the poll already knows ----------
+
+
+def stat_probes(stat_log) -> list[str]:
+    return [c for c in read_calls(stat_log) if not c.startswith("stat-bulk")]
+
+
+def wait_for_warm_stat_cache(stat_log, deadline_s: float = 5.0) -> None:
+    """Block until the mux has consumed a bulk poll.
+
+    Two polls, not one: the mux never starts a poll while another is
+    outstanding, so a second `stat-bulk` in the log proves the first one was
+    read to EOF and folded into the cache. Waiting for the first would race the
+    fake's log write against the mux's read of its output.
+    """
+    deadline = time.monotonic() + deadline_s
+    while time.monotonic() < deadline:
+        if len([c for c in read_calls(stat_log) if c.startswith("stat-bulk")]) >= 2:
+            return
+        time.sleep(0.02)
+    raise AssertionError("the mux never polled the host twice")
+
+
+def test_opening_a_session_reuses_the_polls_answer_instead_of_probing(
+    require_mux, zmx_log, attach_log, stat_log, tmp_path, host
+):
+    """The activity poll asks every daemon the same capability question four
+    times a second, and its answer carries the same fields the probe reads. A
+    process per open on top of that is pure latency in front of the first byte
+    the user sees — and the phone re-opens a session on every reconnect."""
+    host.set_sessions({"quiet-alpha": 1}, resumable=True, history=True)
+    client = MuxClient(
+        zmx_log, tmp_path, attach_log=attach_log, stat_log=stat_log,
+        extra_env={**host.env(), "FAKE_ZMX_EPOCH": "4242",
+                   "FAKE_ZMX_OFFSET": "5000"},
+    )
+    try:
+        wait_for_warm_stat_cache(stat_log)
+        ready = client.open_session(1, "quiet-alpha", epoch=4242, offset=1234)
+        assert ready.name == "quiet-alpha"
+        assert stat_probes(stat_log) == [], "the open probed what the poll had answered"
+        # And it used the answer rather than merely skipping the question: both
+        # capabilities the poll reported have to reach the attach.
+        assert ready.continued
+        assert resume_calls(attach_log) == ["resume quiet-alpha continued 4242 1234"]
+        assert [c for c in read_calls(attach_log) if c.startswith("history-pages")]
+    finally:
+        client.shutdown()
+
+
+def test_a_session_the_poll_has_not_seen_is_still_probed(
+    require_mux, zmx_log, attach_log, stat_log, tmp_path, host
+):
+    """The cache is an accelerator, never the authority. A session born since
+    the last poll, or a daemon too old to print the fields that settle it, has
+    to be asked directly — attaching a client the daemon never registered as a
+    mirror is what lets a phone resize the terminal someone is working in."""
+    host.set_sessions({"quiet-alpha": 1})
+    client = MuxClient(
+        zmx_log, tmp_path, attach_log=attach_log, stat_log=stat_log,
+        extra_env=host.env(),
+    )
+    try:
+        wait_for_warm_stat_cache(stat_log)
+        client.open_session(1, "quiet-alpha")
+        assert stat_probes(stat_log) == ["stat quiet-alpha"]
+    finally:
+        client.shutdown()

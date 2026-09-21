@@ -60,6 +60,17 @@ def zmx_log(tmp_path: Path) -> Path:
 
 
 @pytest.fixture
+def stat_log(tmp_path: Path) -> Path:
+    """Where fake_zmx records every `stat` the mux ran: `stat-bulk` for a poll,
+    `stat <name>` for the per-open capability probe. Separate from [zmx_log] for
+    the same reason [attach_log] is — status polling happens on its own clock and
+    would otherwise appear in every "the mux asked for nothing" assertion."""
+    path = tmp_path / "zmx-stat-calls.log"
+    path.touch()
+    return path
+
+
+@pytest.fixture
 def attach_log(tmp_path: Path) -> Path:
     """Where fake_zmx records how each attach was spelled: its resume request and
     its snapshot cap. Separate from [zmx_log] so "the mux asked the host for
@@ -85,13 +96,25 @@ class FakeHost:
         self.fail_list = False
         self.set_sessions({})
 
-    def set_sessions(self, sequences: dict[str, int]) -> None:
-        """Declare which sessions exist and how much output each has emitted."""
+    def set_sessions(self, sequences: dict[str, int],
+                     resumable: bool = False, history: bool = False) -> None:
+        """Declare which sessions exist and how much output each has emitted.
+
+        [resumable] adds the fields a daemon carrying the resume patches prints —
+        the real bulk form prints them for every session, and their presence is
+        what lets the mux open a session without probing it. Off by default so
+        the probe path stays the one most tests exercise.
+        """
+        extra = ""
+        if resumable:
+            extra = " epoch=4242 stream_start=0 stream_end=0"
+            if history:
+                extra += " history_pages=1"
         self._write(
             self.stat_file,
             "".join(
                 f"name={name} pid=1 cols=80 rows=24 owners=1 mirrors=0 "
-                f"bound=1 output_seq={seq}\n"
+                f"bound=1 output_seq={seq}{extra}\n"
                 for name, seq in sequences.items()
             ),
         )
@@ -157,7 +180,8 @@ class MuxClient:
     def __init__(self, zmx_log: Path, tmp_path: Path,
                  read_chunk: int = 65536, read_pause_s: float = 0.0,
                  extra_env: dict[str, str] | None = None,
-                 attach_log: Path | None = None):
+                 attach_log: Path | None = None,
+                 stat_log: Path | None = None):
         # A throttled reader is not an artificial handicap: the phone parses VT100
         # on its main thread under a per-frame byte budget, so it consumes far
         # slower than the host produces. Starvation only becomes observable once
@@ -170,6 +194,7 @@ class MuxClient:
             "HOMEATTACH_ZMX": f"{sys.executable} {FAKE_ZMX}",
             "FAKE_ZMX_LOG": str(zmx_log),
             "FAKE_ZMX_ATTACH_LOG": str(attach_log or (tmp_path / "zmx-attach.log")),
+            "FAKE_ZMX_STAT_LOG": str(stat_log or (tmp_path / "zmx-stat-calls.log")),
             "ZMX_DIR": str(tmp_path / "zmx-dir"),
             # Deliberately poisoned. A login shell that has ever been inside a session exports
             # this, and zmx reads it as "switch the current session" instead of "attach to the

@@ -16,6 +16,11 @@ Only the verbs `tsess-mux` depends on are implemented:
     claim <name> <cols> <rows>
     release <name>
     stat                     bulk status, read verbatim from $FAKE_ZMX_STAT
+    stat <name>              single-session status, answering the capability probe
+
+Both spellings of `stat` append to $FAKE_ZMX_STAT_LOG - `stat-bulk` for the poll,
+`stat <name>` for the probe - so a test can assert that opening a session spent
+no process on a question the poll had already answered.
 
 `claim` and `release` append one line to $FAKE_ZMX_LOG so a test can assert what
 the mux asked the host to do, and how many times. Attach-time arguments go to
@@ -225,6 +230,7 @@ def main(argv: list[str]) -> int:
             # Single-session form: the mux asks this before attaching, to find
             # out whether the daemon knows how to resume at all. $FAKE_ZMX_NO_EPOCH
             # stands in for a host that predates the resume patches.
+            log_call("stat", args, "FAKE_ZMX_STAT_LOG")
             if os.environ.get("FAKE_ZMX_NO_EPOCH"):
                 sys.stdout.write("pid=1 cols=80 rows=24 owners=1 mirrors=0 bound=1\n")
                 return 0
@@ -238,7 +244,11 @@ def main(argv: list[str]) -> int:
             )
             return 0
         # Bulk form: one process answering for every session is the whole reason
-        # the mux may poll this several times a second.
+        # the mux may poll this several times a second. Logged under its own verb
+        # so a test can count polls without counting probes, and because the
+        # second poll is what proves the first one was consumed - the mux never
+        # starts one while another is outstanding.
+        log_call("stat-bulk", [], "FAKE_ZMX_STAT_LOG")
         path = os.environ.get("FAKE_ZMX_STAT")
         if path and os.path.exists(path):
             with open(path, "r", encoding="utf-8") as handle:
