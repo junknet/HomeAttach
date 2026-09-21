@@ -1,8 +1,8 @@
 {
-  "versionCode": 17,
-  "versionName": "1.5.0",
-  "apkUrl": "https://github.com/junknet/HomeAttach/releases/download/v1.5.0/app-release.apk",
-  "sha256": "f92993c5333cff35db5b95b10ae9a087f3137ee9bf716b6921db9f5ea302f7aa",
+  "versionCode": 18,
+  "versionName": "1.5.1",
+  "apkUrl": "https://github.com/junknet/HomeAttach/releases/download/v1.5.1/app-release.apk",
+  "sha256": "5a00ff493122eed7bb7be45a2356d101acd8aff59d8c685c2704d068b4a12757",
   "sizeBytes": 28993072,
-  "notes": "大对话首屏按需加载、上翻预取历史、渲染修复及 Tab 键；电脑端支持新会话后续热升级。"
+  "notes": "忙碌会话不再越追越慢：解析预算放开、落后时先追赶再重绘，积压从 2MB 降到 70KB 以内，不再每两秒重新 attach；键盘开合不再触发整屏重取快照；电脑端开会话少一次进程探测。"
 }
