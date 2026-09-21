@@ -4,5 +4,5 @@
   "apkUrl": "https://github.com/junknet/HomeAttach/releases/download/v1.5.2/app-release.apk",
   "sha256": "8eb03e2a0e30d89a372e6f72634f2baf5cde9b8e2db89a5ff360d14c02e0ac3a",
   "sizeBytes": 28993072,
-  "notes": "快捷键一行放下：九个键按标签宽度分配、不再需要横滑，方向键随手可点。另含 1.5.1 的性能修复——忙碌会话不再越追越慢、键盘开合不再整屏重取快照。"
+  "notes": "终端页新增「新建」键：一键在电脑上开一个会话并直接进去，不用退回列表。同时含 1.5.2 的快捷键一行放下，以及 1.5.1 的性能修复。"
 }
