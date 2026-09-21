@@ -152,8 +152,11 @@ mirrors never clearing or RIS-resetting the caller's terminal) are documented in
 - Release builds run R8 full mode; `proguard-rules.pro` keeps the reflection-resolved JSch/BouncyCastle
   ed25519 crypto that R8 cannot see. Verify ed25519 connect on a real device after touching it.
 - Self-update reads a static `update.json` manifest from the release download URL, never the GitHub
-  REST API (rate limits + draft 404s). `versionCode`/`versionName` in `app/build.gradle.kts` and
-  `update.json` must agree; bump both plus the manifest URL for a release.
+  REST API (rate limits + draft 404s). Before a release, bump `versionCode`/`versionName` in
+  `app/build.gradle.kts` and write `notes` in `update.json`; `publish-release.sh` fills in the
+  manifest's version, URL, hash and size from the build it uploads and commits that before tagging.
+  Do not hand-write the hash — the release APK is not reproducible, so two clean builds of one
+  commit differ and a hash written in advance names an APK that was never published.
 
 ## Licensing
 

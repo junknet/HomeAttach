@@ -3,8 +3,14 @@
 # One-click: build the signed release APK and publish it as a GitHub Release.
 #
 # Flow: verify clean tree -> read version -> clean build -> verify APK is
-# signed with the persistent release keystore -> push master -> (re)create the
-# version tag -> create the GitHub Release and upload the APK.
+# signed with the persistent release keystore -> fold the build's hash into
+# update.json and commit it -> push master -> (re)create the version tag ->
+# create the GitHub Release and upload the APK.
+#
+# What you bump before running this: versionCode and versionName in
+# app/build.gradle.kts, and `notes` in update.json. The manifest's version, URL,
+# hash and size are written here - the APK is not reproducible, so a hash cannot
+# be known before the build that ships.
 #
 # Fail-fast by design. It never runs `git add -A`: publishing to a PUBLIC repo
 # must not blindly stage whatever happens to be in the tree (secrets, scratch
@@ -68,24 +74,75 @@ echo "APK sha256: $APK_SHA256  size: $APK_SIZE"
 # The app reads this from the CDN direct-download URL, NOT the GitHub REST API.
 # The asset name must be exactly "update.json"/"app-release.apk", so the temp
 # file is named accordingly (gh derives the asset name from the basename).
+#
+# The manifest is the repository's own update.json with the computed fields
+# replaced, rather than a fresh document. That makes the direction of each field
+# explicit: `notes` is written by a human before the release and flows *in*,
+# while the version, URL, hash and size are only knowable here and flow *out* -
+# written back to the same file, which step 3c commits. Generating the whole
+# document here instead is what used to ship "HomeAttach 1.5.1" as the release
+# note the update dialog showed, and leave the committed hash naming an APK
+# that was never published.
 REPO_SLUG=$(gh repo view --json nameWithOwner -q .nameWithOwner)
 APK_ASSET="app-release.apk"
 APK_URL="https://github.com/$REPO_SLUG/releases/download/$TAG_NAME/$APK_ASSET"
 MANIFEST_URL="https://github.com/$REPO_SLUG/releases/latest/download/update.json"
+REPO_MANIFEST="update.json"
 MANIFEST_DIR=$(mktemp -d)
 trap 'rm -rf "$MANIFEST_DIR"' EXIT
 MANIFEST="$MANIFEST_DIR/update.json"
-cat > "$MANIFEST" <<EOF
-{
-  "versionCode": $VERSION_CODE,
-  "versionName": "$VERSION_NAME",
-  "apkUrl": "$APK_URL",
-  "sha256": "$APK_SHA256",
-  "sizeBytes": $APK_SIZE,
-  "notes": "HomeAttach $VERSION_NAME"
-}
-EOF
+
+[ -f "$REPO_MANIFEST" ] || { echo "Error: $REPO_MANIFEST is missing." >&2; exit 1; }
+VERSION_CODE="$VERSION_CODE" VERSION_NAME="$VERSION_NAME" APK_URL="$APK_URL" \
+APK_SHA256="$APK_SHA256" APK_SIZE="$APK_SIZE" \
+python3 - "$REPO_MANIFEST" "$MANIFEST" <<'PYEOF' || exit 1
+import json, os, sys
+
+source, destination = sys.argv[1], sys.argv[2]
+with open(source, encoding="utf-8") as handle:
+    manifest = json.load(handle)
+
+notes = manifest.get("notes", "").strip()
+if not notes:
+    sys.exit(f"Error: {source} has no release notes to publish.")
+
+manifest.update({
+    "versionCode": int(os.environ["VERSION_CODE"]),
+    "versionName": os.environ["VERSION_NAME"],
+    "apkUrl": os.environ["APK_URL"],
+    "sha256": os.environ["APK_SHA256"],
+    "sizeBytes": int(os.environ["APK_SIZE"]),
+    "notes": notes,
+})
+for path in (destination, source):
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(manifest, handle, ensure_ascii=False, indent=2)
+        handle.write("\n")
+PYEOF
 echo "Manifest generated: $MANIFEST_URL -> versionCode $VERSION_CODE"
+
+# ---- 3c. Commit the manifest before tagging --------------------------------
+# The tag has to name a tree whose update.json is the one that ships. The APK is
+# not reproducible - two clean builds of the same commit differ - so the hash
+# cannot be written by hand in advance and be right; it is only knowable here,
+# after the build that actually gets uploaded. Committing it before the tag is
+# what keeps the published manifest and the tagged one the same document.
+#
+# Narrow on purpose: only update.json, never `git add -A`. Step 1 proved the
+# tree was clean, so anything else being dirty now means something unexpected
+# wrote to it, and that is a reason to stop rather than to sweep it in.
+if [ -n "$(git status --porcelain)" ]; then
+    if [ "$(git status --porcelain)" != " M update.json" ]; then
+        echo "Error: the build left changes beyond update.json:" >&2
+        git status --short >&2
+        exit 1
+    fi
+    echo "Recording the published manifest..."
+    git add update.json
+    git commit -q -m "Record the published $VERSION_NAME manifest"
+else
+    echo "Manifest already matched the build; nothing to record."
+fi
 
 # ---- 4. Push branch and tag ----------------------------------------------
 echo "Pushing $BRANCH..."
