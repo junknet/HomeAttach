@@ -1,8 +1,8 @@
 {
-  "versionCode": 18,
-  "versionName": "1.5.1",
-  "apkUrl": "https://github.com/junknet/HomeAttach/releases/download/v1.5.1/app-release.apk",
-  "sha256": "30bf6286918a26d863109d9147c2e3affa6a06a8c969dc37387c58a69133b4eb",
+  "versionCode": 19,
+  "versionName": "1.5.2",
+  "apkUrl": "https://github.com/junknet/HomeAttach/releases/download/v1.5.2/app-release.apk",
+  "sha256": "7394144e4dfe13d1446547ef881b001ac5474ce4cecaaec869f0c22df2560795",
   "sizeBytes": 28993072,
-  "notes": "忙碌会话不再越追越慢：解析预算放开、落后时先追赶再重绘，积压从 2MB 降到 70KB 以内，不再每两秒重新 attach；键盘开合不再触发整屏重取快照；电脑端开会话少一次进程探测。"
+  "notes": "快捷键一行放下：九个键按标签宽度分配、不再需要横滑，方向键随手可点。另含 1.5.1 的性能修复——忙碌会话不再越追越慢、键盘开合不再整屏重取快照。"
 }

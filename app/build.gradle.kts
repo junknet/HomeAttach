@@ -58,8 +58,8 @@ android {
         applicationId = "com.homeattach.app"
         minSdk = 26
         targetSdk = 36
-        versionCode = 18
-        versionName = "1.5.1"
+        versionCode = 19
+        versionName = "1.5.2"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         // The self-updater reads a static version manifest from a CDN direct-download URL, never the
