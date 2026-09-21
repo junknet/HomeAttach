@@ -62,6 +62,10 @@ internal class TerminalRenderQueue(private val capacityBytes: Int = 2 * 1024 * 1
     @Synchronized
     fun hasPending(): Boolean = snapshot != null || pending.isNotEmpty()
 
+    /** Bytes waiting to be parsed. How far behind the live stream this terminal is. */
+    @Synchronized
+    fun pendingBytes(): Int = bufferedBytes
+
     @Synchronized
     fun clear() {
         snapshot = null

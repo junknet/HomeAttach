@@ -9,6 +9,7 @@ import android.os.Looper
 import android.os.SystemClock
 import android.os.Trace
 import android.util.Log
+import com.homeattach.app.BuildConfig
 import com.homeattach.app.ssh.MuxHistoryPage
 import com.termux.terminal.TerminalEmulator
 import com.termux.terminal.TerminalOutput
@@ -110,6 +111,35 @@ class RemoteTerminalSession(
 
     private val drainRunnable = Runnable { drainOutput() }
 
+    /**
+     * Screen changes parsed but not yet drawn, and when the last draw happened.
+     *
+     * Drawing every drain is what a backlogged terminal cannot afford. The emulator parses far
+     * faster than the view draws, so while behind, each drawn frame is a picture of a screen that
+     * was already stale when it was drawn - unreadable, and the reason the next one is stale too.
+     * Deferring the draw while behind puts that time back into the parser, which is the only thing
+     * that ends the backlog. Measured on a device against a 1.5MB/s session, this halves the draws
+     * (about 35 a second against 66 drains that changed something) and is part of what took the
+     * pipeline from 0.49MB/s to 1.57MB/s - see [MAX_BYTES_PER_DRAIN] for the rest of that number.
+     */
+    private var pendingRepaint = false
+    private var lastRepaintAt = 0L
+
+    /**
+     * Debug-only throughput counters, reported once a second.
+     *
+     * Kept because this is the only place the interesting failure is visible: a terminal that
+     * cannot keep up does not look broken, it looks slow, and the difference between "the phone
+     * parses too slowly" and "the phone is not being given time to parse" is exactly these numbers.
+     * A rising `behind` is the signal - past [TerminalRenderQueue]'s capacity it becomes a full
+     * re-attach, which reads on screen as the picture redrawing itself from the top.
+     */
+    private var statBytes = 0L
+    private var statParseNanos = 0L
+    private var statRepaints = 0
+    private var statMaxPending = 0
+    private var statWindowAt = 0L
+
     private fun scheduleDrain() {
         synchronized(schedulingLock) {
             if (!drainScheduled && !finished.get()) {
@@ -124,14 +154,23 @@ class RemoteTerminalSession(
     private fun drainOutput() {
         if (finished.get()) return
         var screenChanged = false
+        var drainedBytes = 0
         val started = SystemClock.elapsedRealtimeNanos()
         Trace.beginSection("HomeAttach.terminalParse")
         try {
             if (session.emulator != null) {
                 var parsedBytes = 0
-                while (parsedBytes < MAX_BYTES_PER_DRAIN &&
-                    SystemClock.elapsedRealtimeNanos() - started < PARSE_BUDGET_NANOS) {
-                    val chunkLimit = if (snapshotEmulator != null && snapshotRemaining > 0)
+                while (true) {
+                    // A snapshot parses into an emulator nobody can see, so there is no picture to
+                    // keep responsive and no reason to spend the backlog a slice at a time: it gets
+                    // a whole frame and a cap it will never reach. Live output shares the frame with
+                    // the view that has to draw it, so it keeps a slice.
+                    val offscreen = snapshotEmulator != null
+                    val byteBudget = if (offscreen) SNAPSHOT_BYTES_PER_DRAIN else MAX_BYTES_PER_DRAIN
+                    val timeBudget = if (offscreen) SNAPSHOT_BUDGET_NANOS else PARSE_BUDGET_NANOS
+                    if (parsedBytes >= byteBudget) break
+                    if (SystemClock.elapsedRealtimeNanos() - started >= timeBudget) break
+                    val chunkLimit = if (offscreen && snapshotRemaining > 0)
                         minOf(PARSE_CHUNK_BYTES.toLong(), snapshotRemaining).toInt()
                     else PARSE_CHUNK_BYTES
                     when (val operation = renderQueue.take(chunkLimit) ?: break) {
@@ -148,6 +187,7 @@ class RemoteTerminalSession(
                             val destination = snapshotEmulator ?: session.emulator
                             destination.append(operation.bytes, operation.bytes.size)
                             parsedBytes += operation.bytes.size
+                            drainedBytes += operation.bytes.size
                             if (snapshotEmulator != null) {
                                 snapshotRemaining -= operation.bytes.size
                                 if (snapshotRemaining == 0L) {
@@ -168,13 +208,53 @@ class RemoteTerminalSession(
                 drainScheduled = false
                 if (!finished.get() && renderQueue.hasPending()) {
                     drainScheduled = true
-                    mainHandler.postDelayed(drainRunnable, DRAIN_YIELD_MS)
+                    if (session.emulator == null) {
+                        // Nothing can be parsed until the view has laid out and built one. Re-posting
+                        // immediately here would spin the main thread against the very layout pass it
+                        // is waiting for, so this one case still sleeps.
+                        mainHandler.postDelayed(drainRunnable, IDLE_RETRY_MS)
+                    } else {
+                        // Otherwise re-post rather than sleep. The next drain is an ordinary
+                        // main-thread message and Choreographer's frame callbacks jump the queue
+                        // ahead of those, so continuing immediately cannot starve a frame — while
+                        // the fixed delay this replaced idled the parser two thirds of every cycle.
+                        mainHandler.post(drainRunnable)
+                    }
                 }
             }
         }
+        if (BuildConfig.DEBUG) {
+            statBytes += drainedBytes
+            statParseNanos += SystemClock.elapsedRealtimeNanos() - started
+            statMaxPending = maxOf(statMaxPending, renderQueue.pendingBytes())
+            val now = SystemClock.elapsedRealtime()
+            if (statWindowAt == 0L) statWindowAt = now
+            if (now - statWindowAt >= 1000) {
+                Log.i(
+                    TAG,
+                    "parsed=${statBytes}B in ${statParseNanos / 1_000_000}ms" +
+                        " repaints=$statRepaints behind=${statMaxPending}B",
+                )
+                statBytes = 0; statParseNanos = 0; statRepaints = 0
+                statMaxPending = 0; statWindowAt = now
+            }
+        }
         if (screenChanged) {
-            onScreenUpdated()
+            pendingRepaint = true
             onFirstOutput()
+        }
+        if (pendingRepaint) {
+            // Draw once the parser has caught up, and otherwise no more often than
+            // [REPAINT_MIN_INTERVAL_MS] - which only bites while behind, since catching up is the
+            // first condition. A drain is always scheduled again while anything is pending, so a
+            // skipped draw is a deferred one, never a dropped one.
+            val now = SystemClock.elapsedRealtime()
+            if (!renderQueue.hasPending() || now - lastRepaintAt >= REPAINT_MIN_INTERVAL_MS) {
+                pendingRepaint = false
+                lastRepaintAt = now
+                if (BuildConfig.DEBUG) statRepaints++
+                onScreenUpdated()
+            }
         }
     }
 
@@ -305,10 +385,34 @@ class RemoteTerminalSession(
     private companion object {
         const val TAG = "RemoteTerminalSession"
 
-        const val MAX_BYTES_PER_DRAIN = 16384
-        const val PARSE_CHUNK_BYTES = 2048
-        const val PARSE_BUDGET_NANOS = 4_000_000L
-        const val DRAIN_YIELD_MS = 8L
+        // One drain of *visible* output. The time budget is the real limiter; the byte cap only
+        // stops a pathological burst from running the clock.
+        //
+        // What these replaced was a 16KB cap, a 4ms budget and an 8ms sleep between drains, which
+        // left the parser idle two thirds of every cycle. Measured on a device against a session
+        // emitting 1.5MB/s, with the same binary and only this policy switched: 0.49MB/s parsed,
+        // the queue hitting its 2MB cap every two seconds, and a full re-attach each time it did.
+        // With these values the same session parses 1.57MB/s - the rate it is produced at - stays
+        // under 70KB behind, and re-attaches never. A re-attach is what the user sees as the screen
+        // redrawing itself from the top, so the backlog is not a throughput detail: it is the bug.
+        const val MAX_BYTES_PER_DRAIN = 256 * 1024
+        const val PARSE_BUDGET_NANOS = 6_000_000L
+
+        /** The same, for a snapshot: offscreen, so it may have the frame to itself. */
+        const val SNAPSHOT_BYTES_PER_DRAIN = 8 * 1024 * 1024
+        const val SNAPSHOT_BUDGET_NANOS = 24_000_000L
+
+        const val PARSE_CHUNK_BYTES = 16384
+
+        /** Only for the one state that cannot make progress: no emulator to parse into yet. */
+        const val IDLE_RETRY_MS = 8L
+
+        /**
+         * Floor on how often a *backlogged* terminal is drawn. Catching up lifts it immediately, so
+         * this is never what paces an idle or lightly loaded session - it only stops a flood from
+         * spending the whole main thread drawing frames of a screen it is already behind.
+         */
+        const val REPAINT_MIN_INTERVAL_MS = 100L
         // Deep scrollback: the buffer is a lazily-allocated row-pointer array, so a big cap
         // costs ~80KB of references up front and real memory only as history fills.
         const val TRANSCRIPT_ROWS = 10000
