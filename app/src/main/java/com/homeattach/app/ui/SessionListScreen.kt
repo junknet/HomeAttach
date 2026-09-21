@@ -78,7 +78,6 @@ import com.homeattach.app.data.SettingsStore
 import com.homeattach.app.ssh.RemoteSession
 import com.homeattach.app.ssh.RemoteSessionFeed
 import com.homeattach.app.ssh.SessionsSnapshot
-import com.homeattach.app.ssh.createRemoteSession
 import com.homeattach.app.ssh.killRemoteSession
 import com.homeattach.app.ui.theme.MonoBody
 import com.homeattach.app.update.AutoUpdate
@@ -87,15 +86,9 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import kotlinx.coroutines.withTimeoutOrNull
-import kotlinx.coroutines.flow.first
-import kotlinx.coroutines.flow.mapNotNull
 
 /** How long pull-to-refresh keeps spinning: the feed is already live, so this is dwell, not work. */
 private const val REFRESH_INDICATOR_MS = 450L
-
-/** How long a new session gets to appear in the feed before we open it on its internal id. */
-private const val NEW_SESSION_LABEL_WAIT_MS = 2_000L
 
 /** Separates a label from the id tacked on when two sessions share a directory outright. */
 private const val LABEL_ID_MARKER = "\u00b7"
@@ -211,19 +204,7 @@ fun SessionListScreen(
         isCreating = true
         scope.launch {
             try {
-                val config = settingsStore.load()
-                val name = withContext(Dispatchers.IO) { createRemoteSession(config) }
-                // The feed sees the new socket within a tick of it existing. Waiting for it buys
-                // a real title (its cwd) instead of opening on the internal id; if it somehow
-                // does not arrive, the id still works.
-                val label = withTimeoutOrNull(NEW_SESSION_LABEL_WAIT_MS) {
-                    RemoteSessionFeed.sessions(settingsStore)
-                        .mapNotNull { snap ->
-                            (snap as? SessionsSnapshot.Live)?.sessions?.firstOrNull { it.name == name }
-                        }
-                        .first()
-                        .displayLabel()
-                } ?: name
+                val (name, label) = createSessionAndResolveLabel(settingsStore)
                 onOpenSession(name, label)
             } catch (e: Exception) {
                 snackbarHostState.showSnackbar(

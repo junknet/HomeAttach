@@ -39,6 +39,8 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.ModalNavigationDrawer
@@ -260,6 +262,32 @@ fun TerminalScreen(
     val bottomPaddingPx = if (imeVisible) maxImeHeight else 0
     val bottomPaddingDp = with(composeDensity) { bottomPaddingPx.toDp() }
 
+    // Starting a session from here rather than from the list screen: the row's `New` cap. Guarded
+    // against a second tap because the PC takes a moment to spawn the tab, and reported through a
+    // snackbar because the failure is remote - a missing `tsess-new`, a host that said no - and
+    // has to name itself or it looks like the cap did nothing.
+    val snackbarHostState = remember { SnackbarHostState() }
+    var isCreatingSession by remember { mutableStateOf(false) }
+    fun createSession() {
+        if (isCreatingSession) return
+        isCreatingSession = true
+        scope.launch {
+            try {
+                val (name, label) = createSessionAndResolveLabel(settingsStore)
+                onNavigateToSession(name, label)
+            } catch (e: Exception) {
+                snackbarHostState.showSnackbar(
+                    context.getString(
+                        R.string.sessions_new_failed,
+                        e.message ?: (e::class.simpleName ?: "?"),
+                    ),
+                )
+            } finally {
+                isCreatingSession = false
+            }
+        }
+    }
+
     val drawerState = rememberDrawerState(initialValue = DrawerValue.Closed)
 
     // Always enabled: leaving must always route through leave(), or Back would pop the screen
@@ -419,6 +447,7 @@ fun TerminalScreen(
             containerColor = Color(0xFF0A0B10),
             // Zero insets: transient system bars overlay the terminal instead of resizing it.
             contentWindowInsets = WindowInsets(0, 0, 0, 0),
+            snackbarHost = { SnackbarHost(snackbarHostState) },
         ) { padding ->
             Box(
                 modifier = Modifier
@@ -534,7 +563,11 @@ fun TerminalScreen(
                             .fillMaxWidth()
                             .padding(bottom = bottomPaddingDp)
                     ) {
-                        ExtraKeysRow(remoteTerminalSession = remoteTerminalSession)
+                        ExtraKeysRow(
+                            remoteTerminalSession = remoteTerminalSession,
+                            newSessionBusy = isCreatingSession,
+                            onNewSession = { createSession() },
+                        )
                     }
                 }
 
@@ -776,6 +809,8 @@ private fun ConnectionProblem(
 internal fun ExtraKeysRow(
     remoteTerminalSession: RemoteTerminalSession,
     modifier: Modifier = Modifier,
+    newSessionBusy: Boolean = false,
+    onNewSession: (() -> Unit)? = null,
 ) {
     // Every key is reachable without scrolling, at any width.
     //
@@ -804,6 +839,23 @@ internal fun ExtraKeysRow(
         horizontalArrangement = Arrangement.spacedBy(4.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
+        // The only cap here that is not a key. It asks the PC to open a tab and walks into it,
+        // which is a remote side effect sitting in a row of keystrokes - so it is tinted, to read
+        // as a control rather than as something that types. It leads because the right of the row
+        // is where a thumb rests between keystrokes, and that is the last place to put the one
+        // control that starts something on another machine.
+        if (onNewSession != null) {
+            val label = stringResource(R.string.terminal_key_new)
+            KeyCap(
+                label = label,
+                labelSp = labelSp,
+                onOverflow = shrink,
+                accent = true,
+                busy = newSessionBusy,
+                modifier = Modifier.weight(label.capWeight()),
+                onPress = onNewSession,
+            )
+        }
         // Ctrl+C/Ctrl+D are spelled in caret notation: six characters would force the whole row
         // down to an unreadable size to fit one cap, and `^C` is what a terminal calls it anyway.
         val keys = listOf<Pair<String, () -> Unit>>(
@@ -857,6 +909,8 @@ private fun KeyCap(
     onOverflow: () -> Unit,
     modifier: Modifier,
     repeating: Boolean = false,
+    accent: Boolean = false,
+    busy: Boolean = false,
     onPress: () -> Unit,
 ) {
     val currentOnPress by rememberUpdatedState(onPress)
@@ -881,9 +935,21 @@ private fun KeyCap(
         }
     }
 
-    val buttonColor = if (pressed) Color(0xFF252A33) else Color(0xFF10131A)
-    val borderColor = if (pressed) Color(0xFF6EA8FE) else Color.White.copy(alpha = 0.14f)
-    val foreground = if (pressed) Color.White else Color(0xFFF2F5FA)
+    val buttonColor = when {
+        pressed -> Color(0xFF252A33)
+        accent -> Color(0xFF15202E)
+        else -> Color(0xFF10131A)
+    }
+    val borderColor = when {
+        pressed -> Color(0xFF6EA8FE)
+        accent -> Color(0xFF6EA8FE).copy(alpha = 0.55f)
+        else -> Color.White.copy(alpha = 0.14f)
+    }
+    val foreground = when {
+        pressed -> Color.White
+        accent -> Color(0xFF9EC5FE)
+        else -> Color(0xFFF2F5FA)
+    }
 
     Surface(
         color = buttonColor,
@@ -898,12 +964,13 @@ private fun KeyCap(
                 // must send nothing at all, and only a tap that starts and ends on the key counts.
                 detectTapGestures(
                     onPress = {
+                        if (busy) return@detectTapGestures
                         pressed = true
                         repeatTookOver = false
                         tryAwaitRelease()
                         pressed = false
                     },
-                    onTap = { if (!repeatTookOver) currentOnPress() },
+                    onTap = { if (!busy && !repeatTookOver) currentOnPress() },
                 )
             },
     ) {
@@ -913,6 +980,17 @@ private fun KeyCap(
                 .padding(horizontal = 2.dp),
             contentAlignment = Alignment.Center,
         ) {
+            if (busy) {
+                // The same answer the list screen's button gives: starting a session takes as long
+                // as yakuake needs to spawn a tab, and a cap that looks idle through that gets
+                // tapped again - which would open a second tab nobody asked for.
+                CircularProgressIndicator(
+                    strokeWidth = 1.5.dp,
+                    color = foreground,
+                    modifier = Modifier.size(14.dp),
+                )
+                return@Box
+            }
             Text(
                 text = label,
                 style = MaterialTheme.typography.labelMedium.copy(

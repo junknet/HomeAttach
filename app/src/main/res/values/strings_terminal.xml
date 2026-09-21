@@ -34,4 +34,7 @@
     <string name="terminal_key_page_up" translatable="false">PgUp</string>
     <string name="terminal_key_page_down" translatable="false">PgDn</string>
     <string name="terminal_key_paste" translatable="false">Paste</string>
+
+    <!-- Not a key: starts a session on the PC. A word, so it is translated. -->
+    <string name="terminal_key_new">New</string>
 </resources>

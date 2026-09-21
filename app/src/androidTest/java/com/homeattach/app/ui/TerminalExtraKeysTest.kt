@@ -23,6 +23,7 @@ import androidx.compose.ui.test.swipeLeft
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.test.platform.app.InstrumentationRegistry
+import com.homeattach.app.R
 import com.homeattach.app.terminal.RemoteTerminalSession
 import java.io.File
 import org.junit.After
@@ -44,28 +45,43 @@ class TerminalExtraKeysTest {
     val composition = createComposeRule()
     private lateinit var terminal: RemoteTerminalSession
 
-    private val allKeys = listOf("Esc", "Tab", "^C", "^D", "Paste", "←", "↑", "↓", "→")
+    private val context = InstrumentationRegistry.getInstrumentation().targetContext
+    private val newLabel = context.getString(R.string.terminal_key_new)
+
+    /** Everything the shipping row shows, `New` included - that is the width it has to survive. */
+    private val allKeys
+        get() = listOf(newLabel, "Esc", "Tab", "^C", "^D", "Paste", "←", "↑", "↓", "→")
 
     @After
     fun releaseTerminal() {
         if (::terminal.isInitialized) composition.runOnIdle { terminal.finish() }
     }
 
-    private fun renderRow(width: Dp, onInput: (ByteArray) -> Unit) {
-        val context = InstrumentationRegistry.getInstrumentation().targetContext
+    private fun renderRow(
+        width: Dp,
+        onInput: (ByteArray) -> Unit = {},
+        busy: Boolean = false,
+        onNewSession: () -> Unit = {},
+    ) {
         composition.runOnIdle {
             terminal = RemoteTerminalSession(context, onInput, { _, _ -> })
         }
         composition.setContent {
             MaterialTheme {
-                Box(Modifier.width(width)) { ExtraKeysRow(terminal) }
+                Box(Modifier.width(width)) {
+                    ExtraKeysRow(
+                        remoteTerminalSession = terminal,
+                        newSessionBusy = busy,
+                        onNewSession = onNewSession,
+                    )
+                }
             }
         }
     }
 
     @Test
     fun everyKeyFitsWithoutScrollingAtPhoneWidth() {
-        renderRow(320.dp) {}
+        renderRow(320.dp)
         assertEveryKeyIsInside(320.dp)
     }
 
@@ -73,13 +89,12 @@ class TerminalExtraKeysTest {
     fun everyKeyStillFitsOnAWidthNarrowerThanAnyPhone() {
         // 240dp is below the narrowest Android phone in circulation. If the row survives here it
         // is fitting by construction rather than by having been tuned on one device.
-        renderRow(240.dp) {}
+        renderRow(240.dp)
         captureRow("terminal-extra-keys-240.png")
         assertEveryKeyIsInside(240.dp)
     }
 
     private fun captureRow(name: String) {
-        val context = InstrumentationRegistry.getInstrumentation().targetContext
         val image = composition.onRoot().captureToImage().asAndroidBitmap()
         File(context.getExternalFilesDir(null), name).outputStream().use { out ->
             assertTrue(image.compress(Bitmap.CompressFormat.PNG, 100, out))
@@ -114,9 +129,35 @@ class TerminalExtraKeysTest {
     }
 
     @Test
+    fun newAsksForASessionOnceAndTypesNothing() {
+        val received = mutableListOf<ByteArray>()
+        var starts = 0
+        renderRow(320.dp, onInput = { received += it }) { starts++ }
+
+        composition.onNodeWithText(newLabel).performTouchInput { click() }
+        composition.runOnIdle {
+            assertEquals("New must start exactly one session", 1, starts)
+            assertTrue("New must not type into the terminal", received.isEmpty())
+        }
+    }
+
+    @Test
+    fun newIsInertWhileTheSessionIsStarting() {
+        // The PC takes a moment to spawn the tab. A cap that still answered taps through that
+        // would open a second session nobody asked for, so while busy it shows progress instead
+        // of its label and does nothing at all.
+        var starts = 0
+        renderRow(320.dp, busy = true) { starts++ }
+
+        composition.onNodeWithText(newLabel).assertDoesNotExist()
+        composition.onRoot().performTouchInput { click() }
+        composition.runOnIdle { assertEquals(0, starts) }
+    }
+
+    @Test
     fun tabTypesAndAStraySwipeDoesNot() {
         val received = mutableListOf<ByteArray>()
-        renderRow(320.dp) { received += it }
+        renderRow(320.dp, onInput = { received += it })
 
         composition.onNodeWithText("Tab").performTouchInput { click() }
         composition.runOnIdle {
@@ -125,7 +166,6 @@ class TerminalExtraKeysTest {
             received.clear()
         }
 
-        val context = InstrumentationRegistry.getInstrumentation().targetContext
         val image = composition.onRoot().captureToImage().asAndroidBitmap()
         File(context.getExternalFilesDir(null), "terminal-extra-keys.png").outputStream().use { out ->
             assertTrue(image.compress(Bitmap.CompressFormat.PNG, 100, out))
